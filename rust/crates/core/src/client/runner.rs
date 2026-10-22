@@ -252,7 +252,6 @@ fn curl_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Resu
     let chain = parse_http_header_blocks(&headers_raw);
     let last = chain.last().cloned().unwrap_or_default();
     let status_code = last.status;
-    let url = resolve_request_url(user_args, ToolKind::Curl).unwrap_or_default();
 
     debug!(?status_code, exit_code, "curl finished");
 
@@ -260,7 +259,7 @@ fn curl_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Resu
         // Swallow stderr/stdout/body on 402 — CLI handles display.
         // 402 challenge bodies are JSON per spec; lossy decode is fine.
         let body_text = String::from_utf8_lossy(&body);
-        let url = payment_url(&url, &chain, named)?;
+        let url = payment_url(user_args, ToolKind::Curl, &chain, named)?;
         return Ok(Hop::Done(classify_402(
             &last.headers,
             Some(&body_text),
@@ -499,7 +498,6 @@ fn wget_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Resu
     let chain = parse_wget_header_blocks(&stderr_text);
     let last = chain.last().cloned().unwrap_or_default();
     let status_code = last.status;
-    let url = resolve_request_url(user_args, ToolKind::Wget).unwrap_or_default();
 
     debug!(?status_code, exit_code, "wget finished");
 
@@ -509,7 +507,7 @@ fn wget_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Resu
         // result, we can't surface server `verification_failed` reasons for
         // wget retries (only curl/fetch). The retry path falls back to a
         // generic "still 402" message.
-        let url = payment_url(&url, &chain, named)?;
+        let url = payment_url(user_args, ToolKind::Wget, &chain, named)?;
         return Ok(Hop::Done(classify_402(&last.headers, None, &url)));
     }
     // wget writes nothing for a redirect it does not follow, so dropping
@@ -578,11 +576,6 @@ fn httpie_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Re
     let exit_code = output.status.code().unwrap_or(1);
     let stdout_text = String::from_utf8_lossy(&output.stdout);
     let stderr_text = String::from_utf8_lossy(&output.stderr);
-    // HTTPie accepts `:port/path` and `host[:port]/path` shorthand;
-    // expand both so the URL persisted alongside an activated
-    // subscription matches what the next request will hit (the SIWMPP
-    // cache lookup is a URL-prefix match).
-    let url = resolve_request_url(user_args, ToolKind::Httpie).unwrap_or_default();
 
     let (status_code, headers, body) = parse_httpie_output(&stdout_text);
 
@@ -596,7 +589,12 @@ fn httpie_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Re
     };
     if status_code == Some(402) {
         // Swallow stdout/stderr on 402 — CLI handles display
-        let url = payment_url(&url, std::slice::from_ref(&last), named)?;
+        let url = payment_url(
+            user_args,
+            ToolKind::Httpie,
+            std::slice::from_ref(&last),
+            named,
+        )?;
         return Ok(Hop::Done(classify_402(
             &last.headers,
             body.as_deref(),
@@ -1526,8 +1524,22 @@ fn answering_url(requested: &str, chain: &[ResponseHead]) -> String {
 /// built for, and later sent straight to, the URL that asked for it, so it
 /// never rides a redirect. A 402 from another origin than the one the caller
 /// named is refused: Pay only pays the origin on the command line.
-fn payment_url(requested: &str, chain: &[ResponseHead], named: &str) -> Result<String> {
-    let answering = answering_url(requested, chain);
+///
+/// The paid retry replays the caller's args at that URL, so it must be the
+/// request that got the 402. See [`ensure_replays_the_redirected_request`].
+fn payment_url(
+    args: &[String],
+    tool: ToolKind,
+    chain: &[ResponseHead],
+    named: &str,
+) -> Result<String> {
+    // Expands HTTPie's `:port/path` shorthand too, so the URL kept with an
+    // activated subscription matches what the next request hits.
+    let requested = resolve_request_url(args, tool).unwrap_or_default();
+    let answering = answering_url(&requested, chain);
+    if answering != requested {
+        ensure_replays_the_redirected_request(args, tool, chain, &answering)?;
+    }
     if answering == named {
         return Ok(answering);
     }
@@ -1542,6 +1554,69 @@ fn payment_url(requested: &str, chain: &[ResponseHead], named: &str) -> Result<S
         )));
     }
     Ok(answering)
+}
+
+/// Refuse, before anything is signed, a paid retry that would not be the
+/// request the 402 answered.
+///
+/// The retry sends the caller's args, method and body included, straight to
+/// the URL that asked for payment. After a redirect the tool may have reached
+/// that URL with another request: curl and wget turn a POST into a bodyless
+/// GET on 301, 302 and 303 (HEAD stays HEAD), and keep the method and body
+/// only on 307 and 308. So the replay is faithful for a bodyless GET or HEAD
+/// after any redirect, and for any other request only when every hop was a
+/// 307 or 308 and the body can be sent again (it is not read from stdin).
+/// `-X`, `--post30x` and uploads all fall in the refused set unless every
+/// hop kept the method anyway.
+fn ensure_replays_the_redirected_request(
+    args: &[String],
+    tool: ToolKind,
+    chain: &[ResponseHead],
+    answering: &str,
+) -> Result<()> {
+    if is_bodyless_read(args, tool) {
+        return Ok(());
+    }
+    let followed = chain.split_last().map_or(&[][..], |(_, followed)| followed);
+    let keeps_request = followed
+        .iter()
+        .filter(|head| head.redirect_location().is_some())
+        .all(|head| matches!(head.status, Some(307 | 308)));
+    if keeps_request && !reads_body_from_stdin(args, tool) {
+        return Ok(());
+    }
+    Err(Error::RequestValidation(format!(
+        "the request was redirected to {answering}, which asked for payment, but the \
+         redirect changed the request (its method or body), so Pay cannot replay it \
+         faithfully with the payment. Send the request to {answering} directly."
+    )))
+}
+
+/// Whether the request body (or upload) is read from stdin, which a second
+/// run of the tool cannot read again.
+fn reads_body_from_stdin(args: &[String], tool: ToolKind) -> bool {
+    let Some(spec) = transfer_options(tool) else {
+        return false;
+    };
+    let line = CommandLine::parse(args, spec);
+    line.options.iter().any(|option| {
+        let value = option.value.unwrap_or_default();
+        match (tool, option.name) {
+            (ToolKind::Curl, OptionName::Short('T') | OptionName::Long("upload-file")) => {
+                matches!(value, "-" | ".")
+            }
+            (
+                ToolKind::Curl,
+                OptionName::Short('d' | 'F')
+                | OptionName::Long(
+                    "data" | "data-ascii" | "data-binary" | "data-raw" | "data-urlencode" | "json"
+                    | "form" | "form-string",
+                ),
+            ) => value.contains("@-") || value.contains("<-"),
+            (ToolKind::Wget, OptionName::Long("post-file" | "body-file")) => value == "-",
+            _ => false,
+        }
+    })
 }
 
 /// Heuristic: find the URL from command args.
@@ -3129,19 +3204,21 @@ mod pre_attach_tests {
                 .map(|l| vec![("location".to_string(), l.to_string())])
                 .unwrap_or_default(),
         };
+        let get = s(&["-sL", "http://a.example/x"]);
         let chain = [
             head(301, Some("https://a.example/x")),
             head(302, Some("/x/")),
             head(402, None),
         ];
         assert_eq!(
-            payment_url("http://a.example/x", &chain, "http://a.example/x").unwrap(),
+            payment_url(&get, ToolKind::Curl, &chain, "http://a.example/x").unwrap(),
             "https://a.example/x/"
         );
         // No redirect: the URL as the caller wrote it.
         assert_eq!(
             payment_url(
-                "http://a.example/x",
+                &get,
+                ToolKind::Curl,
                 &[head(402, None)],
                 "http://a.example/x"
             )
@@ -3160,10 +3237,147 @@ mod pre_attach_tests {
         ] {
             let chain = [head(302, Some(elsewhere)), head(402, None)];
             assert!(
-                payment_url("http://a.example/x", &chain, "http://a.example/x").is_err(),
+                payment_url(&get, ToolKind::Curl, &chain, "http://a.example/x").is_err(),
                 "{elsewhere}"
             );
         }
+    }
+
+    #[test]
+    fn the_paid_retry_replays_only_the_request_that_got_the_402() {
+        let head = |status, location: Option<&str>| ResponseHead {
+            status: Some(status),
+            headers: location
+                .map(|l| vec![("location".to_string(), l.to_string())])
+                .unwrap_or_default(),
+        };
+        let via = |status| [head(status, Some("/paid")), head(402, None)];
+        let url = "https://a.example/start";
+        let pays = |args: &[&str], tool, chain: &[ResponseHead]| {
+            let mut args = s(args);
+            args.push(url.to_string());
+            payment_url(&args, tool, chain, url)
+        };
+        // A body sent again only on 307 and 308; 301, 302 and 303 turned the
+        // POST into a bodyless GET.
+        for status in [301, 302, 303] {
+            assert!(pays(&["-L", "-d", "x=1"], ToolKind::Curl, &via(status)).is_err());
+            assert!(pays(&["--post-data=x=1"], ToolKind::Wget, &via(status)).is_err());
+            // `-X` and `--post30x` change what the tool sent: refused too.
+            assert!(
+                pays(
+                    &["-L", "-X", "POST", "-d", "x"],
+                    ToolKind::Curl,
+                    &via(status)
+                )
+                .is_err()
+            );
+            assert!(
+                pays(
+                    &["-L", "--post302", "-d", "x"],
+                    ToolKind::Curl,
+                    &via(status)
+                )
+                .is_err()
+            );
+            assert!(pays(&["-L", "-X", "DELETE"], ToolKind::Curl, &via(status)).is_err());
+        }
+        for status in [307, 308] {
+            assert_eq!(
+                pays(&["-L", "-d", "x=1"], ToolKind::Curl, &via(status)).unwrap(),
+                "https://a.example/paid"
+            );
+            assert!(pays(&["--post-data=x=1"], ToolKind::Wget, &via(status)).is_ok());
+            // A body read from stdin cannot be sent a second time.
+            assert!(pays(&["-L", "-d", "@-"], ToolKind::Curl, &via(status)).is_err());
+            assert!(pays(&["-L", "-T", "-"], ToolKind::Curl, &via(status)).is_err());
+            assert!(pays(&["--post-file=-"], ToolKind::Wget, &via(status)).is_err());
+        }
+        // Positive controls: a GET or HEAD is the same request after any
+        // redirect, and without a redirect any request is replayed as is.
+        for status in [301, 302, 303, 307, 308] {
+            assert!(pays(&["-L"], ToolKind::Curl, &via(status)).is_ok());
+            assert!(pays(&["-LI"], ToolKind::Curl, &via(status)).is_ok());
+            assert!(pays(&["-q"], ToolKind::Wget, &via(status)).is_ok());
+        }
+        for args in [&["-d", "@-"][..], &["-X", "DELETE"], &["-T", "-"]] {
+            assert_eq!(pays(args, ToolKind::Curl, &[head(402, None)]).unwrap(), url);
+        }
+    }
+
+    #[test]
+    fn curl_refuses_to_pay_for_a_post_a_redirect_turned_into_a_get() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                "HTTP/1.1 303 See Other\r\nLocation: /paid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+            ],
+        );
+        let outcome = run_curl_inner(&s(&["-sL", "-d", "x=1", &start]), &[]);
+        assert!(
+            matches!(&outcome, Err(Error::RequestValidation(m)) if m.contains("/paid")),
+            "{outcome:?}"
+        );
+        let methods: Vec<String> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| r.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(methods, ["POST /start", "GET /paid"]);
+    }
+
+    #[test]
+    fn curl_pays_a_post_that_a_307_kept_a_post() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /paid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+                OK_RESPONSE.to_string(),
+            ],
+        );
+        let args = s(&["-sL", "-d", "x=1", &start]);
+        let RunOutcome::UnknownPaymentRequired { resource_url, .. } =
+            run_curl_inner(&args, &[]).unwrap()
+        else {
+            panic!("expected the 402 from /paid");
+        };
+        let paid = run_paid(ToolKind::Curl, &args, &resource_url, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(paid, RunOutcome::Completed { exit_code: 0, .. }));
+        let requests = server.join().unwrap();
+        let seen: Vec<(&str, &str, bool)> = requests
+            .iter()
+            .map(|r| {
+                let mut line = r.split_whitespace();
+                (
+                    line.next().unwrap_or_default(),
+                    line.next().unwrap_or_default(),
+                    r.contains(PAYMENT_SECRET),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("POST", "/start", false),
+                ("POST", "/paid", false),
+                ("POST", "/paid", true)
+            ]
+        );
     }
 
     #[test]
