@@ -1964,6 +1964,7 @@ impl StartCommand {
                 &recipient,
                 network.slug(),
                 &rpc_url,
+                api.operator.as_ref().and_then(|operator| operator.realm.as_deref()),
                 &challenge_binding_secret,
                 &charge_realm,
                 charge_store,
