@@ -484,7 +484,7 @@ pub async fn approve(
     let (pending, code) = state
         .cli()
         .approve(&id, subject.clone(), Some(session.id.clone()), || {
-            crate::oauth::session_is_live(&state, &session)
+            crate::oauth::session_is_live(&state, &subject, &session)
         })
         .ok_or_else(unknown_request)?;
     let mut response = Json(Decision {
@@ -997,7 +997,10 @@ mod tests {
             .unwrap()
             .session = Some("sess_cli".to_string());
 
-        state.privy().unwrap().revoke_session("sess_cli");
+        state.privy().unwrap().revoke_session(
+            &crate::privy::subject_for_user(crate::privy::tests::USER),
+            "sess_cli",
+        );
         state.cli().revoke_session("sess_cli");
         assert!(state.cli().authenticate(&token).is_none());
         assert!(!state.cli().is_link_pending("parked"), "cannot resume");

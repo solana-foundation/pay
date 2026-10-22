@@ -1152,7 +1152,7 @@ pub async fn approve(
     }
     let (request, code) = store
         .approve_in_session(&id, &subject, Some(&session.id), || {
-            session_is_live(&state, &session)
+            session_is_live(&state, &subject, &session)
         })
         .ok_or_else(unknown_request)?;
     tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved");
@@ -1196,20 +1196,28 @@ pub(crate) fn approve_with_cookie(
         .tenants()
         .login_from_cookie(headers)
         .filter(|login| state.tenants().get(&login.subject).is_some())
-        .filter(|login| session_is_live(state, &login.session))
+        .filter(|login| session_is_live(state, &login.subject, &login.session))
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no_wallet", no_wallet))
 }
 
 #[cfg(feature = "privy")]
-pub(crate) fn session_is_live(state: &AppState, session: &crate::tenants::LoginSession) -> bool {
+pub(crate) fn session_is_live(
+    state: &AppState,
+    subject: &str,
+    session: &crate::tenants::LoginSession,
+) -> bool {
     state
         .privy()
-        .is_some_and(|privy| privy.session_is_live(session))
+        .is_some_and(|privy| privy.session_is_live(subject, session))
 }
 
 /// Without Privy no login session exists to be live.
 #[cfg(not(feature = "privy"))]
-pub(crate) fn session_is_live(_state: &AppState, _session: &crate::tenants::LoginSession) -> bool {
+pub(crate) fn session_is_live(
+    _state: &AppState,
+    _subject: &str,
+    _session: &crate::tenants::LoginSession,
+) -> bool {
     false
 }
 
@@ -1692,7 +1700,7 @@ pub async fn link_complete(
     // to the session that attaches it and end when it signs out. They are
     // adopted before the wallet is bound, so a sign-out racing this link
     // either revokes them or leaves the guest without the wallet.
-    let live = || session_is_live(&state, &session);
+    let live = || session_is_live(&state, &subject, &session);
     let adopted = state
         .oauth()
         .is_none_or(|store| store.adopt_session(&guest, &session.id, live));
@@ -1766,8 +1774,9 @@ async fn sign_out_session(state: &AppState, headers: &HeaderMap) -> Result<(), A
             "Your Privy sign-in could not be verified, so it was not signed out. Try again.",
         )
     })?;
+    let subject = crate::privy::subject_for_user(&session.user_id);
     let session = session.session.id;
-    privy.revoke_session(&session);
+    privy.revoke_session(&subject, &session);
     if let Some(store) = state.oauth() {
         store.revoke_session(&session);
     }

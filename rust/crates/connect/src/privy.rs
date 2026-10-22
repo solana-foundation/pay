@@ -24,7 +24,7 @@
 //! retires stops verifying; keys due for a refetch that fails stop verifying
 //! too, and a `kid` the current set does not name never verifies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -52,8 +52,12 @@ const JWKS_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// How long a revoked session is remembered: past the lifetime of any
 /// access token issued for it.
 const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Most sign-outs one user is remembered by, session by session. One more
+/// refuses every token of theirs issued so far instead, in a single entry,
+/// so no one user can fill the list.
+const MAX_SIGN_OUTS_PER_USER: usize = 8;
 /// Most revoked sessions remembered at once.
-const MAX_REVOKED_SESSIONS: usize = 4096;
+const MAX_REVOKED_SESSIONS: usize = 65_536;
 
 #[derive(Clone)]
 pub struct Config {
@@ -242,6 +246,127 @@ impl Keys {
     }
 }
 
+/// Sign-outs this process remembers, each until no token it refuses can
+/// still be live. Both maps together hold at most [`MAX_REVOKED_SESSIONS`].
+#[derive(Default)]
+struct SignOuts {
+    /// Signed-out sessions by `sid`: whose (the subject), and when.
+    sessions: HashMap<String, (String, Instant)>,
+    /// The same sessions by subject, so a user's share is counted without
+    /// scanning everyone's.
+    by_user: HashMap<String, Vec<String>>,
+    /// Users who signed out more than [`MAX_SIGN_OUTS_PER_USER`] sessions:
+    /// the unix second before which none of their tokens is accepted, and
+    /// when it was set.
+    users: HashMap<String, (u64, Instant)>,
+}
+
+fn remembered(at: &Instant, now: Instant) -> bool {
+    now.saturating_duration_since(*at) <= REVOKED_SESSION_TTL
+}
+
+impl SignOuts {
+    fn len(&self) -> usize {
+        self.sessions.len() + self.users.len()
+    }
+
+    fn refuses(&self, subject: &str, session: &LoginSession) -> bool {
+        let now = Instant::now();
+        self.sessions
+            .get(&session.id)
+            .is_some_and(|(_, at)| remembered(at, now))
+            || self
+                .users
+                .get(subject)
+                .is_some_and(|(floor, at)| remembered(at, now) && session.issued_at < *floor)
+    }
+
+    /// Remember that `subject` signed `session` out. Returns false, holding
+    /// nothing new, when every entry is a live sign-out of someone else.
+    fn insert(&mut self, subject: &str, session: &str, now: Instant) -> bool {
+        // Forget this user's expired sign-outs, then count what is left.
+        let sessions = &mut self.sessions;
+        let theirs = self.by_user.entry(subject.to_string()).or_default();
+        theirs.retain(|sid| {
+            let keep = sessions
+                .get(sid)
+                .is_some_and(|(owner, at)| owner == subject && remembered(at, now));
+            if !keep && sessions.get(sid).is_some_and(|(owner, _)| owner == subject) {
+                sessions.remove(sid);
+            }
+            keep
+        });
+        if let Some((_, at)) = sessions.get_mut(session) {
+            *at = now;
+            if theirs.is_empty() {
+                self.by_user.remove(subject);
+            }
+            return true;
+        }
+        if theirs.len() >= MAX_SIGN_OUTS_PER_USER {
+            // One user signing out session after session is remembered by
+            // one entry: every token of theirs issued so far is refused.
+            for sid in theirs.drain(..) {
+                sessions.remove(&sid);
+            }
+            self.by_user.remove(subject);
+            let floor = unix_now() + 1;
+            let entry = self
+                .users
+                .entry(subject.to_string())
+                .or_insert((floor, now));
+            *entry = (entry.0.max(floor), now);
+            return true;
+        }
+        if self.len() >= MAX_REVOKED_SESSIONS {
+            self.sessions.retain(|_, (_, at)| remembered(at, now));
+            self.users.retain(|_, (_, at)| remembered(at, now));
+            let sessions = &self.sessions;
+            self.by_user.retain(|_, sids| {
+                sids.retain(|sid| sessions.contains_key(sid));
+                !sids.is_empty()
+            });
+            if self.len() >= MAX_REVOKED_SESSIONS {
+                return false;
+            }
+        }
+        self.sessions
+            .insert(session.to_string(), (subject.to_string(), now));
+        self.by_user
+            .entry(subject.to_string())
+            .or_default()
+            .push(session.to_string());
+        true
+    }
+
+    /// Forget the oldest remembered session to make room.
+    fn evict_oldest(&mut self) {
+        let Some((sid, owner)) = self
+            .sessions
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(sid, (owner, _))| (sid.clone(), owner.clone()))
+        else {
+            let oldest = self
+                .users
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(subject, _)| subject.clone());
+            if let Some(subject) = oldest {
+                self.users.remove(&subject);
+            }
+            return;
+        };
+        self.sessions.remove(&sid);
+        if let Some(sids) = self.by_user.get_mut(&owner) {
+            sids.retain(|other| *other != sid);
+            if sids.is_empty() {
+                self.by_user.remove(&owner);
+            }
+        }
+    }
+}
+
 /// The Privy client pay-connect holds: app credentials and the verifier.
 pub struct Privy {
     cfg: Config,
@@ -254,8 +379,8 @@ pub struct Privy {
     /// The last refetch failed: a set due for one is no longer confirmed.
     refresh_failed: std::sync::atomic::AtomicBool,
     validation: jsonwebtoken::Validation,
-    /// Sessions signed out here, by `sid`, with when.
-    revoked: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    /// Sign-outs remembered in this process.
+    revoked: std::sync::Mutex<SignOuts>,
     /// Unix second before which no token is accepted. Sign-outs are
     /// remembered in this process only, so a token issued before it started
     /// may belong to a session signed out on a previous run: it is refused,
@@ -432,7 +557,7 @@ impl Privy {
             id: session,
             issued_at: data.claims.iat,
         };
-        if !self.session_is_live(&session) {
+        if !self.session_is_live(&subject_for_user(&data.claims.sub), &session) {
             return Err("the Privy session was signed out".to_string());
         }
         Ok(Identity {
@@ -441,43 +566,34 @@ impl Privy {
         })
     }
 
-    /// Whether credentials may still be derived from `session`: it was not
-    /// signed out here, and was proven by a token issued since this process
-    /// began remembering sign-outs.
-    pub fn session_is_live(&self, session: &LoginSession) -> bool {
+    /// Whether credentials may still be derived from `session`, a login of
+    /// `subject`: it was not signed out here, and was proven by a token
+    /// issued since this process began remembering sign-outs.
+    pub fn session_is_live(&self, subject: &str, session: &LoginSession) -> bool {
         session.issued_at >= self.not_before.load(std::sync::atomic::Ordering::SeqCst)
-            && !self.is_revoked(&session.id)
+            && !self
+                .revoked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .refuses(subject, session)
     }
 
-    /// Refuse further sign-ins with `session` for as long as its access
-    /// tokens can live.
-    pub fn revoke_session(&self, session: &str) {
+    /// Refuse further sign-ins with `session`, a login of `subject`, for as
+    /// long as its access tokens can live.
+    pub fn revoke_session(&self, subject: &str, session: &str) {
         let now = Instant::now();
         let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
-        revoked.retain(|_, at| now.saturating_duration_since(*at) <= REVOKED_SESSION_TTL);
-        if revoked.len() >= MAX_REVOKED_SESSIONS
-            && let Some(oldest) = revoked
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(sid, _)| sid.clone())
-        {
-            // Forgetting a sign-out must not revive its tokens: first refuse
-            // every token issued so far, which signs everyone out, then
-            // make room.
-            self.not_before
-                .fetch_max(unix_now() + 1, std::sync::atomic::Ordering::SeqCst);
-            tracing::warn!("too many Privy sign-outs to remember; every earlier token is refused");
-            revoked.remove(&oldest);
+        if revoked.insert(subject, session, now) {
+            return;
         }
-        revoked.insert(session.to_string(), now);
-    }
-
-    fn is_revoked(&self, session: &str) -> bool {
-        self.revoked
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(session)
-            .is_some_and(|at| at.elapsed() <= REVOKED_SESSION_TTL)
+        // Only sign-outs by many distinct users fill the list. Forgetting
+        // one must not revive its tokens: first refuse every token issued
+        // so far, which signs everyone out, then make room.
+        self.not_before
+            .fetch_max(unix_now() + 1, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!("too many Privy sign-outs to remember; every earlier token is refused");
+        revoked.evict_oldest();
+        revoked.insert(subject, session, now);
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -1247,7 +1363,7 @@ pub(crate) mod tests {
 
         let token = app.token_for(USER);
         assert!(privy.verify(&token).is_ok());
-        privy.revoke_session("sess_1");
+        privy.revoke_session(&subject_for_user(USER), "sess_1");
         assert!(
             privy.verify(&token).is_err(),
             "a signed-out session is refused"
@@ -1285,12 +1401,14 @@ pub(crate) mod tests {
             id: "sess_1".to_string(),
             issued_at,
         };
-        assert!(privy.session_is_live(&cookie_session(unix())));
-        assert!(!privy.session_is_live(&cookie_session(unix() - 120)));
+        let subject = subject_for_user(USER);
+        assert!(privy.session_is_live(&subject, &cookie_session(unix())));
+        assert!(!privy.session_is_live(&subject, &cookie_session(unix() - 120)));
     }
 
     /// A full sign-out list never forgets a sign-out in a way that lets its
-    /// token back in: it refuses every token issued so far instead.
+    /// token back in: it refuses every token issued so far instead. Only
+    /// sign-outs by many distinct users fill it.
     #[test]
     fn a_full_sign_out_list_refuses_rather_than_forgets() {
         let app = FakeApp::new("http://unused");
@@ -1303,17 +1421,57 @@ pub(crate) mod tests {
         };
         let victim = token("sess_victim", unix());
         let bystander = token("sess_bystander", unix());
-        privy.revoke_session("sess_victim");
+        privy.revoke_session(&subject_for_user(USER), "sess_victim");
         for i in 1..MAX_REVOKED_SESSIONS {
-            privy.revoke_session(&format!("sess_{i}"));
+            privy.revoke_session(&format!("sub_{i}"), &format!("sess_{i}"));
         }
         assert!(privy.verify(&victim).is_err());
         assert!(privy.verify(&bystander).is_ok(), "not full yet");
 
-        privy.revoke_session("sess_one_too_many");
+        privy.revoke_session("sub_one_too_many", "sess_one_too_many");
         assert!(privy.verify(&victim).is_err(), "the evicted sign-out holds");
         assert!(privy.verify(&bystander).is_err(), "everyone signs in again");
         assert!(privy.verify(&token("sess_new", unix() + 2)).is_ok());
+    }
+
+    /// One user signing out session after session never fills the list:
+    /// past their share they are remembered by one entry that refuses all
+    /// of their earlier tokens, and nobody else is signed out.
+    #[test]
+    fn one_user_signing_out_repeatedly_signs_out_only_themselves() {
+        const OTHER: &str = "did:privy:someone-else";
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sub: &str, sid: &str, iat: u64| {
+            app.token(json!({
+                "sub": sub, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": unix() + 600, "iat": iat
+            }))
+        };
+        let bystander = token(OTHER, "sess_bystander", unix());
+        let first = token(USER, "sess_0", unix());
+        let untouched = token(USER, "sess_kept", unix());
+        let subject = subject_for_user(USER);
+        for i in 0..MAX_SIGN_OUTS_PER_USER {
+            privy.revoke_session(&subject, &format!("sess_{i}"));
+        }
+        assert!(privy.verify(&first).is_err());
+        assert!(privy.verify(&untouched).is_ok(), "within their share");
+
+        for i in MAX_SIGN_OUTS_PER_USER..2 * MAX_REVOKED_SESSIONS {
+            privy.revoke_session(&subject, &format!("sess_{i}"));
+        }
+        assert!(privy.revoked.lock().unwrap().len() <= MAX_SIGN_OUTS_PER_USER + 1);
+        assert!(privy.verify(&first).is_err(), "earlier sign-outs hold");
+        assert!(
+            privy.verify(&untouched).is_err(),
+            "past their share every earlier token of theirs is refused"
+        );
+        assert!(privy.verify(&bystander).is_ok(), "nobody else signs out");
+        assert!(
+            privy.verify(&token(USER, "sess_fresh", unix() + 2)).is_ok(),
+            "they sign in again"
+        );
     }
 
     #[test]
