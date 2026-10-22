@@ -1609,14 +1609,19 @@ fn ensure_single_transfer(args: &[String], tool: ToolKind) -> Result<()> {
     let line = CommandLine::parse(args, spec);
     for option in &line.options {
         match option.name {
-            OptionName::Long(name)
-                if spec.multi_transfer_long.contains(&name)
-                    || spec
-                        .multi_transfer_long_prefixes
-                        .iter()
-                        .any(|p| name.starts_with(p)) =>
-            {
+            OptionName::Long(name) if spec.adds_transfers(name) => {
                 return refuse(&format!("uses `--{name}`"));
+            }
+            // The tool itself rejects an ambiguous abbreviation, but one
+            // that could stand for a transfer-adding option is refused here
+            // whatever the tool's option table says.
+            OptionName::Ambiguous(typed)
+                if spec
+                    .long
+                    .candidates(typed)
+                    .any(|name| spec.adds_transfers(name)) =>
+            {
+                return refuse(&format!("uses `--{typed}`"));
             }
             OptionName::Short(c) if spec.multi_transfer_short.contains(c) => {
                 return refuse(&format!("uses `-{c}`"));
@@ -1662,7 +1667,10 @@ struct ParsedOption<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OptionName<'a> {
+    /// A long option by its full name, however the caller abbreviated it.
     Long(&'a str),
+    /// An abbreviation the tool refuses because it fits several options.
+    Ambiguous(&'a str),
     Short(char),
 }
 
@@ -1698,8 +1706,14 @@ impl<'a> CommandLine<'a> {
                     Some((name, value)) => (name, Some(value)),
                     None => (long, None),
                 };
-                let is_url = spec.url_long == Some(name);
-                let takes_value = is_url || spec.value_long.contains(&name);
+                let (name, arg) = match spec.long.resolve(name) {
+                    LongMatch::Known(name, arg) => (OptionName::Long(name), arg),
+                    LongMatch::Ambiguous(typed) => (OptionName::Ambiguous(typed), LongArg::None),
+                };
+                let is_url = spec
+                    .url_long
+                    .is_some_and(|url| name == OptionName::Long(url));
+                let takes_value = is_url || arg == LongArg::Required;
                 let value = match inline_value {
                     Some(value) => Some(value),
                     None if takes_value => {
@@ -1716,10 +1730,7 @@ impl<'a> CommandLine<'a> {
                         inline: inline_value.is_some(),
                     });
                 }
-                options.push(ParsedOption {
-                    name: OptionName::Long(name),
-                    value,
-                });
+                options.push(ParsedOption { name, value });
             } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
                 let mut chars = shorts.char_indices();
                 while let Some((at, c)) = chars.next() {
@@ -1762,6 +1773,14 @@ impl<'a> CommandLine<'a> {
     }
 }
 
+/// The options of a wget command line, by full name.
+fn wget_options(args: &[String]) -> impl Iterator<Item = (OptionName<'_>, Option<&str>)> {
+    CommandLine::parse(args, &WGET_OPTIONS)
+        .options
+        .into_iter()
+        .map(|option| (option.name, option.value))
+}
+
 /// What [`ensure_single_transfer`] needs to know about a tool's options.
 struct TransferOptions {
     /// Short options that consume a value (attached or as the next arg).
@@ -1770,8 +1789,8 @@ struct TransferOptions {
     boolean_prefix_short: &'static str,
     /// Short options that add transfers on their own.
     multi_transfer_short: &'static str,
-    /// Long options (without `--`) that consume a value.
-    value_long: &'static [&'static str],
+    /// How long options (without `--`) are spelled and what they take.
+    long: LongOptions,
     /// Long options that add transfers on their own.
     multi_transfer_long: &'static [&'static str],
     multi_transfer_long_prefixes: &'static [&'static str],
@@ -1779,154 +1798,234 @@ struct TransferOptions {
     url_long: Option<&'static str>,
 }
 
+impl TransferOptions {
+    fn adds_transfers(&self, name: &str) -> bool {
+        self.multi_transfer_long.contains(&name)
+            || self
+                .multi_transfer_long_prefixes
+                .iter()
+                .any(|p| name.starts_with(p))
+    }
+}
+
+/// Whether a long option takes a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongArg {
+    None,
+    /// The value is the rest of the argument or the next one.
+    Required,
+    /// The value is only ever given inline (`--name=value`).
+    Optional,
+}
+
+/// How a tool matches the long options on its command line.
+enum LongOptions {
+    /// Names are matched exactly (curl). Only the ones that take a value
+    /// are listed; anything else is a flag.
+    Exact {
+        takes_value: &'static [&'static str],
+    },
+    /// `getopt_long` (wget): an exact name, or else any prefix of exactly
+    /// one name, selects that option. This is the tool's whole table.
+    Abbreviable(&'static [(&'static str, LongArg)]),
+}
+
+enum LongMatch<'a> {
+    Known(&'a str, LongArg),
+    Ambiguous(&'a str),
+}
+
+impl LongOptions {
+    fn resolve<'a>(&self, typed: &'a str) -> LongMatch<'a> {
+        match self {
+            Self::Exact { takes_value } => {
+                let arg = if takes_value.contains(&typed) {
+                    LongArg::Required
+                } else {
+                    LongArg::None
+                };
+                LongMatch::Known(typed, arg)
+            }
+            Self::Abbreviable(table) => {
+                if let Some(&(name, arg)) = table.iter().find(|(name, _)| *name == typed) {
+                    return LongMatch::Known(name, arg);
+                }
+                let mut candidates = table.iter().filter(|(name, _)| name.starts_with(typed));
+                match (candidates.next(), candidates.next()) {
+                    (Some(&(name, arg)), None) => LongMatch::Known(name, arg),
+                    (Some(_), Some(_)) => LongMatch::Ambiguous(typed),
+                    // Unknown: the tool refuses to run at all.
+                    (None, _) => LongMatch::Known(typed, LongArg::None),
+                }
+            }
+        }
+    }
+
+    /// Every option name `typed` could abbreviate.
+    fn candidates<'s>(&'s self, typed: &'s str) -> impl Iterator<Item = &'static str> + 's {
+        let table: &'static [(&'static str, LongArg)] = match self {
+            Self::Exact { .. } => &[],
+            Self::Abbreviable(table) => table,
+        };
+        table
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(move |name| name.starts_with(typed))
+    }
+}
+
 static CURL_OPTIONS: TransferOptions = TransferOptions {
     value_short: "ECbcdDFPHmoxUQreXYytzTuAw",
     boolean_prefix_short: "",
     // `-:` is `--next`, `-K` reads a config file that can add URLs.
     multi_transfer_short: ":K",
-    value_long: &[
-        "abstract-unix-socket",
-        "alt-svc",
-        "aws-sigv4",
-        "cacert",
-        "capath",
-        "cert",
-        "cert-type",
-        "ciphers",
-        "connect-timeout",
-        "connect-to",
-        "continue-at",
-        "cookie",
-        "cookie-jar",
-        "create-file-mode",
-        "crlfile",
-        "curves",
-        "data",
-        "data-ascii",
-        "data-binary",
-        "data-raw",
-        "data-urlencode",
-        "delegation",
-        "dns-interface",
-        "dns-ipv4-addr",
-        "dns-ipv6-addr",
-        "dns-servers",
-        "doh-url",
-        "dump-header",
-        "ech",
-        "egd-file",
-        "engine",
-        "etag-compare",
-        "etag-save",
-        "expect100-timeout",
-        "form",
-        "form-string",
-        "ftp-account",
-        "ftp-alternative-to-user",
-        "ftp-method",
-        "ftp-port",
-        "ftp-ssl-ccc-mode",
-        "happy-eyeballs-timeout-ms",
-        "haproxy-clientip",
-        "header",
-        "hostpubmd5",
-        "hostpubsha256",
-        "hsts",
-        "interface",
-        "ip-tos",
-        "ipfs-gateway",
-        "json",
-        "keepalive-cnt",
-        "keepalive-time",
-        "key",
-        "key-type",
-        "knownhosts",
-        "krb",
-        "libcurl",
-        "limit-rate",
-        "local-port",
-        "login-options",
-        "mail-auth",
-        "mail-from",
-        "mail-rcpt",
-        "max-filesize",
-        "max-redirs",
-        "max-time",
-        "netrc-file",
-        "noproxy",
-        "oauth2-bearer",
-        "output",
-        "output-dir",
-        "parallel-max",
-        "pass",
-        "pinnedpubkey",
-        "preproxy",
-        "proto",
-        "proto-default",
-        "proto-redir",
-        "proxy",
-        "proxy1.0",
-        "proxy-cacert",
-        "proxy-capath",
-        "proxy-cert",
-        "proxy-cert-type",
-        "proxy-ciphers",
-        "proxy-crlfile",
-        "proxy-header",
-        "proxy-key",
-        "proxy-key-type",
-        "proxy-pass",
-        "proxy-pinnedpubkey",
-        "proxy-service-name",
-        "proxy-tls13-ciphers",
-        "proxy-tlsauthtype",
-        "proxy-tlspassword",
-        "proxy-tlsuser",
-        "proxy-user",
-        "pubkey",
-        "quote",
-        "random-file",
-        "range",
-        "rate",
-        "referer",
-        "request",
-        "request-target",
-        "resolve",
-        "retry",
-        "retry-delay",
-        "retry-max-time",
-        "sasl-authzid",
-        "service-name",
-        "sigalgs",
-        "socks4",
-        "socks4a",
-        "socks5",
-        "socks5-gssapi-service",
-        "socks5-hostname",
-        "speed-limit",
-        "speed-time",
-        "ssl-sessions",
-        "stderr",
-        "telnet-option",
-        "tftp-blksize",
-        "time-cond",
-        "tls-max",
-        "tls13-ciphers",
-        "tlsauthtype",
-        "tlspassword",
-        "tlsuser",
-        "trace",
-        "trace-ascii",
-        "trace-config",
-        "unix-socket",
-        "upload-file",
-        "upload-flags",
-        "url-query",
-        "user",
-        "user-agent",
-        "vlan-priority",
-        "write-out",
-    ],
+    // curl matches long options exactly: `--nex` is an unknown option, not
+    // `--next` (checked against curl 8.7 and 8.20).
+    long: LongOptions::Exact {
+        takes_value: &[
+            "abstract-unix-socket",
+            "alt-svc",
+            "aws-sigv4",
+            "cacert",
+            "capath",
+            "cert",
+            "cert-type",
+            "ciphers",
+            "connect-timeout",
+            "connect-to",
+            "continue-at",
+            "cookie",
+            "cookie-jar",
+            "create-file-mode",
+            "crlfile",
+            "curves",
+            "data",
+            "data-ascii",
+            "data-binary",
+            "data-raw",
+            "data-urlencode",
+            "delegation",
+            "dns-interface",
+            "dns-ipv4-addr",
+            "dns-ipv6-addr",
+            "dns-servers",
+            "doh-url",
+            "dump-header",
+            "ech",
+            "egd-file",
+            "engine",
+            "etag-compare",
+            "etag-save",
+            "expect100-timeout",
+            "form",
+            "form-string",
+            "ftp-account",
+            "ftp-alternative-to-user",
+            "ftp-method",
+            "ftp-port",
+            "ftp-ssl-ccc-mode",
+            "happy-eyeballs-timeout-ms",
+            "haproxy-clientip",
+            "header",
+            "hostpubmd5",
+            "hostpubsha256",
+            "hsts",
+            "interface",
+            "ip-tos",
+            "ipfs-gateway",
+            "json",
+            "keepalive-cnt",
+            "keepalive-time",
+            "key",
+            "key-type",
+            "knownhosts",
+            "krb",
+            "libcurl",
+            "limit-rate",
+            "local-port",
+            "login-options",
+            "mail-auth",
+            "mail-from",
+            "mail-rcpt",
+            "max-filesize",
+            "max-redirs",
+            "max-time",
+            "netrc-file",
+            "noproxy",
+            "oauth2-bearer",
+            "output",
+            "output-dir",
+            "parallel-max",
+            "pass",
+            "pinnedpubkey",
+            "preproxy",
+            "proto",
+            "proto-default",
+            "proto-redir",
+            "proxy",
+            "proxy1.0",
+            "proxy-cacert",
+            "proxy-capath",
+            "proxy-cert",
+            "proxy-cert-type",
+            "proxy-ciphers",
+            "proxy-crlfile",
+            "proxy-header",
+            "proxy-key",
+            "proxy-key-type",
+            "proxy-pass",
+            "proxy-pinnedpubkey",
+            "proxy-service-name",
+            "proxy-tls13-ciphers",
+            "proxy-tlsauthtype",
+            "proxy-tlspassword",
+            "proxy-tlsuser",
+            "proxy-user",
+            "pubkey",
+            "quote",
+            "random-file",
+            "range",
+            "rate",
+            "referer",
+            "request",
+            "request-target",
+            "resolve",
+            "retry",
+            "retry-delay",
+            "retry-max-time",
+            "sasl-authzid",
+            "service-name",
+            "sigalgs",
+            "socks4",
+            "socks4a",
+            "socks5",
+            "socks5-gssapi-service",
+            "socks5-hostname",
+            "speed-limit",
+            "speed-time",
+            "ssl-sessions",
+            "stderr",
+            "telnet-option",
+            "tftp-blksize",
+            "time-cond",
+            "tls-max",
+            "tls13-ciphers",
+            "tlsauthtype",
+            "tlspassword",
+            "tlsuser",
+            "trace",
+            "trace-ascii",
+            "trace-config",
+            "unix-socket",
+            "upload-file",
+            "upload-flags",
+            "url-query",
+            "user",
+            "user-agent",
+            "vlan-priority",
+            "write-out",
+        ],
+    },
     // `--variable` and `--expand-*` can synthesise URLs at run time.
     multi_transfer_long: &["next", "config", "variable"],
     multi_transfer_long_prefixes: &["expand-"],
@@ -1934,89 +2033,12 @@ static CURL_OPTIONS: TransferOptions = TransferOptions {
 };
 
 static WGET_OPTIONS: TransferOptions = TransferOptions {
-    value_short: "oaBtOTwQPUlARDIX",
+    value_short: "oaBtOTwQPUlARDIXY",
     boolean_prefix_short: "n",
     // `-i` reads URLs from a file; `-r`, `-m` and `-p` crawl; `-e` runs
     // wgetrc commands, which can set any of those.
     multi_transfer_short: "irmpe",
-    value_long: &[
-        "output-file",
-        "append-output",
-        "report-speed",
-        "base",
-        "rejected-log",
-        "tries",
-        "retry-on-http-error",
-        "output-document",
-        "start-pos",
-        "progress",
-        "timeout",
-        "dns-timeout",
-        "connect-timeout",
-        "read-timeout",
-        "wait",
-        "waitretry",
-        "quota",
-        "bind-address",
-        "limit-rate",
-        "restrict-file-names",
-        "prefer-family",
-        "user",
-        "password",
-        "use-askpass",
-        "local-encoding",
-        "remote-encoding",
-        "directory-prefix",
-        "cut-dirs",
-        "http-user",
-        "http-password",
-        "default-page",
-        "header",
-        "compression",
-        "proxy-user",
-        "proxy-password",
-        "referer",
-        "user-agent",
-        "load-cookies",
-        "save-cookies",
-        "post-data",
-        "post-file",
-        "method",
-        "body-data",
-        "body-file",
-        "secure-protocol",
-        "certificate",
-        "certificate-type",
-        "private-key",
-        "private-key-type",
-        "ca-certificate",
-        "ca-directory",
-        "crl-file",
-        "pinnedpubkey",
-        "random-file",
-        "ciphers",
-        "ftp-user",
-        "ftp-password",
-        "warc-file",
-        "warc-header",
-        "warc-max-size",
-        "warc-dedup",
-        "warc-tempdir",
-        "level",
-        "backups",
-        "accept",
-        "reject",
-        "accept-regex",
-        "reject-regex",
-        "regex-type",
-        "domains",
-        "exclude-domains",
-        "follow-tags",
-        "ignore-tags",
-        "include-directories",
-        "exclude-directories",
-        "max-redirect",
-    ],
+    long: LongOptions::Abbreviable(WGET_LONG_OPTIONS),
     multi_transfer_long: &[
         "input-file",
         "input-metalink",
@@ -2025,10 +2047,272 @@ static WGET_OPTIONS: TransferOptions = TransferOptions {
         "page-requisites",
         "execute",
         "config",
+        // Downloads the file from the mirrors a metalink response lists.
+        "metalink-over-http",
     ],
     multi_transfer_long_prefixes: &[],
     url_long: None,
 };
+
+/// wget's long options, as `getopt_long` sees them: every entry of
+/// `option_data` in wget's `src/main.c`, plus the `no-` twin `init_switches`
+/// adds for each boolean (booleans take an inline value only, `--foo=off`).
+/// The whole table is needed to resolve abbreviations the way wget does:
+/// `--input-fil` is `--input-file`, `--mirro` is `--mirror`, `--exec` is
+/// `--execute`.
+static WGET_LONG_OPTIONS: &[(&str, LongArg)] = &[
+    ("accept", LongArg::Required),
+    ("accept-regex", LongArg::Required),
+    ("adjust-extension", LongArg::Optional),
+    ("append-output", LongArg::Required),
+    ("ask-password", LongArg::Optional),
+    ("auth-no-challenge", LongArg::Optional),
+    ("background", LongArg::Optional),
+    ("backup-converted", LongArg::Optional),
+    ("backups", LongArg::Optional),
+    ("base", LongArg::Required),
+    ("bind-address", LongArg::Required),
+    ("bind-dns-address", LongArg::Required),
+    ("body-data", LongArg::Required),
+    ("body-file", LongArg::Required),
+    ("ca-certificate", LongArg::Required),
+    ("ca-directory", LongArg::Required),
+    ("cache", LongArg::Optional),
+    ("certificate", LongArg::Required),
+    ("certificate-type", LongArg::Required),
+    ("check-certificate", LongArg::Optional),
+    ("ciphers", LongArg::Required),
+    ("clobber", LongArg::Optional),
+    ("compression", LongArg::Required),
+    ("config", LongArg::Required),
+    ("connect-timeout", LongArg::Required),
+    ("content-disposition", LongArg::Optional),
+    ("content-on-error", LongArg::Optional),
+    ("continue", LongArg::Optional),
+    ("convert-file-only", LongArg::Optional),
+    ("convert-links", LongArg::Optional),
+    ("cookies", LongArg::Optional),
+    ("crl-file", LongArg::Required),
+    ("cut-dirs", LongArg::Required),
+    ("debug", LongArg::Optional),
+    ("default-page", LongArg::Required),
+    ("delete-after", LongArg::Optional),
+    ("directories", LongArg::Optional),
+    ("directory-prefix", LongArg::Required),
+    ("dns-cache", LongArg::Optional),
+    ("dns-servers", LongArg::Required),
+    ("dns-timeout", LongArg::Required),
+    ("domains", LongArg::Required),
+    ("dont-remove-listing", LongArg::None),
+    ("dot-style", LongArg::Required),
+    ("egd-file", LongArg::Required),
+    ("exclude-directories", LongArg::Required),
+    ("exclude-domains", LongArg::Required),
+    ("execute", LongArg::Required),
+    ("follow-ftp", LongArg::Optional),
+    ("follow-tags", LongArg::Required),
+    ("force-directories", LongArg::Optional),
+    ("force-html", LongArg::Optional),
+    ("ftp-password", LongArg::Required),
+    ("ftp-stmlf", LongArg::Optional),
+    ("ftp-user", LongArg::Required),
+    ("ftps-clear-data-connection", LongArg::Optional),
+    ("ftps-fallback-to-ftp", LongArg::Optional),
+    ("ftps-implicit", LongArg::Optional),
+    ("ftps-resume-ssl", LongArg::Optional),
+    ("glob", LongArg::Optional),
+    ("header", LongArg::Required),
+    ("help", LongArg::None),
+    ("host-directories", LongArg::Optional),
+    ("hsts", LongArg::Optional),
+    ("hsts-file", LongArg::Required),
+    ("html-extension", LongArg::Optional),
+    ("htmlify", LongArg::Optional),
+    ("http-keep-alive", LongArg::Optional),
+    ("http-passwd", LongArg::Required),
+    ("http-password", LongArg::Required),
+    ("http-user", LongArg::Required),
+    ("https-only", LongArg::Optional),
+    ("if-modified-since", LongArg::Optional),
+    ("ignore-case", LongArg::Optional),
+    ("ignore-length", LongArg::Optional),
+    ("ignore-tags", LongArg::Required),
+    ("include-directories", LongArg::Required),
+    ("inet4-only", LongArg::Optional),
+    ("inet6-only", LongArg::Optional),
+    ("input-file", LongArg::Required),
+    ("input-metalink", LongArg::Required),
+    ("iri", LongArg::Optional),
+    ("keep-badhash", LongArg::Optional),
+    ("keep-session-cookies", LongArg::Optional),
+    ("level", LongArg::Required),
+    ("limit-rate", LongArg::Required),
+    ("load-cookies", LongArg::Required),
+    ("local-encoding", LongArg::Required),
+    ("max-redirect", LongArg::Required),
+    ("metalink-index", LongArg::Required),
+    ("metalink-over-http", LongArg::Optional),
+    ("method", LongArg::Required),
+    ("mirror", LongArg::Optional),
+    ("netrc", LongArg::Optional),
+    ("no", LongArg::Required),
+    ("no-adjust-extension", LongArg::None),
+    ("no-ask-password", LongArg::None),
+    ("no-auth-no-challenge", LongArg::None),
+    ("no-background", LongArg::None),
+    ("no-backup-converted", LongArg::None),
+    ("no-backups", LongArg::None),
+    ("no-cache", LongArg::None),
+    ("no-check-certificate", LongArg::None),
+    ("no-clobber", LongArg::Optional),
+    ("no-config", LongArg::Optional),
+    ("no-content-disposition", LongArg::None),
+    ("no-content-on-error", LongArg::None),
+    ("no-continue", LongArg::None),
+    ("no-convert-file-only", LongArg::None),
+    ("no-convert-links", LongArg::None),
+    ("no-cookies", LongArg::None),
+    ("no-debug", LongArg::None),
+    ("no-delete-after", LongArg::None),
+    ("no-directories", LongArg::None),
+    ("no-dns-cache", LongArg::None),
+    ("no-follow-ftp", LongArg::None),
+    ("no-force-directories", LongArg::None),
+    ("no-force-html", LongArg::None),
+    ("no-ftp-stmlf", LongArg::None),
+    ("no-ftps-clear-data-connection", LongArg::None),
+    ("no-ftps-fallback-to-ftp", LongArg::None),
+    ("no-ftps-implicit", LongArg::None),
+    ("no-ftps-resume-ssl", LongArg::None),
+    ("no-glob", LongArg::None),
+    ("no-host-directories", LongArg::None),
+    ("no-hsts", LongArg::None),
+    ("no-html-extension", LongArg::None),
+    ("no-htmlify", LongArg::None),
+    ("no-http-keep-alive", LongArg::None),
+    ("no-https-only", LongArg::None),
+    ("no-if-modified-since", LongArg::None),
+    ("no-ignore-case", LongArg::None),
+    ("no-ignore-length", LongArg::None),
+    ("no-inet4-only", LongArg::None),
+    ("no-inet6-only", LongArg::None),
+    ("no-iri", LongArg::None),
+    ("no-keep-badhash", LongArg::None),
+    ("no-keep-session-cookies", LongArg::None),
+    ("no-metalink-over-http", LongArg::None),
+    ("no-mirror", LongArg::None),
+    ("no-netrc", LongArg::None),
+    ("no-no-clobber", LongArg::None),
+    ("no-no-config", LongArg::None),
+    ("no-no-parent", LongArg::None),
+    ("no-page-requisites", LongArg::None),
+    ("no-parent", LongArg::Optional),
+    ("no-passive-ftp", LongArg::None),
+    ("no-preserve-permissions", LongArg::None),
+    ("no-protocol-directories", LongArg::None),
+    ("no-proxy", LongArg::None),
+    ("no-quiet", LongArg::None),
+    ("no-random-wait", LongArg::None),
+    ("no-recursive", LongArg::None),
+    ("no-relative", LongArg::None),
+    ("no-remove-listing", LongArg::None),
+    ("no-report-speed", LongArg::None),
+    ("no-restrict-file-names", LongArg::None),
+    ("no-retr-symlinks", LongArg::None),
+    ("no-retry-connrefused", LongArg::None),
+    ("no-retry-on-host-error", LongArg::None),
+    ("no-save-headers", LongArg::None),
+    ("no-server-response", LongArg::None),
+    ("no-show-progress", LongArg::None),
+    ("no-span-hosts", LongArg::None),
+    ("no-spider", LongArg::None),
+    ("no-strict-comments", LongArg::None),
+    ("no-timestamping", LongArg::None),
+    ("no-trust-server-names", LongArg::None),
+    ("no-unlink", LongArg::None),
+    ("no-use-server-timestamps", LongArg::None),
+    ("no-verbose", LongArg::None),
+    ("no-warc-cdx", LongArg::None),
+    ("no-warc-compression", LongArg::None),
+    ("no-warc-digests", LongArg::None),
+    ("no-warc-keep-log", LongArg::None),
+    ("no-wdebug", LongArg::None),
+    ("no-xattr", LongArg::None),
+    ("output-document", LongArg::Required),
+    ("output-file", LongArg::Required),
+    ("page-requisites", LongArg::Optional),
+    ("parent", LongArg::Optional),
+    ("passive-ftp", LongArg::Optional),
+    ("password", LongArg::Required),
+    ("pinnedpubkey", LongArg::Required),
+    ("post-data", LongArg::Required),
+    ("post-file", LongArg::Required),
+    ("prefer-family", LongArg::Required),
+    ("preferred-location", LongArg::Required),
+    ("preserve-permissions", LongArg::Optional),
+    ("private-key", LongArg::Required),
+    ("private-key-type", LongArg::Required),
+    ("progress", LongArg::Required),
+    ("protocol-directories", LongArg::Optional),
+    ("proxy", LongArg::Optional),
+    ("proxy-passwd", LongArg::Required),
+    ("proxy-password", LongArg::Required),
+    ("proxy-user", LongArg::Required),
+    ("proxy__compat", LongArg::Required),
+    ("quiet", LongArg::Optional),
+    ("quota", LongArg::Required),
+    ("random-file", LongArg::Required),
+    ("random-wait", LongArg::Optional),
+    ("read-timeout", LongArg::Required),
+    ("recursive", LongArg::Optional),
+    ("referer", LongArg::Required),
+    ("regex-type", LongArg::Required),
+    ("reject", LongArg::Required),
+    ("reject-regex", LongArg::Required),
+    ("rejected-log", LongArg::Required),
+    ("relative", LongArg::Optional),
+    ("remote-encoding", LongArg::Required),
+    ("remove-listing", LongArg::Optional),
+    ("report-speed", LongArg::Optional),
+    ("restrict-file-names", LongArg::Optional),
+    ("retr-symlinks", LongArg::Optional),
+    ("retry-connrefused", LongArg::Optional),
+    ("retry-on-host-error", LongArg::Optional),
+    ("retry-on-http-error", LongArg::Required),
+    ("save-cookies", LongArg::Required),
+    ("save-headers", LongArg::Optional),
+    ("secure-protocol", LongArg::Required),
+    ("server-response", LongArg::Optional),
+    ("show-progress", LongArg::Optional),
+    ("span-hosts", LongArg::Optional),
+    ("spider", LongArg::Optional),
+    ("start-pos", LongArg::Required),
+    ("strict-comments", LongArg::Optional),
+    ("timeout", LongArg::Required),
+    ("timestamping", LongArg::Optional),
+    ("tries", LongArg::Required),
+    ("trust-server-names", LongArg::Optional),
+    ("unlink", LongArg::Optional),
+    ("use-askpass", LongArg::Required),
+    ("use-server-timestamps", LongArg::Optional),
+    ("user", LongArg::Required),
+    ("user-agent", LongArg::Required),
+    ("verbose", LongArg::Optional),
+    ("version", LongArg::None),
+    ("wait", LongArg::Required),
+    ("waitretry", LongArg::Required),
+    ("warc-cdx", LongArg::Optional),
+    ("warc-compression", LongArg::Optional),
+    ("warc-dedup", LongArg::Required),
+    ("warc-digests", LongArg::Optional),
+    ("warc-file", LongArg::Required),
+    ("warc-header", LongArg::Required),
+    ("warc-keep-log", LongArg::Optional),
+    ("warc-max-size", LongArg::Required),
+    ("warc-tempdir", LongArg::Required),
+    ("wdebug", LongArg::Optional),
+    ("xattr", LongArg::Optional),
+];
 
 /// Flags that stop the wrapped tool from following redirects, appended after
 /// the user's args (so they win over `-L`, `--location-trusted`, `--follow`
@@ -2375,6 +2659,14 @@ fn user_already_set_user_agent(args: &[String], tool: ToolKind) -> bool {
     if user_already_set_header(args, tool, "user-agent") {
         return true;
     }
+    if let ToolKind::Wget = tool {
+        return wget_options(args).any(|(name, value)| {
+            matches!(
+                name,
+                OptionName::Short('U') | OptionName::Long("user-agent")
+            ) && value.is_some()
+        });
+    }
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         match tool {
@@ -2389,24 +2681,19 @@ fn user_already_set_user_agent(args: &[String], tool: ToolKind) -> bool {
                     return true;
                 }
             }
-            ToolKind::Wget => {
-                if arg == "-U" || arg == "--user-agent" {
-                    return iter.peek().is_some();
-                }
-                if arg.starts_with("-U") && arg.len() > 2 {
-                    return true;
-                }
-                if arg.starts_with("--user-agent=") {
-                    return true;
-                }
-            }
-            ToolKind::Httpie => {}
+            ToolKind::Wget | ToolKind::Httpie => {}
         }
     }
     false
 }
 
 fn user_already_set_header(args: &[String], tool: ToolKind, header_name: &str) -> bool {
+    if let ToolKind::Wget = tool {
+        return wget_options(args).any(|(name, value)| {
+            name == OptionName::Long("header")
+                && value.is_some_and(|value| is_header_name(value, header_name))
+        });
+    }
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         match tool {
@@ -2425,19 +2712,7 @@ fn user_already_set_header(args: &[String], tool: ToolKind, header_name: &str) -
                     return true;
                 }
             }
-            ToolKind::Wget => {
-                if let Some(val) = arg.strip_prefix("--header=")
-                    && is_header_name(val, header_name)
-                {
-                    return true;
-                }
-                if arg == "--header"
-                    && let Some(next) = iter.peek()
-                    && is_header_name(next, header_name)
-                {
-                    return true;
-                }
-            }
+            ToolKind::Wget => {}
             ToolKind::Httpie => {
                 if is_header_name(arg, header_name) {
                     return true;
@@ -3091,6 +3366,88 @@ mod pre_attach_tests {
     }
 
     #[test]
+    fn wget_abbreviations_are_read_as_the_option_they_select() {
+        // getopt_long accepts any unambiguous prefix of a long option.
+        for args in [
+            s(&["--input-fil=urls.txt"]),
+            s(&["--input-fil", "urls.txt"]),
+            s(&["--mirro", "https://a.example/paid"]),
+            s(&["--recur", "https://a.example/paid"]),
+            s(&["--page-req", "https://a.example/paid"]),
+            s(&["--exec", "recursive=on", "https://a.example/paid"]),
+            s(&["--conf=evil.wgetrc", "https://a.example/paid"]),
+            s(&["--metalink-over", "https://a.example/paid"]),
+            // Ambiguous, and one reading (`--config`) adds transfers.
+            s(&["--con", "x", "https://a.example/paid"]),
+            // Booleans take no separate value: both URLs are transfers.
+            s(&[
+                "--backups",
+                "https://collector.example/",
+                "https://a.example/paid",
+            ]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_err(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            s(&["--head", "Accept: x", "https://a.example/paid"]),
+            s(&["--output-doc=-", "https://a.example/paid"]),
+            s(&["--no-verb", "--quiet", "https://a.example/paid"]),
+            s(&["--report-speed=bits", "https://a.example/paid"]),
+            s(&["--no-recursive", "https://a.example/paid"]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wget_abbreviations_reach_every_reading_of_the_command_line() {
+        assert!(!follows_redirects(
+            &s(&["--max-redir=0", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!is_bodyless_read(
+            &s(&["--post-d=a=1", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(user_already_set_auth(
+            &s(&["--head=Authorization: Bearer mine", "https://a.example/"]),
+            ToolKind::Wget
+        ));
+        assert!(user_already_set_user_agent(
+            &s(&["--user-a", "agent", "https://a.example/"]),
+            ToolKind::Wget
+        ));
+        let request =
+            ParsedWgetRequest::from_args(&s(&["--post-d", "a=1", "https://a.example/paid"]));
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.body.as_deref(), Some("a=1"));
+        assert_eq!(request.url.as_deref(), Some("https://a.example/paid"));
+    }
+
+    #[test]
+    fn curl_long_options_are_never_abbreviated() {
+        // curl rejects `--nex` as unknown rather than reading `--next`, so
+        // it is a flag here too; the URL count still holds the line.
+        assert!(
+            ensure_single_transfer(&s(&["--nex", "https://a.example/paid"]), ToolKind::Curl)
+                .is_ok()
+        );
+        assert!(
+            ensure_single_transfer(
+                &s(&["https://a.example/paid", "--nex", "https://c.example/"]),
+                ToolKind::Curl
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn credentials_are_never_injected_into_a_multi_transfer_command() {
         // The public retry entry points refuse before spawning anything.
         let args = s(&["https://a.example/paid", "https://collector.example/"]);
@@ -3345,58 +3702,29 @@ struct ParsedWgetRequest {
 
 impl ParsedWgetRequest {
     fn from_args(args: &[String]) -> Self {
-        let mut url = None;
+        let url = resolve_request_url(args, ToolKind::Wget);
         let mut explicit_method = None;
         let mut body = None;
         let mut post_body_seen = false;
-        let mut i = 0;
-
-        while i < args.len() {
-            let arg = &args[i];
-            match arg.as_str() {
-                "--method" => {
-                    if let Some(value) = args.get(i + 1) {
+        for (name, value) in wget_options(args) {
+            match name {
+                OptionName::Long("method") => {
+                    if let Some(value) = value {
                         explicit_method = Some(value.to_ascii_uppercase());
-                        i += 1;
                     }
                 }
-                "--post-data" | "--body-data" => {
-                    if let Some(value) = args.get(i + 1) {
-                        body = Some(value.clone());
-                        post_body_seen = true;
-                        i += 1;
+                OptionName::Long("post-data" | "body-data") => {
+                    if let Some(value) = value {
+                        body = Some(value.to_string());
                     }
+                    post_body_seen = true;
                 }
-                "--spider" => {
+                OptionName::Long("post-file" | "body-file") => post_body_seen = true,
+                OptionName::Long("spider") => {
                     explicit_method.get_or_insert_with(|| "HEAD".to_string());
                 }
-                _ => {
-                    if let Some(value) = arg.strip_prefix("--method=") {
-                        explicit_method = Some(value.to_ascii_uppercase());
-                    } else if let Some(value) = arg.strip_prefix("--post-data=") {
-                        body = Some(value.to_string());
-                        post_body_seen = true;
-                    } else if let Some(value) = arg.strip_prefix("--body-data=") {
-                        body = Some(value.to_string());
-                        post_body_seen = true;
-                    } else if matches!(
-                        arg.as_str(),
-                        "--post-file" | "--body-file" | "--post-file=" | "--body-file="
-                    ) {
-                        post_body_seen = true;
-                        if !arg.ends_with('=') && args.get(i + 1).is_some() {
-                            i += 1;
-                        }
-                    } else if arg.starts_with("--post-file=") || arg.starts_with("--body-file=") {
-                        post_body_seen = true;
-                    } else if url.is_none()
-                        && (arg.starts_with("http://") || arg.starts_with("https://"))
-                    {
-                        url = Some(arg.clone());
-                    }
-                }
+                _ => {}
             }
-            i += 1;
         }
 
         let method = explicit_method.unwrap_or_else(|| {
