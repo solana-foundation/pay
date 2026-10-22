@@ -102,12 +102,14 @@ struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
     fn acquire(active: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self(Arc::clone(active)))
+        let mut n = active.load(Ordering::Acquire);
+        while n < max {
+            match active.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(Arc::clone(active))),
+                Err(current) => n = current,
+            }
+        }
+        None
     }
 }
 
