@@ -1713,7 +1713,7 @@ fn is_control_plane(path: &str) -> bool {
 fn scrub_url_credentials(credentials: &UrlCredentials, response: &mut ResponseHeader) {
     let mut scrubbed = response.headers.clone();
     credentials.scrub_response_headers(&mut scrubbed);
-    for name in URL_RESPONSE_HEADERS {
+    for (name, _) in URL_RESPONSE_HEADERS {
         let before: Vec<HeaderValue> = response.headers.get_all(&name).iter().cloned().collect();
         let after: Vec<HeaderValue> = scrubbed.get_all(&name).iter().cloned().collect();
         if before == after {

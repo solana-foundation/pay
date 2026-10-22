@@ -742,10 +742,31 @@ pub struct UrlCredentials {
     path_segments: Vec<String>,
 }
 
-/// Response headers that carry URLs the caller follows or reads.
-pub const URL_RESPONSE_HEADERS: [axum::http::HeaderName; 2] = [
-    axum::http::header::LOCATION,
-    axum::http::header::CONTENT_LOCATION,
+/// How a URL-bearing response header embeds its URLs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlHeaderSyntax {
+    /// The whole value is one URI reference.
+    Reference,
+    /// RFC 8288 link-values: `<uri-reference>; params`, comma separated.
+    LinkList,
+    /// `<delay>[; url=<uri-reference>]`.
+    Refresh,
+}
+
+/// Response headers that carry URLs the caller follows or reads, with how
+/// each embeds them. Every entry is scrubbed of gateway credentials, so a new
+/// URL-bearing header only needs a line here.
+pub const URL_RESPONSE_HEADERS: [(axum::http::HeaderName, UrlHeaderSyntax); 4] = [
+    (axum::http::header::LOCATION, UrlHeaderSyntax::Reference),
+    (
+        axum::http::header::CONTENT_LOCATION,
+        UrlHeaderSyntax::Reference,
+    ),
+    (axum::http::header::LINK, UrlHeaderSyntax::LinkList),
+    (
+        axum::http::HeaderName::from_static("refresh"),
+        UrlHeaderSyntax::Refresh,
+    ),
 ];
 
 impl UrlCredentials {
@@ -837,9 +858,19 @@ impl UrlCredentials {
                 .iter()
                 .any(|form| value.contains(form.as_str()))
                 || decoded.contains(secret.as_str())
-        }) || decoded
-            .split(['/', '?', '#', '&', '='])
-            .any(|part| self.path_segments.iter().any(|secret| secret == part))
+        }) || [
+            &['/', '?', '#', '&', '='][..],
+            // Delimiters around a URL embedded in a structured header value.
+            &[
+                '/', '?', '#', '&', '=', '<', '>', ';', ',', '"', '\'', ' ', '\t',
+            ][..],
+        ]
+        .iter()
+        .any(|delimiters| {
+            decoded
+                .split(*delimiters)
+                .any(|part| self.path_segments.iter().any(|secret| secret == part))
+        })
     }
 
     /// `value` with every query pair carrying a credential removed, or
@@ -879,13 +910,78 @@ impl UrlCredentials {
         (!self.exposed_in(&scrubbed)).then_some(scrubbed)
     }
 
+    /// `value`, a list of RFC 8288 link-values, without the credentials its
+    /// targets carry. A link whose credential cannot be removed is dropped;
+    /// `None` when no link survives.
+    fn scrub_link_list(&self, value: &str) -> Option<String> {
+        let links = split_link_values(value);
+        let mut changed = false;
+        let mut kept = Vec::new();
+        for link in &links {
+            let link = link.trim();
+            if link.is_empty() {
+                continue;
+            }
+            let parsed = link.strip_prefix('<').and_then(|rest| rest.split_once('>'));
+            let scrubbed = match parsed {
+                Some((target, params)) => self
+                    .scrub_url(target)
+                    .map(|target| format!("<{target}>{params}")),
+                None => Some(link.to_string()),
+            }
+            .filter(|link| !self.exposed_in(link));
+            match scrubbed {
+                Some(scrubbed) => {
+                    changed |= scrubbed != link;
+                    kept.push(scrubbed);
+                }
+                None => changed = true,
+            }
+        }
+        if !changed {
+            return Some(value.to_string());
+        }
+        (!kept.is_empty()).then(|| kept.join(", "))
+    }
+
+    /// `value`, a `Refresh` header, without the credentials its target
+    /// carries, or `None` when they cannot be removed.
+    fn scrub_refresh(&self, value: &str) -> Option<String> {
+        let (delay, target) = match value.find([';', ',']) {
+            Some(at) => (&value[..at], value[at + 1..].trim()),
+            None => (value, ""),
+        };
+        let target = target
+            .get(..3)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("url"))
+            .and_then(|_| target[3..].trim_start().strip_prefix('='))
+            .map(str::trim_start)
+            .unwrap_or(target);
+        let target = ['"', '\'']
+            .iter()
+            .find_map(|quote| {
+                target
+                    .strip_prefix(*quote)
+                    .and_then(|rest| rest.strip_suffix(*quote))
+            })
+            .unwrap_or(target);
+        if target.is_empty() {
+            return Some(value.to_string());
+        }
+        let scrubbed = self.scrub_url(target)?;
+        if scrubbed == target {
+            return Some(value.to_string());
+        }
+        Some(format!("{}; url={scrubbed}", delay.trim()))
+    }
+
     /// Remove injected credentials from URL-bearing response headers; a
     /// header that would still expose one is dropped.
     pub fn scrub_response_headers(&self, headers: &mut HeaderMap) {
         if self.query.is_empty() && self.path_segments.is_empty() {
             return;
         }
-        for name in URL_RESPONSE_HEADERS {
+        for (name, syntax) in URL_RESPONSE_HEADERS {
             let values: Vec<HeaderValue> = headers.get_all(&name).iter().cloned().collect();
             if values.is_empty() {
                 continue;
@@ -895,7 +991,12 @@ impl UrlCredentials {
                 if let Some(scrubbed) = value
                     .to_str()
                     .ok()
-                    .and_then(|value| self.scrub_url(value))
+                    .and_then(|value| match syntax {
+                        UrlHeaderSyntax::Reference => self.scrub_url(value),
+                        UrlHeaderSyntax::LinkList => self.scrub_link_list(value),
+                        UrlHeaderSyntax::Refresh => self.scrub_refresh(value),
+                    })
+                    .filter(|value| !self.exposed_in(value))
                     .and_then(|value| HeaderValue::from_str(&value).ok())
                 {
                     headers.append(name.clone(), scrubbed);
@@ -903,6 +1004,36 @@ impl UrlCredentials {
             }
         }
     }
+}
+
+/// Split a `Link` header into its link-values: commas inside a `<...>`
+/// target or a quoted parameter do not separate them.
+fn split_link_values(value: &str) -> Vec<&str> {
+    let mut values = Vec::new();
+    let (mut start, mut in_target, mut in_quote, mut escaped) = (0, false, false, false);
+    for (at, c) in value.char_indices() {
+        if in_quote {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '<' if !in_target => in_target = true,
+            '>' if in_target => in_target = false,
+            '"' if !in_target => in_quote = true,
+            ',' if !in_target => {
+                values.push(&value[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    values.push(&value[start..]);
+    values
 }
 
 impl std::fmt::Debug for PreparedUpstreamRequest {
@@ -2340,6 +2471,73 @@ mod tests {
         assert_eq!(headers.get(axum::http::header::LOCATION).unwrap(), "/next");
         assert!(headers.get(axum::http::header::CONTENT_LOCATION).is_none());
         assert!(headers.get("x-other").is_some());
+    }
+
+    #[test]
+    fn url_credentials_are_scrubbed_from_link_and_refresh_headers() {
+        let mut credentials = credentials(&["s3cr3t"]);
+        credentials.push_path("live-t0ken");
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::LINK,
+            HeaderValue::from_static(
+                "</next?key=s3cr3t&page=2>; rel=\"next\", \
+                 <https://up.example/live-t0ken/prev>; rel=\"prev\", \
+                 </docs?a=1,2>; rel=\"help\"; title=\"x, y\"",
+            ),
+        );
+        headers.append(
+            axum::http::header::LINK,
+            HeaderValue::from_static("<https://up.example/live-t0ken>; rel=\"self\""),
+        );
+        headers.append(
+            axum::http::HeaderName::from_static("refresh"),
+            HeaderValue::from_static("5; URL='/next?key=s3cr3t&page=2'"),
+        );
+        credentials.scrub_response_headers(&mut headers);
+        let links: Vec<_> = headers
+            .get_all(axum::http::header::LINK)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        // The credential pair goes, an irremovable link is dropped, and an
+        // unrelated link (commas inside its target and title) is kept whole.
+        assert_eq!(
+            links,
+            [r#"</next?page=2>; rel="next", </docs?a=1,2>; rel="help"; title="x, y""#]
+        );
+        assert_eq!(headers.get("refresh").unwrap(), "5; url=/next?page=2");
+
+        for (refresh, scrubbed) in [
+            ("0;url=https://up.example/live-t0ken/next", None),
+            (
+                "3, https://up.example/next?key=s3cr3t",
+                Some("3; url=https://up.example/next"),
+            ),
+            // Positive controls: nothing to remove is relayed as written.
+            ("5; url=/next?page=2", Some("5; url=/next?page=2")),
+            ("10", Some("10")),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("refresh", HeaderValue::from_str(refresh).unwrap());
+            credentials.scrub_response_headers(&mut headers);
+            assert_eq!(
+                headers.get("refresh").map(|value| value.to_str().unwrap()),
+                scrubbed,
+                "{refresh}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::LINK,
+            HeaderValue::from_static("</next?page=2>; rel=\"next\""),
+        );
+        credentials.scrub_response_headers(&mut headers);
+        assert_eq!(
+            headers.get(axum::http::header::LINK).unwrap(),
+            "</next?page=2>; rel=\"next\""
+        );
     }
 
     #[test]
