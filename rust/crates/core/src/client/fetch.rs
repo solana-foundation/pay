@@ -655,6 +655,7 @@ pub fn fetch_request_with_body_for_policy(
         body,
         redirect_policy,
         outbound_policy,
+        None,
     )?;
     if redirect_policy == RedirectPolicy::None && (300..400).contains(&raw.status) {
         let location = raw
@@ -692,6 +693,7 @@ pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome
         None,
         RedirectPolicy::Follow,
         OutboundPolicy::Unrestricted,
+        None,
     )?;
     Ok(raw_to_outcome(raw))
 }
@@ -747,6 +749,33 @@ pub fn fetch_raw_with_body_for(
         body,
         redirect_policy,
         OutboundPolicy::Unrestricted,
+        None,
+    )
+}
+
+/// Like [`fetch_raw`], but the whole request fails once `timeout` elapses.
+/// `None` keeps the client default.
+///
+/// The skills probe uses this so `--probe-timeout` bounds each endpoint.
+pub fn fetch_raw_with_timeout(
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<RawResponse> {
+    let method = Method::from_bytes(method.as_bytes())
+        .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
+    let body = body.map(RequestBody::from);
+    fetch_raw_with_method(
+        ClientApp::Cli,
+        method,
+        url,
+        extra_headers,
+        body.as_ref(),
+        RedirectPolicy::Follow,
+        OutboundPolicy::Unrestricted,
+        timeout,
     )
 }
 
@@ -792,6 +821,7 @@ fn debugger_proxy_path(url: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_raw_with_method(
     client_app: ClientApp,
     method: Method,
@@ -800,6 +830,7 @@ fn fetch_raw_with_method(
     body: Option<&RequestBody>,
     redirect_policy: RedirectPolicy,
     outbound_policy: OutboundPolicy,
+    timeout: Option<Duration>,
 ) -> Result<RawResponse> {
     if outbound_policy == OutboundPolicy::PublicInternetOnly {
         let parsed = reqwest::Url::parse(url).map_err(|error| {
@@ -829,6 +860,9 @@ fn fetch_raw_with_method(
         }
         (OutboundPolicy::Unrestricted, RedirectPolicy::Follow) => client_builder,
     };
+    if let Some(timeout) = timeout {
+        client_builder = client_builder.timeout(timeout);
+    }
     let client = client_builder
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create HTTP client: {e}")))?;
