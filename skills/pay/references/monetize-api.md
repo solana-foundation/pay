@@ -224,8 +224,9 @@ Recommended baseline:
   On Cloud Run, this maps cleanly to one service per provider or per upstream
   API, each with its own YAML spec and environment.
 - Bind to the platform port, for example `--bind 0.0.0.0:8080` on Cloud Run.
-- Store provider API keys, RPC URLs, MPP challenge secrets, and recipient
-  configuration in the cloud secret manager. Inject them as environment
+- Store provider API keys, RPC URLs, MPP challenge secrets, the Redis URL
+  (`PAY_MPP_REDIS_URL`), and recipient configuration in the cloud secret
+  manager. Inject them as environment
   variables; do not bake secrets into images or provider markdown.
 - Use a production signer backend such as `operator.signer.backend: gcp-kms`
   for fee-payer signing. The private key stays in Cloud KMS/HSM-backed key
@@ -243,6 +244,27 @@ Recommended baseline:
   upstream delivery failures, payments collected, fees paid, and remaining
   fee-payer SOL.
 
+### Durable payment state (Redis)
+
+Off devnet and localnet the gateway keeps every consumed payment in Redis, so a
+restart or a second replica cannot serve the same payment twice. A mainnet
+`pay gate api` refuses to start MPP charges or subscriptions without it, and
+disables x402 `exact` and `batch-settlement` with a warning.
+
+| Variable | Used for |
+| --- | --- |
+| `PAY_MPP_REDIS_URL` | MPP charge replay, subscriptions and sessions. Required on mainnet. |
+| `PAY_X402_REDIS_URL` | x402 `exact` replay and `batch-settlement` channels. Falls back to `PAY_MPP_REDIS_URL`. |
+| `PAY_MPP_REDIS_PREFIX` | MPP session key namespace, default `pay:session:v1:`. |
+| `PAY_X402_REDIS_PREFIX` | x402 batch channel namespace, default `pay:batch:v1:` on mainnet. |
+
+Point every replica of one gateway, and its `pay-worker`, at the same Redis and
+prefixes. Use `rediss://` for a managed instance and store the URL in the
+secret manager. Enable persistence and backups: the store holds the only record
+of accepted vouchers. Release binaries and the container image can open Redis;
+a source build needs the default features (`cargo install --path rust/crates/cli`
+keeps them).
+
 Example production spec fragment:
 
 ```yaml
@@ -259,7 +281,8 @@ operator:
     pubkey: "${PAY_GCP_KMS_PUBKEY}"
 ```
 
-Example Cloud Run command:
+Example Cloud Run command (with `PAY_MPP_REDIS_URL` injected from Secret
+Manager):
 
 ```sh
 pay gate api /app/providers/google/bigquery.yml \

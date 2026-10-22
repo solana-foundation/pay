@@ -9,7 +9,10 @@ name = "pay"
 path = "src/main.rs"
 
 [features]
-default = []
+# `redis-session-store` is on by default: hosted (mainnet) gateways refuse to
+# start without a durable replay store, so every release build must be able to
+# open one. `release_builds_can_open_a_durable_store` guards this.
+default = ["redis-session-store"]
 # `pay setup --backend ledger`; see pay-core's feature of the same name.
 # macOS enables the core feature through its target dependency below so a
 # normal `cargo install` includes Ledger support there. Other targets opt in.

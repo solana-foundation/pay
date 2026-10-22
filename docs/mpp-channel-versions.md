@@ -57,8 +57,9 @@ the account owner and on-chain hook commitment against that stored policy.
 Changing process defaults must not reinterpret an existing channel.
 
 V2 session gateways require durable Redis storage: set `PAY_MPP_REDIS_URL`
-(or the legacy `PAY_SESSION_REDIS_URL`) and use a binary built with
-`redis-session-store`. Use the same Redis namespace for the gateway and
+(or the legacy `PAY_SESSION_REDIS_URL`). Release binaries and the container
+image include the `redis-session-store` feature; a source build that drops
+default features cannot open Redis. Use the same Redis namespace for the gateway and
 settlement worker (`PAY_MPP_REDIS_PREFIX`, falling back to
 `PAY_SESSION_REDIS_PREFIX`; default `pay:session:v1:`). The namespace name does
 not select the channel ABI. Startup fails rather than falling back to memory.

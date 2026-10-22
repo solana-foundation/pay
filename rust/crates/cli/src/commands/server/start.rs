@@ -140,11 +140,10 @@ impl ConfiguredSessionStore {
             .map_err(|error| pay_core::Error::Config(error.to_string()))?;
         match self {
             Self::Static { durable: false, .. } if config.channel_version == Some(2) => {
-                Err(pay_core::Error::Config(
-                    "V2 MPP sessions require durable Redis storage; set PAY_MPP_REDIS_URL or \
-                     PAY_SESSION_REDIS_URL and build with redis-session-store"
-                        .into(),
-                ))
+                Err(pay_core::Error::Config(format!(
+                    "V2 MPP sessions require durable Redis storage; {}",
+                    durable_store_remedy("PAY_MPP_REDIS_URL")
+                )))
             }
             Self::Static { store, .. } => Ok(SessionMpp::new_with_channel_store(
                 config,
@@ -269,16 +268,16 @@ async fn charge_replay_store(
     )
     .await?;
     if !durable && deployment_policy_mode {
-        return Err(pay_core::Error::Config(
-            "deployment gateways need a shared MPP charge replay store; set PAY_MPP_REDIS_URL"
-                .into(),
-        ));
+        return Err(pay_core::Error::Config(format!(
+            "deployment gateways need a shared MPP charge replay store; {}",
+            durable_store_remedy("PAY_MPP_REDIS_URL")
+        )));
     }
     if !durable && requires_durable_store(network, deployment_policy_mode) {
         return Err(pay_core::Error::Config(format!(
-            "MPP charges on {} need a durable replay store; set PAY_MPP_REDIS_URL and build \
-             with redis-session-store",
-            network.slug()
+            "MPP charges on {} need a durable replay store; {}",
+            network.slug(),
+            durable_store_remedy("PAY_MPP_REDIS_URL")
         )));
     }
     Ok(store)
@@ -299,9 +298,9 @@ async fn subscription_store(
     .await?;
     if !durable && serves_subscriptions && requires_durable_store(network, deployment_policy_mode) {
         return Err(pay_core::Error::Config(format!(
-            "{} subscriptions need a durable replay store; set PAY_MPP_REDIS_URL and build \
-             with redis-session-store",
-            network.slug()
+            "{} subscriptions need a durable replay store; {}",
+            network.slug(),
+            durable_store_remedy("PAY_MPP_REDIS_URL")
         )));
     }
     Ok(store)
@@ -339,6 +338,23 @@ fn batch_store_default_prefix(network: &SolanaNetwork) -> String {
     match network {
         SolanaNetwork::Mainnet => PREFIX.to_string(),
         other => format!("{PREFIX}{}:", other.slug()),
+    }
+}
+
+/// What an operator must do when a gateway needs a durable store it does not
+/// have. A binary built without `redis-session-store` cannot open Redis at
+/// all, so setting the URL alone would only move the failure.
+fn durable_store_remedy(url_var: &str) -> String {
+    if cfg!(feature = "redis-session-store") {
+        format!(
+            "set {url_var} to a Redis URL every replica shares (redis:// or rediss://); \
+             only devnet and localnet may run on process memory"
+        )
+    } else {
+        format!(
+            "this pay binary was built without the redis-session-store feature; install a \
+             release build or rebuild with `--features redis-session-store`, then set {url_var}"
+        )
     }
 }
 
@@ -2442,9 +2458,9 @@ impl StartCommand {
                     eprintln!(
                         "{}",
                         format!(
-                            "x402 exact disabled: {} payments need a durable replay store; \
-                             set PAY_X402_REDIS_URL",
-                            network.slug()
+                            "x402 exact disabled: {} payments need a durable replay store; {}",
+                            network.slug(),
+                            durable_store_remedy("PAY_X402_REDIS_URL")
                         )
                         .yellow()
                     );
@@ -2526,8 +2542,9 @@ impl StartCommand {
                             "{}",
                             format!(
                                 "x402 batch-settlement disabled: {} payments need a durable \
-                                 channel store; set PAY_X402_REDIS_URL",
-                                network.slug()
+                                 channel store; {}",
+                                network.slug(),
+                                durable_store_remedy("PAY_X402_REDIS_URL")
                             )
                             .yellow()
                         );
@@ -4359,6 +4376,67 @@ mod tests {
         // Local test clusters may still run on process memory.
         devnet.unwrap();
         localnet.unwrap();
+    }
+
+    /// Hosted gateways refuse to start without Redis, so a shipped binary that
+    /// cannot open Redis cannot serve mainnet at all.
+    #[test]
+    fn release_builds_can_open_a_durable_store() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest: toml_edit::DocumentMut =
+            std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let default = manifest["features"]["default"].as_array().unwrap();
+        assert!(
+            default
+                .iter()
+                .any(|feature| feature.as_str() == Some("redis-session-store")),
+            "the pay CLI must build with redis-session-store by default"
+        );
+
+        // A release path that drops default features would drop it again.
+        let repo = manifest_dir.join("../../..");
+        let mut build_scripts = vec![
+            repo.join("Justfile"),
+            repo.join("rust/Justfile"),
+            repo.join("rust/Dockerfile"),
+            repo.join("rust/.cargo/config.toml"),
+        ];
+        for entry in std::fs::read_dir(repo.join(".github/workflows")).unwrap() {
+            build_scripts.push(entry.unwrap().path());
+        }
+        for path in build_scripts {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("--no-default-features"),
+                "{} builds pay without its default features",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_missing_durable_store_names_the_variable_to_set() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let refused = super::charge_replay_store(&SolanaNetwork::Mainnet, false).await;
+        let local = super::charge_replay_store(&SolanaNetwork::Localnet, false).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        let message = refused.err().unwrap().to_string();
+        assert!(message.contains("PAY_MPP_REDIS_URL"), "{message}");
+        // This binary can already open Redis, so the URL is the only remedy.
+        assert!(!message.contains("redis-session-store"), "{message}");
+        local.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
