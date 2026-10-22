@@ -35,8 +35,8 @@ use pay_core::server::gate::{
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
 use pay_core::server::proxy::{
-    ClientVoucherMeter, STRIP_HEADERS, URL_RESPONSE_HEADERS, UpstreamPlan, UrlCredentials,
-    collect_upstream_body, prepare_upstream_with_identity, routing_signs_request_body,
+    ClientVoucherMeter, URL_RESPONSE_HEADERS, UpstreamPlan, UrlCredentials, collect_upstream_body,
+    is_stripped_request_header, prepare_upstream_with_identity, routing_signs_request_body,
     upstream_http_client,
 };
 use pay_core::server::session_stream::{
@@ -1330,9 +1330,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             if let Ok(uri) = path_and_query.parse::<Uri>() {
                 let _ = upstream_request.set_uri(uri);
             }
-            for h in STRIP_HEADERS {
-                upstream_request.remove_header(*h);
-            }
+            strip_caller_headers(upstream_request);
             let _ = upstream_request.insert_header("host", host_header.clone());
             for (k, v) in headers {
                 let _ = upstream_request.insert_header(k.clone(), v.clone());
@@ -1706,6 +1704,20 @@ fn is_control_plane(path: &str) -> bool {
         || path.starts_with("__402/")
         || path == "openapi.json"
         || path.starts_with(".well-known/")
+}
+
+/// Remove every caller header the upstream must not see from Pingora's
+/// native request, which it forwards separately from the sanitized headers.
+fn strip_caller_headers(upstream_request: &mut RequestHeader) {
+    let stripped: Vec<HeaderName> = upstream_request
+        .headers
+        .keys()
+        .filter(|name| is_stripped_request_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in stripped {
+        upstream_request.remove_header(&name);
+    }
 }
 
 /// Remove gateway query credentials from a natively proxied response's
@@ -2398,6 +2410,27 @@ mod tests {
         let uri: Uri = "https://authority.example/latest".parse().unwrap();
 
         assert_eq!(request_host(&headers, &uri), None);
+    }
+
+    #[test]
+    fn native_requests_drop_every_caller_routing_header_variant() {
+        let mut request = pingora::http::RequestHeader::build("GET", b"/v1", None).unwrap();
+        for name in [
+            "X-Forwarded-Host",
+            "x-forwarded-server",
+            "X-Original-URL",
+            "Forwarded",
+            "X-Pay-Verified-Payer",
+        ] {
+            request.append_header(name, "other-tenant.example").unwrap();
+        }
+        request.append_header("X-Forwarded-For", "1.2.3.4").unwrap();
+        request.append_header("x-forwarded-for", "5.6.7.8").unwrap();
+        // Positive control: an ordinary caller header is forwarded.
+        request.append_header("X-Request-Id", "abc").unwrap();
+        super::strip_caller_headers(&mut request);
+        let names: Vec<_> = request.headers.keys().map(|name| name.as_str()).collect();
+        assert_eq!(names, ["x-request-id"]);
     }
 
     #[test]

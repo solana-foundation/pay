@@ -60,14 +60,37 @@ pub const STRIP_HEADERS: &[&str] = &[
     // Caller-supplied proxy routing metadata. The gateway admitted the request
     // for its own Host; a host-aware upstream must not be steered to another
     // tenant or resource under the gateway's upstream credential.
+    // Each `x-forwarded-*` and `x-original-*` variant is stripped by
+    // `STRIP_HEADER_PREFIXES`; these are the rest of the family.
     "forwarded",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "x-forwarded-port",
-    "x-forwarded-prefix",
-    "x-forwarded-for",
     "x-real-ip",
+    "x-host",
+    "x-http-host",
+    "x-rewrite-url",
+    "x-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+    "x-cluster-client-ip",
 ];
+
+/// Header families stripped when forwarding to upstream, whatever the suffix:
+/// proxies and frameworks keep adding variants (`X-Forwarded-Server`,
+/// `X-Forwarded-Uri`, `X-Original-URL`, ...) that a host- or path-aware
+/// upstream may trust for routing.
+pub const STRIP_HEADER_PREFIXES: &[&str] = &["x-forwarded-", "x-original-"];
+
+/// Whether a caller request header must never reach the upstream. Header
+/// names compare case-insensitively; both adapters strip through this.
+pub fn is_stripped_request_header(name: &str) -> bool {
+    STRIP_HEADERS
+        .iter()
+        .any(|stripped| name.eq_ignore_ascii_case(stripped))
+        || STRIP_HEADER_PREFIXES.iter().any(|prefix| {
+            name.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+}
 
 /// Return an upstream URL that is safe to attach to logs and traces.
 ///
@@ -457,7 +480,7 @@ pub async fn prepare_upstream_with_identity(
     // Forward headers.
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
-        if STRIP_HEADERS.contains(&name_str) {
+        if is_stripped_request_header(name_str) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -2972,6 +2995,23 @@ mod tests {
         assert!(STRIP_HEADERS.contains(&"x-pay-original-host"));
     }
 
+    #[test]
+    fn stripped_request_headers_match_any_case_and_family_variant() {
+        for name in [
+            "Host",
+            "X-Forwarded-Host",
+            "x-forwarded-anything-new",
+            "X-ORIGINAL-URL",
+            "X-Pay-Verified-Payer",
+        ] {
+            assert!(is_stripped_request_header(name), "{name}");
+        }
+        // Positive controls: ordinary and look-alike headers pass through.
+        for name in ["x-request-id", "x-forwarded", "x-originality", "accept"] {
+            assert!(!is_stripped_request_header(name), "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn caller_proxy_routing_headers_never_reach_the_upstream() {
         let api = make_api("test");
@@ -2984,6 +3024,15 @@ mod tests {
             "x-forwarded-prefix",
             "x-forwarded-for",
             "x-real-ip",
+            // Variants outside the original list.
+            "x-forwarded-server",
+            "x-forwarded-uri",
+            "x-forwarded-scheme",
+            "x-original-host",
+            "x-original-url",
+            "x-rewrite-url",
+            "x-host",
+            "true-client-ip",
         ] {
             headers.insert(name, HeaderValue::from_static("other-tenant.example"));
         }
