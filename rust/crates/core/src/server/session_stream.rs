@@ -596,10 +596,17 @@ impl SessionStreamMeter {
         chunk: &[u8],
         is_sse: bool,
     ) -> MeteringResult<Option<SessionGateDecision>> {
-        if !self.accumulator.observe_chunk(chunk, is_sse)? {
+        let changed = self.accumulator.observe_chunk(chunk, is_sse)?;
+        self.observe_usage_change(changed)
+    }
+
+    fn observe_usage_change(
+        &mut self,
+        changed: bool,
+    ) -> MeteringResult<Option<SessionGateDecision>> {
+        if !changed {
             return Ok(None);
         }
-
         self.current = self.accumulator.observation();
         self.gate
             .observe(self.current.clone(), GateMode::Streaming)
@@ -628,7 +635,11 @@ impl SessionStreamMeter {
     /// returns.
     pub async fn settle_complete_body(mut self, body: &[u8], is_sse: bool) -> Result<(), BoxError> {
         self.touch_channel_if_due();
-        if let Some(decision) = self.observe_chunk(body, is_sse).map_err(box_error)? {
+        let changed = self
+            .accumulator
+            .observe_complete_body(body, is_sse)
+            .map_err(box_error)?;
+        if let Some(decision) = self.observe_usage_change(changed).map_err(box_error)? {
             settle_decision(&mut self, decision).await?;
         }
         if let Some(decision) = self.finish(is_sse).map_err(box_error)? {
@@ -860,6 +871,14 @@ async fn wait_for_commit(context: &SessionStreamContext, target: u64) -> Result<
         })?
 }
 
+/// How the bytes handed to [`StreamUsageAccumulator`] split into records.
+enum BodyRecords<'a> {
+    Sse,
+    Ndjson,
+    /// A complete body already parsed as one JSON document.
+    Document(&'a Value),
+}
+
 #[derive(Debug, Clone)]
 struct StreamUsageAccumulator {
     spec: SessionMeterSpec,
@@ -904,6 +923,28 @@ impl StreamUsageAccumulator {
     }
 
     fn observe_chunk(&mut self, chunk: &[u8], is_sse: bool) -> MeteringResult<bool> {
+        let records = if is_sse {
+            BodyRecords::Sse
+        } else {
+            BodyRecords::Ndjson
+        };
+        self.observe_records(chunk, records)
+    }
+
+    /// Observe a complete, unstreamed response body. A body that is one JSON
+    /// document is one record, whatever its line breaks; any other body is
+    /// read as NDJSON records.
+    fn observe_complete_body(&mut self, body: &[u8], is_sse: bool) -> MeteringResult<bool> {
+        if is_sse {
+            return self.observe_records(body, BodyRecords::Sse);
+        }
+        match serde_json::from_slice::<Value>(body) {
+            Ok(document) => self.observe_records(body, BodyRecords::Document(&document)),
+            Err(_) => self.observe_records(body, BodyRecords::Ndjson),
+        }
+    }
+
+    fn observe_records(&mut self, chunk: &[u8], records: BodyRecords<'_>) -> MeteringResult<bool> {
         self.output_bytes = self.output_bytes.saturating_add(chunk.len() as u64);
         self.request_seen = true;
 
@@ -912,10 +953,13 @@ impl StreamUsageAccumulator {
             changed = true;
         }
 
-        if is_sse {
+        if let BodyRecords::Sse = records {
             changed |= self.observe_sse_chunk(chunk)?;
         } else {
-            changed |= self.observe_ndjson_chunk(chunk)?;
+            changed |= match records {
+                BodyRecords::Document(document) => self.observe_stream_value(document, false),
+                _ => self.observe_ndjson_chunk(chunk)?,
+            };
             if observes_unit(&self.spec, BillingUnit::Characters) {
                 self.output_chars = self
                     .output_chars
@@ -1755,6 +1799,47 @@ mod tests {
                 .observation()
                 .get(MeterDirection::Output, BillingUnit::Tokens),
             Some(5)
+        );
+    }
+
+    #[test]
+    fn a_complete_json_body_is_one_record_whatever_its_line_breaks() {
+        let spec = || {
+            SessionMeterSpec::new([SessionMeterDimension::required(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1,
+                1,
+            )])
+        };
+        let tokens = |body: &[u8]| {
+            let mut accumulator = StreamUsageAccumulator::new(spec(), SessionUsageHints::default());
+            assert!(accumulator.observe_complete_body(body, false).unwrap());
+            assert!(!accumulator.finish_ndjson().unwrap());
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens)
+        };
+
+        assert_eq!(
+            tokens(b"{\n\"usage\":{\"completion_tokens\":50}\n}"),
+            Some(50)
+        );
+        // Control: the same document on one line meters the same.
+        assert_eq!(tokens(br#"{"usage":{"completion_tokens":50}}"#), Some(50));
+        // A body of several records is still read record by record.
+        assert_eq!(
+            tokens(
+                b"{\"usage\":{\"completion_tokens\":5}}\n{\"usage\":{\"completion_tokens\":7}}\n"
+            ),
+            Some(7)
+        );
+        // Streamed line by line, the multiline document is refused.
+        let mut streamed = StreamUsageAccumulator::new(spec(), SessionUsageHints::default());
+        assert!(
+            streamed
+                .observe_chunk(b"{\n\"usage\":{\"completion_tokens\":50}\n}", false)
+                .is_err()
         );
     }
 
