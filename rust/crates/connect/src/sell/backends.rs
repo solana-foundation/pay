@@ -58,9 +58,80 @@ impl RpcUrl {
         &self.0
     }
 
-    /// `text` (an RPC error, say) with the full URL replaced by its origin.
+    /// `text` (an RPC error, say) with the URL replaced by its origin.
+    ///
+    /// Clients print the URL they parsed, not the string they were given:
+    /// `reqwest` lowercases the host, adds a `/` path and percent-encodes.
+    /// So every form of the URL is redacted, and so are its secret-bearing
+    /// parts on their own (credentials, path segments, query values), raw,
+    /// percent-encoded and decoded.
     pub fn redact_in(&self, text: &str) -> String {
-        text.replace(&self.0, &self.to_string())
+        // Shorter fragments are not credentials, and redacting them would
+        // mangle ordinary words in the message.
+        const MIN_SECRET_LEN: usize = 8;
+        const PLACEHOLDER: &str = "\u{0}rpc-url\u{0}";
+        // Every byte but alphanumerics, and only what a URL cannot carry raw.
+        const STRICT: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
+        const MINIMAL: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+            .add(b' ')
+            .add(b'"')
+            .add(b'#')
+            .add(b'<')
+            .add(b'>')
+            .add(b'`')
+            .add(b'{')
+            .add(b'}');
+        let mut whole = vec![self.0.clone()];
+        let mut parts = Vec::new();
+        if let Ok(url) = url::Url::parse(&self.0) {
+            whole.push(url.as_str().to_string());
+            let tail = &url[url::Position::BeforePath..];
+            if tail != "/" {
+                parts.push(tail.to_string());
+            }
+            parts.push(url.username().to_string());
+            parts.extend(url.password().map(str::to_string));
+            parts.extend(
+                url.path_segments()
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_string),
+            );
+            parts.extend(url.query().map(str::to_string));
+            for (key, value) in url.query_pairs() {
+                parts.push(key.into_owned());
+                parts.push(value.into_owned());
+            }
+        }
+        let spellings = |forms: Vec<String>| {
+            let mut all: Vec<String> = forms
+                .into_iter()
+                .flat_map(|form| {
+                    let decoded = percent_encoding::percent_decode_str(&form)
+                        .decode_utf8_lossy()
+                        .into_owned();
+                    let encode =
+                        |set| percent_encoding::utf8_percent_encode(&form, set).to_string();
+                    let (strict, minimal) = (encode(STRICT), encode(MINIMAL));
+                    let form_encoded: String =
+                        url::form_urlencoded::byte_serialize(form.as_bytes()).collect();
+                    [form.clone(), decoded, strict, minimal, form_encoded]
+                })
+                .filter(|form| form.len() >= MIN_SECRET_LEN)
+                .collect();
+            // Longest first, so a form is never split by one of its parts.
+            all.sort_by_key(|form| std::cmp::Reverse(form.len()));
+            all.dedup();
+            all
+        };
+        let mut redacted = text.to_string();
+        for form in spellings(whole) {
+            redacted = redacted.replace(&form, PLACEHOLDER);
+        }
+        for part in spellings(parts) {
+            redacted = redacted.replace(&part, "…");
+        }
+        redacted.replace(PLACEHOLDER, &self.to_string())
     }
 }
 
@@ -620,6 +691,42 @@ mod rpc_url_tests {
             let error = format!("error sending request for url ({raw})");
             assert!(!url.redact_in(&error).contains("secret"), "{raw}");
         }
+    }
+
+    /// reqwest prints the URL it parsed: host lowercased, a `/` path added,
+    /// unsafe bytes percent-encoded. None of those spellings leaks either.
+    #[test]
+    fn every_spelling_of_an_rpc_url_is_redacted() {
+        let raw = "https://Mainnet.Helius-RPC.com?api-key=secret-1 x&id=7";
+        let url = RpcUrl::new(raw);
+        let parsed = url::Url::parse(raw).unwrap();
+        assert_ne!(parsed.as_str(), raw);
+        for leaked in [
+            format!("error sending request for url ({parsed})"),
+            format!("request to {} failed", &parsed[url::Position::BeforePath..]),
+            "upstream rejected api-key secret-1 x".to_string(),
+            "upstream rejected api-key secret-1%20x".to_string(),
+            "upstream rejected api-key secret-1+x".to_string(),
+        ] {
+            let redacted = url.redact_in(&leaked);
+            assert!(!redacted.contains("secret"), "{leaked} -> {redacted}");
+        }
+        assert_eq!(
+            url.redact_in(&format!("error sending request for url ({parsed})")),
+            "error sending request for url (https://mainnet.helius-rpc.com/…)"
+        );
+
+        let path = RpcUrl::new("https://user:hunter2-pass@x.quiknode.pro/secret-2/");
+        let redacted = path.redact_in("auth hunter2-pass failed at /secret-2/ via secret-2");
+        assert!(
+            !redacted.contains("secret") && !redacted.contains("hunter2"),
+            "{redacted}"
+        );
+        // Messages that carry no part of the URL are left alone.
+        assert_eq!(
+            path.redact_in("connection refused (os error 61)"),
+            "connection refused (os error 61)"
+        );
     }
 }
 
