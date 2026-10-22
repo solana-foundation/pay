@@ -657,7 +657,9 @@ pub fn build_upto_payment_with_override(
 /// The offer terms an x402 `payment-identifier` is reused for: every field
 /// of the requirements and the advertised extensions except the ones a fresh
 /// 402 for the same offer legitimately changes (the blockhash and slot the
-/// transaction is built against, and the raw wire echo that carries them).
+/// transaction is built against, the raw wire echo that carries them, and
+/// the per-challenge fields of a `sign-in-with-x` offer: its nonce and the
+/// times and request id stamped on each challenge).
 ///
 /// A memo, order reference, fee payer or any other field the server adds
 /// changes what is being paid for, so it gets its own identifier rather than
@@ -684,6 +686,30 @@ fn payment_identifier_terms(
     strip(&mut terms);
     if let Some(extra) = terms.get_mut("extra") {
         strip(extra);
+    }
+    let mut extensions = extensions.cloned();
+    if let Some(siwx) = extensions
+        .as_mut()
+        .and_then(|extensions| extensions.get_mut(pay_kit::x402::SIGN_IN_WITH_X))
+    {
+        const PER_CHALLENGE: [&str; 5] = [
+            "nonce",
+            "issuedAt",
+            "expirationTime",
+            "notBefore",
+            "requestId",
+        ];
+        let strip_challenge = |fields: &mut serde_json::Value| {
+            if let Some(fields) = fields.as_object_mut() {
+                for key in PER_CHALLENGE {
+                    fields.remove(key);
+                }
+            }
+        };
+        strip_challenge(siwx);
+        if let Some(info) = siwx.get_mut("info") {
+            strip_challenge(info);
+        }
     }
     Ok(serde_json::json!({ "requirements": terms, "extensions": extensions }).to_string())
 }
@@ -2220,6 +2246,62 @@ mod tests {
         assert_ne!(
             sent_payment_identifier(&first),
             sent_payment_identifier(&other)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_fresh_sign_in_nonce_keeps_the_payment_identifier() {
+        let store = payment_identifier_store();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"q\":\"siwx\"}"),
+        );
+        let build = |challenge: &Challenge| {
+            build_payment_for_attempt(
+                challenge,
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        // Every 402 for the offer also offers sign-in with a new challenge.
+        let offer = |seed: u8, nonce: &str, domain: &str| {
+            let mut challenge = payment_identifier_challenge(seed, "1000");
+            challenge.extensions.as_mut().unwrap()["sign-in-with-x"] = serde_json::json!({
+                "info": {
+                    "domain": domain,
+                    "uri": format!("https://{domain}"),
+                    "version": "1",
+                    "nonce": nonce,
+                    "issuedAt": format!("2026-04-27T00:00:0{seed}Z"),
+                    "expirationTime": format!("2026-04-27T00:05:0{seed}Z"),
+                    "requestId": format!("req-{seed}"),
+                },
+                "supportedChains": [{
+                    "chainId": SOLANA_DEVNET,
+                    "type": "ed25519",
+                    "signatureScheme": "siws"
+                }]
+            });
+            challenge
+        };
+        let first = build(&offer(1, "nonce-1", "provider.example"));
+        let retry = build(&offer(2, "nonce-2", "provider.example"));
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&retry)
+        );
+        // Positive control: the rest of the extension is still offer terms.
+        let elsewhere = build(&offer(3, "nonce-3", "other.example"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&elsewhere)
         );
         attempt.resolved();
     }
