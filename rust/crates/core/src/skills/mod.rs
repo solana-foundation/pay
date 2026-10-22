@@ -1558,6 +1558,11 @@ pub fn parse_catalog_source(raw: &str, source_url: &str) -> Result<Catalog> {
 /// source's own origin it carries the trust the user gave that source; on
 /// any other origin it must be a public HTTPS hostname, so a catalog cannot
 /// aim detail fetches at loopback, link-local or internal services.
+///
+/// One exception: a catalog served from loopback may name another loopback
+/// origin. That is a local `pay gate api --public-url http://localhost:…`,
+/// registered as `http://127.0.0.1:…`; a remote catalog still cannot reach
+/// loopback, because its source is not on it.
 fn check_detail_base_url(source_url: &str, base_url: &str) -> Result<()> {
     if base_url.is_empty() {
         return Ok(());
@@ -1576,7 +1581,14 @@ fn check_detail_base_url(source_url: &str, base_url: &str) -> Result<()> {
     if !matches!(base.scheme(), "http" | "https") {
         return reject("is not http(s)");
     }
-    if reqwest::Url::parse(source_url).is_ok_and(|source| source.origin() == base.origin()) {
+    let source = reqwest::Url::parse(source_url).ok();
+    if source
+        .as_ref()
+        .is_some_and(|source| source.origin() == base.origin())
+    {
+        return Ok(());
+    }
+    if source.as_ref().is_some_and(is_loopback) && is_loopback(&base) {
         return Ok(());
     }
     if base.scheme() != "https" {
@@ -1601,6 +1613,19 @@ fn check_detail_base_url(source_url: &str, base_url: &str) -> Result<()> {
         return reject("is on another origin and names a local host");
     }
     Ok(())
+}
+
+/// `localhost` (RFC 6761: always loopback), `127.0.0.0/8` or `::1`.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 fn validate_payment_discovery_openapi(doc: &serde_json::Value, source_url: &str) -> Result<()> {
@@ -3004,6 +3029,18 @@ mod tests {
                 .to_string();
             assert!(err.contains("base_url"), "{base_url}: {err}");
         }
+        // A loopback catalog may name loopback, never another local or
+        // internal host.
+        for base_url in [
+            "http://169.254.169.254/latest",
+            "http://10.0.0.5/v1",
+            "http://metadata.google.internal/v1",
+            "http://intranet/v1",
+        ] {
+            let raw = pay_catalog_with_base_url(base_url);
+            parse_catalog_source(&raw, "http://127.0.0.1:1403/.well-known/pay-skills.json")
+                .expect_err(base_url);
+        }
     }
 
     #[test]
@@ -3018,6 +3055,16 @@ mod tests {
             (
                 "http://127.0.0.1:1402/catalog.json",
                 "http://127.0.0.1:1402",
+            ),
+            // `pay gate api --public-url http://localhost:1403`, registered
+            // under its bind address.
+            (
+                "http://127.0.0.1:1403/.well-known/pay-skills.json",
+                "http://localhost:1403",
+            ),
+            (
+                "http://localhost:1403/.well-known/pay-skills.json",
+                "http://[::1]:1404/v1",
             ),
             ("https://catalog.example/v1/skills.json", ""),
         ] {
