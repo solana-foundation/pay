@@ -806,46 +806,58 @@ impl UrlCredentials {
     }
 
     fn exposed_in(&self, value: &str) -> bool {
+        let decoded = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
         self.query.iter().any(|secret| {
             Self::forms(secret)
                 .iter()
                 .any(|form| value.contains(form.as_str()))
-                || percent_encoding::percent_decode_str(value)
-                    .decode_utf8_lossy()
-                    .contains(secret.as_str())
-        })
+                || decoded.contains(secret.as_str())
+        }) || decoded
+            .split(['/', '?', '#', '&', '='])
+            .any(|part| self.path_segments.iter().any(|secret| secret == part))
     }
 
     /// `value` with every query pair carrying a credential removed, or
-    /// `None` when the credential cannot be removed from it.
+    /// `None` when the credential cannot be removed from it. The rest of the
+    /// reference is kept as written, so a relative redirect still resolves
+    /// against the request it answers.
     fn scrub_url(&self, value: &str) -> Option<String> {
         if !self.exposed_in(value) {
             return Some(value.to_string());
         }
-        let base = reqwest::Url::parse("http://relative.invalid/").ok()?;
-        let absolute = reqwest::Url::parse(value).is_ok();
-        let mut url = base.join(value).ok()?;
-        let kept: Vec<(String, String)> = url
-            .query_pairs()
-            .filter(|(_, pair)| !self.query.iter().any(|secret| secret == pair))
-            .map(|(key, pair)| (key.into_owned(), pair.into_owned()))
-            .collect();
-        url.set_query(None);
-        if !kept.is_empty() {
-            url.query_pairs_mut().extend_pairs(kept);
-        }
-        let scrubbed = if absolute {
-            url.to_string()
-        } else {
-            url[url::Position::BeforePath..].to_string()
+        let (reference, fragment) = match value.split_once('#') {
+            Some((reference, fragment)) => (reference, Some(fragment)),
+            None => (value, None),
         };
+        let (target, query) = match reference.split_once('?') {
+            Some((target, query)) => (target, Some(query)),
+            None => (reference, None),
+        };
+        let mut scrubbed = target.to_string();
+        if let Some(query) = query {
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| {
+                    !url::form_urlencoded::parse(pair.as_bytes())
+                        .any(|(_, pair)| self.query.iter().any(|secret| *secret == pair))
+                })
+                .collect();
+            if !kept.is_empty() {
+                scrubbed.push('?');
+                scrubbed.push_str(&kept.join("&"));
+            }
+        }
+        if let Some(fragment) = fragment {
+            scrubbed.push('#');
+            scrubbed.push_str(fragment);
+        }
         (!self.exposed_in(&scrubbed)).then_some(scrubbed)
     }
 
     /// Remove injected credentials from URL-bearing response headers; a
     /// header that would still expose one is dropped.
     pub fn scrub_response_headers(&self, headers: &mut HeaderMap) {
-        if self.query.is_empty() {
+        if self.query.is_empty() && self.path_segments.is_empty() {
             return;
         }
         for name in URL_RESPONSE_HEADERS {
@@ -2194,6 +2206,10 @@ mod tests {
             ("/next?sig=a%2Bb%2Fc#top", Some("/next#top")),
             // A credential outside the query cannot be removed: drop it.
             ("https://up.example/s3cr3t/next", None),
+            // Relative references keep their target: only the pair goes.
+            ("next?key=s3cr3t", Some("next")),
+            ("../v2/next?page=2&key=s3cr3t", Some("../v2/next?page=2")),
+            ("?key=s3cr3t&page=2", Some("?page=2")),
             // Positive control: unrelated redirects are relayed untouched.
             ("/next?page=2", Some("/next?page=2")),
         ] {
@@ -2218,6 +2234,43 @@ mod tests {
         assert_eq!(headers.get(axum::http::header::LOCATION).unwrap(), "/next");
         assert!(headers.get(axum::http::header::CONTENT_LOCATION).is_none());
         assert!(headers.get("x-other").is_some());
+    }
+
+    #[test]
+    fn path_rewrite_credentials_are_never_relayed_in_urls() {
+        let mut credentials = UrlCredentials::default();
+        credentials.push_path("live-t0ken");
+        for (location, scrubbed) in [
+            ("https://up.example/live/live-t0ken/next", None),
+            ("/live/live%2Dt0ken", None),
+            ("/next?from=live-t0ken", None),
+            // Positive control: a segment that merely contains it is kept.
+            ("/live/live-t0kens", Some("/live/live-t0kens")),
+            ("/next?page=2", Some("/next?page=2")),
+        ] {
+            assert_eq!(
+                credentials.scrub_url(location).as_deref(),
+                scrubbed,
+                "{location}"
+            );
+        }
+
+        // With no query credential at all, the URL headers are still checked.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::LOCATION,
+            HeaderValue::from_static("https://up.example/live/live-t0ken/next"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_LOCATION,
+            HeaderValue::from_static("/live/other"),
+        );
+        credentials.scrub_response_headers(&mut headers);
+        assert!(headers.get(axum::http::header::LOCATION).is_none());
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_LOCATION).unwrap(),
+            "/live/other"
+        );
     }
 
     #[tokio::test]
