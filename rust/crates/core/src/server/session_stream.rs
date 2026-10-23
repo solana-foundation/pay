@@ -1423,7 +1423,7 @@ fn has_stream_observable_dimension(spec: &SessionMeterSpec) -> bool {
 /// fields only, so a header meter, a custom JSON path, or a meter on any
 /// other unit must settle from the buffered response instead of being
 /// silently replaced by the stream's own heuristics.
-fn stream_honors_meters(metering: &Metering) -> bool {
+pub(crate) fn stream_honors_meters(metering: &Metering) -> bool {
     metering
         .dimensions
         .iter()

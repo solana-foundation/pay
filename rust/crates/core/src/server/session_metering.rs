@@ -50,6 +50,11 @@ pub enum SessionMeteringError {
     Overflow { context: &'static str },
     #[error("invalid streamed usage: {0}")]
     InvalidStream(String),
+    #[error(
+        "client-voucher sessions meter provider token usage only; a response header meter, \
+         a custom JSON path or a meter on another unit cannot be observed"
+    )]
+    UnobservableMeter,
 }
 
 pub type Result<T> = std::result::Result<T, SessionMeteringError>;

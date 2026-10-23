@@ -622,6 +622,13 @@ impl ClientVoucherMeter {
         let Some(metering) = route.endpoint(api).and_then(|ep| ep.metering.as_ref()) else {
             return Ok(None);
         };
+        // The stream meter reads provider token usage from canonical fields
+        // only. Any other configured meter would be replaced by its own
+        // heuristics and release a response its vouchers may not cover, so
+        // the route is refused before the upstream is called.
+        if !session_stream::stream_honors_meters(metering) {
+            return Err(crate::server::session_metering::SessionMeteringError::UnobservableMeter);
+        }
         let path = uri.path().trim_start_matches('/');
         let props = payment::extract_request_properties(headers, path);
         let variant_hint = payment::extract_variant_hint(path);
@@ -2312,7 +2319,21 @@ mod tests {
             "tiers": [{"price_usd": 0.000001}],
             "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
         })));
-        api.endpoints = vec![metered, flat, misconfigured];
+        // Meters the stream meter cannot observe: a response header and a
+        // custom JSON path.
+        let mut header_metered = endpoint_with_routing("v1/header-metered", None);
+        header_metered.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "bytes", "scale": 1,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_header", "header": "x-billable-bytes"}
+        })));
+        let mut custom_path = endpoint_with_routing("v1/custom-path", None);
+        custom_path.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "tokens", "scale": 1,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_json", "path": "/billing/generated"}
+        })));
+        api.endpoints = vec![metered, flat, misconfigured, header_metered, custom_path];
 
         let key = || solana_pubkey::Pubkey::new_unique().to_string();
         let handle = std::sync::Arc::new(crate::server::session::SessionMpp::new(
@@ -2399,6 +2420,24 @@ mod tests {
 
         // Positive control: a route whose meter builds reaches the upstream.
         let (_, hits) = client_voucher_exchange("v1/flat", METERED_ANSWER).await;
+        assert_eq!(hits, 1);
+    }
+
+    #[tokio::test]
+    async fn client_voucher_meters_it_cannot_observe_never_call_the_upstream() {
+        for path in ["v1/header-metered", "v1/custom-path"] {
+            let (served, hits) = client_voucher_exchange(path, METERED_ANSWER).await;
+            let (status, first) = served.expect("an unobservable meter answers at once");
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{path}");
+            assert!(
+                !String::from_utf8_lossy(&first.unwrap_or_default()).contains("protected-content"),
+                "{path}"
+            );
+            assert_eq!(hits, 0, "{path} spent an upstream call it cannot meter");
+        }
+        // Positive control: the canonical token meter reaches the upstream
+        // (and then waits on a voucher).
+        let (_, hits) = client_voucher_exchange("v1/metered", METERED_ANSWER).await;
         assert_eq!(hits, 1);
     }
 
