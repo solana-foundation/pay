@@ -546,13 +546,20 @@ pub struct OnchainPlan {
     pub amount: u64,
     pub period_hours: u64,
     pub created_at: i64,
+    /// The non-zero entries of the Plan's destinations whitelist.
+    pub destinations: Vec<solana_pubkey::Pubkey>,
 }
+
+/// Offset of the Plan's four destination addresses: after the terms'
+/// `created_at` (91..99) and the plan's `end_ts` (99..107).
+const PLAN_DESTINATIONS_AT: usize = 107;
 
 impl OnchainPlan {
     /// Decode a Plan account: discriminator, owner, bump, status, plan id,
-    /// mint, then terms (amount, period_hours, created_at).
+    /// mint, terms (amount, period_hours, created_at), end_ts, then the
+    /// destinations whitelist.
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 99 {
+        if data.len() < PLAN_DESTINATIONS_AT + 4 * 32 {
             return Err(Error::Mpp(format!(
                 "Plan account is too short ({} bytes)",
                 data.len()
@@ -568,15 +575,37 @@ impl OnchainPlan {
             amount: u64::from_le_bytes(word(75)),
             period_hours: u64::from_le_bytes(word(83)),
             created_at: i64::from_le_bytes(word(91)),
+            destinations: (0..4)
+                .map(|i| pubkey(PLAN_DESTINATIONS_AT + i * 32))
+                .filter(|destination| *destination != solana_pubkey::Pubkey::default())
+                .collect(),
         })
     }
 
-    /// Refuse to attach `spec` to a Plan whose immutable terms differ from it.
+    /// Refuse to attach `spec` to a Plan whose immutable terms differ from it,
+    /// or whose destinations are not exactly `recipient`: subscribers'
+    /// clients refuse to activate any other Plan
+    /// (draft-solana-subscription-00 §Method Details), and destinations
+    /// cannot be updated, so such a Plan must be replaced.
     pub fn require_terms(
         &self,
         spec: &SubscriptionEndpoint,
         owner: &solana_pubkey::Pubkey,
+        recipient: &solana_pubkey::Pubkey,
     ) -> Result<()> {
+        if self.destinations != [*recipient] {
+            return Err(Error::Config(format!(
+                "on-chain Plan destinations {:?} are not exactly the endpoint recipient {recipient}, \
+                 so subscribers cannot activate it. A Plan's destinations cannot be updated: \
+                 publish a new Plan by setting another `plan_id_numeric` on the endpoint's \
+                 `subscription:` block and removing its `plan_id`, `plan_bump` and \
+                 `plan_created_at`, then restart",
+                self.destinations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )));
+        }
         let (amount, _decimals, mint) = resolve_amount(spec)?;
         let (unit, count) = spec.parse_period().map_err(Error::Config)?;
         let expected = (
@@ -697,10 +726,10 @@ pub async fn publish_plan(
     rpc_url: &str,
     route: PlanRoute,
     plan_id_numeric: u64,
+    recipient: &solana_pubkey::Pubkey,
 ) -> Result<PublishedPlan> {
     use pay_kit::mpp::program::subscriptions::{
-        CreatePlanAccounts, CreatePlanData, PlanTerms, build_create_plan_ix, default_program_id,
-        find_plan_pda, plan_id_seed,
+        CreatePlanAccounts, build_create_plan_ix, default_program_id, find_plan_pda, plan_id_seed,
     };
     use solana_pubkey::Pubkey;
 
@@ -724,20 +753,7 @@ pub async fn publish_plan(
     let (plan_pda, plan_bump) = find_plan_pda(operator, &seed, &program_id);
 
     // ── Build create_plan data + instruction ─────────────────────────
-    let create_data = CreatePlanData::new(
-        plan_id_numeric,
-        mint,
-        PlanTerms {
-            amount,
-            period_hours,
-            created_at: 0, // set on-chain by the program
-        },
-        0,                      // no plan-level expiry; HTTP-layer subscription_expires governs
-        [Pubkey::default(); 4], // open destinations whitelist for v0
-        [Pubkey::default(); 4], // owner-only pullers for v0
-        "",
-    )
-    .map_err(|e| Error::Config(format!("Failed to build CreatePlanData: {e}")))?;
+    let create_data = create_plan_data(plan_id_numeric, mint, amount, period_hours, recipient)?;
 
     let token_program = Pubkey::from_str(pay_kit::mpp::protocol::solana::programs::TOKEN_PROGRAM)
         .map_err(|e| Error::Config(format!("invalid token program id: {e}")))?;
@@ -769,6 +785,39 @@ pub async fn publish_plan(
         plan_created_at,
         broadcast_signature: Some(signature),
     })
+}
+
+/// The `create_plan` data for an endpoint's Plan. The challenge's
+/// `recipient` is the only destination: clients activate a Plan only when its
+/// destinations are exactly that address, and they cannot be updated later.
+fn create_plan_data(
+    plan_id_numeric: u64,
+    mint: solana_pubkey::Pubkey,
+    amount: u64,
+    period_hours: u64,
+    recipient: &solana_pubkey::Pubkey,
+) -> Result<pay_kit::mpp::program::subscriptions::CreatePlanData> {
+    use pay_kit::mpp::program::subscriptions::{CreatePlanData, PlanTerms};
+    use solana_pubkey::Pubkey;
+    CreatePlanData::new(
+        plan_id_numeric,
+        mint,
+        PlanTerms {
+            amount,
+            period_hours,
+            created_at: 0, // set on-chain by the program
+        },
+        0, // no plan-level expiry; HTTP-layer subscription_expires governs
+        [
+            *recipient,
+            Pubkey::default(),
+            Pubkey::default(),
+            Pubkey::default(),
+        ],
+        [Pubkey::default(); 4], // owner-only pullers for v0
+        "",
+    )
+    .map_err(|e| Error::Config(format!("Failed to build CreatePlanData: {e}")))
 }
 
 /// Read just the `created_at` (i64 LE) out of a freshly-published Plan
@@ -898,6 +947,7 @@ mod tests {
         mint: &str,
         amount: u64,
         period_hours: u64,
+        destinations: &[solana_pubkey::Pubkey],
     ) -> Vec<u8> {
         let mut data = vec![0u8];
         data.extend_from_slice(owner.as_ref());
@@ -907,6 +957,12 @@ mod tests {
         data.extend_from_slice(&amount.to_le_bytes());
         data.extend_from_slice(&period_hours.to_le_bytes());
         data.extend_from_slice(&1_780_000_000i64.to_le_bytes());
+        data.extend_from_slice(&0i64.to_le_bytes()); // end_ts
+        for i in 0..4 {
+            let destination = destinations.get(i).copied().unwrap_or_default();
+            data.extend_from_slice(destination.as_ref());
+        }
+        data.extend_from_slice(&[0u8; 4 * 32 + 128]); // pullers, metadata
         data
     }
 
@@ -916,9 +972,10 @@ mod tests {
         let mut spec = make_spec();
         spec.amount_base_units = Some("9990000".into());
         let (_, _, mint) = resolve_amount(&spec).unwrap();
-        let plan = OnchainPlan::decode(&plan_bytes(&owner, &mint, 9_990_000, 720)).unwrap();
+        let plan =
+            OnchainPlan::decode(&plan_bytes(&owner, &mint, 9_990_000, 720, &[owner])).unwrap();
         assert_eq!(plan.created_at, 1_780_000_000);
-        plan.require_terms(&spec, &owner).unwrap();
+        plan.require_terms(&spec, &owner, &owner).unwrap();
 
         // A cheaper Plan, a different cadence or owner is never reused.
         for (plan_owner, amount, period) in [
@@ -927,10 +984,59 @@ mod tests {
             (solana_pubkey::Pubkey::new_unique(), 9_990_000, 720),
         ] {
             let other =
-                OnchainPlan::decode(&plan_bytes(&plan_owner, &mint, amount, period)).unwrap();
-            assert!(other.require_terms(&spec, &owner).is_err());
+                OnchainPlan::decode(&plan_bytes(&plan_owner, &mint, amount, period, &[owner]))
+                    .unwrap();
+            assert!(other.require_terms(&spec, &owner, &owner).is_err());
         }
         assert!(OnchainPlan::decode(&[0; 98]).is_err());
+    }
+
+    /// Subscribers' clients activate a Plan only when its destinations are
+    /// exactly the challenge's recipient (pay-kit #395), and destinations
+    /// cannot be updated: a Plan with open or other destinations is never
+    /// reused, and the one pay publishes carries the recipient alone.
+    #[test]
+    fn plans_carry_the_recipient_as_their_only_destination() {
+        let owner = solana_pubkey::Pubkey::new_unique();
+        let recipient = solana_pubkey::Pubkey::new_unique();
+        let mut spec = make_spec();
+        spec.amount_base_units = Some("9990000".into());
+        let (_, _, mint) = resolve_amount(&spec).unwrap();
+        let plan = |destinations: &[solana_pubkey::Pubkey]| {
+            OnchainPlan::decode(&plan_bytes(&owner, &mint, 9_990_000, 720, destinations)).unwrap()
+        };
+        plan(&[recipient])
+            .require_terms(&spec, &owner, &recipient)
+            .unwrap();
+        for destinations in [
+            vec![],
+            vec![owner],
+            vec![recipient, solana_pubkey::Pubkey::new_unique()],
+        ] {
+            let refused = plan(&destinations).require_terms(&spec, &owner, &recipient);
+            assert!(
+                matches!(&refused, Err(Error::Config(m)) if m.contains("publish a new Plan")),
+                "{destinations:?}: {refused:?}"
+            );
+        }
+
+        let data = create_plan_data(
+            7,
+            solana_pubkey::Pubkey::from_str(&mint).unwrap(),
+            9_990_000,
+            720,
+            &recipient,
+        )
+        .unwrap();
+        assert_eq!(
+            data.destinations,
+            [
+                recipient,
+                solana_pubkey::Pubkey::default(),
+                solana_pubkey::Pubkey::default(),
+                solana_pubkey::Pubkey::default()
+            ]
+        );
     }
 
     /// Run with a dedicated disposable Redis via PAY_TEST_SUBSCRIPTION_REDIS_URL.

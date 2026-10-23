@@ -3349,6 +3349,17 @@ async fn ensure_subscription_plans(
             .unwrap_or_else(|| route.plan_id_numeric(operator_pubkey_str, &api_subdomain));
         let seed = plan_id_seed(plan_id_numeric);
         let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
+        // The challenge's recipient (the endpoint's, else the operator's, as
+        // the gate resolves it) is the Plan's only destination.
+        let recipient = match sub_spec.recipient.as_deref() {
+            Some(recipient) => Pubkey::from_str(recipient).map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "endpoint `{}` has an invalid subscription recipient: {e}",
+                    endpoint.path
+                ))
+            })?,
+            None => operator,
+        };
         // A Plan authorizes every route it is attached to, so one per route.
         if let Some(other) = plans_in_use.insert(plan_pda, route.clone()) {
             return Err(pay_core::Error::Config(format!(
@@ -3380,11 +3391,12 @@ async fn ensure_subscription_plans(
                     "subscription Plan already on-chain — reusing",
                 );
                 let plan = fetch_plan(rpc_url, &plan_pda).await?;
-                plan.require_terms(sub_spec, &operator).map_err(|error| {
-                    pay_core::Error::Config(format!(
-                        "endpoint `{route}` cannot reuse Plan `{plan_pda}`: {error}"
-                    ))
-                })?;
+                plan.require_terms(sub_spec, &operator, &recipient)
+                    .map_err(|error| {
+                        pay_core::Error::Config(format!(
+                            "endpoint `{route}` cannot reuse Plan `{plan_pda}`: {error}"
+                        ))
+                    })?;
                 let plan_created_at = plan.created_at;
                 sub_spec.plan_id = Some(plan_pda.to_string());
                 sub_spec.plan_id_numeric = Some(plan_id_numeric);
@@ -3465,6 +3477,7 @@ async fn ensure_subscription_plans(
                     rpc_url,
                     route.clone(),
                     plan_id_numeric,
+                    &recipient,
                 )
                 .await
                 .map_err(|e| {
