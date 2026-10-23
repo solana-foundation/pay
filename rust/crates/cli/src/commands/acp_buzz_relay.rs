@@ -41,6 +41,15 @@ const MAX_CONNECTIONS: usize = 4;
 /// Reading one request may take this long in total, however slowly the
 /// bytes arrive, so a peer without the token cannot hold a slot.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+/// Longest one `buzz messages send` may run while it holds a slot; past it
+/// the send is killed and reported as failed.
+const SEND_DEADLINE: Duration = Duration::from_secs(60);
+/// Over-cap connections waiting for their "busy" answer. Beyond this they
+/// are closed unanswered, so a flood cannot grow the queue.
+const BUSY_QUEUE: usize = 16;
+/// How long the busy responder waits for an over-cap peer's request before
+/// closing, so the close does not reset the answer it just sent.
+const BUSY_DRAIN: Duration = Duration::from_millis(500);
 /// The `messages send` options an agent may pass. Attachments read local
 /// files, `--broadcast` leaves the relay, and global options would pick
 /// another identity or relay.
@@ -64,9 +73,19 @@ struct Response {
 impl Response {
     /// Shaped like the buzz CLI's own errors: JSON on stderr, exit code 1.
     fn refused(message: &str) -> Self {
-        let error = serde_json::json!({"error": "bad_input", "message": message});
+        Self::error("bad_input", 1, message)
+    }
+
+    /// The relay, not the request, failed: `other`, exit code 4, as when the
+    /// shim cannot reach the relay at all.
+    fn failed(message: &str) -> Self {
+        Self::error("other", 4, message)
+    }
+
+    fn error(kind: &str, code: i32, message: &str) -> Self {
+        let error = serde_json::json!({"error": kind, "message": message});
         Self {
-            code: 1,
+            code,
             stdout: String::new(),
             stderr: BASE64.encode(format!("{error}\n")),
         }
@@ -87,12 +106,14 @@ pub(super) struct BuzzRelay {
 struct Limits {
     max_connections: usize,
     request_deadline: Duration,
+    send_deadline: Duration,
 }
 
 impl Limits {
     const DEFAULT: Self = Self {
         max_connections: MAX_CONNECTIONS,
         request_deadline: REQUEST_DEADLINE,
+        send_deadline: SEND_DEADLINE,
     };
 }
 
@@ -146,12 +167,24 @@ impl BuzzRelay {
         let expected = token.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let slots = Arc::clone(&active);
+        // One thread answers every over-cap connection, so a flood costs a
+        // bounded queue and no worker.
+        let (busy, over_cap) = std::sync::mpsc::sync_channel::<TcpStream>(BUSY_QUEUE);
+        thread::Builder::new()
+            .name("pay-acp-buzz-busy".into())
+            .spawn(move || {
+                for stream in over_cap {
+                    answer_busy(stream);
+                }
+            })?;
         thread::Builder::new()
             .name("pay-acp-buzz-relay".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    // Over the cap: closed here, before any worker exists.
+                    // Over the cap: no worker; told to retry, or closed when
+                    // even the busy queue is full.
                     let Some(slot) = Slot::acquire(&slots, limits.max_connections) else {
+                        let _ = busy.try_send(stream);
                         continue;
                     };
                     let (tracker, buzz, expected) =
@@ -162,7 +195,7 @@ impl BuzzRelay {
                         .name("pay-acp-buzz-send".into())
                         .spawn(move || {
                             let _slot = slot;
-                            serve(stream, &expected, &tracker, &buzz, limits.request_deadline);
+                            serve(stream, &expected, &tracker, &buzz, limits);
                         });
                 }
             })?;
@@ -225,16 +258,39 @@ fn write_shim(dir: &Path, client_exe: &Path) -> io::Result<()> {
     )
 }
 
+/// Tell an over-cap peer to retry: write the answer, then read what it sent
+/// for a moment, so closing with its request unread does not reset the
+/// connection before the answer is read.
+fn answer_busy(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(BUSY_DRAIN));
+    let _ = stream.set_read_timeout(Some(BUSY_DRAIN));
+    if let Ok(mut body) = serde_json::to_vec(&Response::failed(
+        "the relay is busy with other sends; retry",
+    )) {
+        body.push(b'\n');
+        let _ = stream.write_all(&body);
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = Instant::now() + BUSY_DRAIN;
+    let mut sink = [0u8; 4096];
+    while Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
 fn serve(
     stream: TcpStream,
     expected_token: &str,
     tracker: &Mutex<BuzzDeliveryTracker>,
     buzz: &Path,
-    deadline: Duration,
+    limits: Limits,
 ) {
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     // A peer that cannot finish its request in time gets no answer.
-    let Ok(line) = read_request(&stream, Instant::now() + deadline) else {
+    let Ok(line) = read_request(&stream, Instant::now() + limits.request_deadline) else {
         return;
     };
     let response = match serde_json::from_slice::<Request>(&line).ok() {
@@ -253,7 +309,7 @@ fn serve(
                 send_args(&request.args, live),
                 BASE64.decode(&request.stdin),
             ) {
-                (Ok(args), Ok(stdin)) => run_buzz(buzz, &args, &stdin),
+                (Ok(args), Ok(stdin)) => run_buzz(buzz, &args, &stdin, limits.send_deadline),
                 (Err(message), _) => Response::refused(&message),
                 (_, Err(_)) => Response::refused("malformed relay request"),
             }
@@ -345,7 +401,9 @@ fn send_args(args: &[String], live: impl Fn(&str) -> bool) -> Result<Vec<String>
     Ok(out)
 }
 
-fn run_buzz(buzz: &Path, args: &[String], stdin: &[u8]) -> Response {
+/// Run `buzz` for one send, killing it if it outlives `deadline`: it runs
+/// while its connection holds one of the relay's few slots.
+fn run_buzz(buzz: &Path, args: &[String], stdin: &[u8], deadline: Duration) -> Response {
     let child = Command::new(buzz)
         .args(args)
         .stdin(Stdio::piped())
@@ -356,21 +414,66 @@ fn run_buzz(buzz: &Path, args: &[String], stdin: &[u8]) -> Response {
         Ok(child) => child,
         Err(error) => {
             tracing::warn!(%error, "Pay ACP relay could not launch `buzz messages send`");
-            return Response::refused("the relay could not run buzz");
+            return Response::failed("the relay could not run buzz");
         }
     };
     if let Some(mut input) = child.stdin.take() {
         let _ = input.write_all(stdin);
     }
-    match child.wait_with_output() {
-        Ok(output) => Response {
-            code: output.status.code().unwrap_or(4),
-            stdout: BASE64.encode(output.stdout),
-            stderr: BASE64.encode(output.stderr),
+    // Drain both pipes while waiting, so a chatty buzz cannot block on a
+    // full pipe until the deadline.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(pipe) = pipe {
+                let _ = pipe.take(MAX_REQUEST_BYTES).read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let until = Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("buzz did not finish the send in time");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Pay ACP relay could not wait for `buzz messages send`");
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("the relay could not run buzz");
+            }
+        }
+    };
+    let (stdout, stderr) = (
+        stdout.join().unwrap_or_default(),
+        stderr.join().unwrap_or_default(),
+    );
+    match status {
+        Ok(status) => Response {
+            code: status.code().unwrap_or(4),
+            stdout: BASE64.encode(stdout),
+            stderr: BASE64.encode(stderr),
         },
-        Err(error) => {
-            tracing::warn!(%error, "Pay ACP relay could not wait for `buzz messages send`");
-            Response::refused("the relay could not run buzz")
+        Err(message) => {
+            tracing::warn!(?deadline, "Pay ACP relay send failed: {message}");
+            Response::failed(message)
         }
     }
 }
@@ -611,10 +714,15 @@ mod limit_tests {
 
     /// A relay over a stand-in `buzz` that echoes its arguments.
     fn relay(limits: Limits) -> (BuzzRelay, tempfile::TempDir) {
+        relay_with(limits, "#!/bin/sh\nprintf 'sent %s' \"$*\"\n")
+    }
+
+    /// A relay over a stand-in `buzz` running `script`.
+    fn relay_with(limits: Limits, script: &str) -> (BuzzRelay, tempfile::TempDir) {
         use std::os::unix::fs::PermissionsExt as _;
         let fake = tempfile::tempdir().unwrap();
         let buzz = fake.path().join("buzz");
-        std::fs::write(&buzz, "#!/bin/sh\nprintf 'sent %s' \"$*\"\n").unwrap();
+        std::fs::write(&buzz, script).unwrap();
         std::fs::set_permissions(&buzz, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut tracker = BuzzDeliveryTracker::default();
         let prompt = serde_json::json!({
@@ -675,11 +783,16 @@ mod limit_tests {
         }
     }
 
+    fn stderr_of(response: &Response) -> String {
+        String::from_utf8(BASE64.decode(&response.stderr).unwrap()).unwrap()
+    }
+
     #[test]
-    fn connections_beyond_the_cap_are_closed_until_a_slot_frees() {
+    fn connections_beyond_the_cap_are_told_to_retry_until_a_slot_frees() {
         let (relay, _fake) = relay(Limits {
             max_connections: 2,
             request_deadline: Duration::from_secs(30),
+            send_deadline: SEND_DEADLINE,
         });
         // Two peers without the token hold every slot.
         let held: Vec<_> = (0..2)
@@ -687,9 +800,10 @@ mod limit_tests {
             .collect();
         wait_for(&relay.active, 2);
 
-        let excess = TcpStream::connect(relay.addr).unwrap();
-        assert!(closed_unanswered(excess));
-        assert!(send(&relay).is_err(), "a send got a worker past the cap");
+        // Past the cap a send gets no worker, but an answer: busy, retry.
+        let busy = send(&relay).expect("an over-cap send is answered");
+        assert_eq!(busy.code, 4);
+        assert!(stderr_of(&busy).contains("busy"), "{}", stderr_of(&busy));
         assert_eq!(relay.active.load(Ordering::Acquire), 2);
 
         drop(held);
@@ -709,6 +823,7 @@ mod limit_tests {
         let (relay, _fake) = relay(Limits {
             max_connections: 1,
             request_deadline: deadline,
+            send_deadline: SEND_DEADLINE,
         });
         let mut trickle = TcpStream::connect(relay.addr).unwrap();
         wait_for(&relay.active, 1);
@@ -726,5 +841,46 @@ mod limit_tests {
         assert!(closed_unanswered(trickle));
         // The freed slot serves an authenticated send.
         assert_eq!(send(&relay).unwrap().code, 0);
+    }
+
+    /// A `buzz` that never finishes is killed at the send deadline and
+    /// reported as a relay failure, and its slot is freed.
+    #[test]
+    fn a_send_that_overruns_its_deadline_is_killed() {
+        let (relay, _fake) = relay_with(
+            Limits {
+                max_connections: 1,
+                request_deadline: REQUEST_DEADLINE,
+                send_deadline: Duration::from_millis(300),
+            },
+            "#!/bin/sh\nexec sleep 30\n",
+        );
+        let started = Instant::now();
+        let response = send(&relay).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the send was not cut"
+        );
+        assert_eq!(response.code, 4);
+        assert!(
+            stderr_of(&response).contains("\"error\":\"other\""),
+            "{}",
+            stderr_of(&response)
+        );
+        wait_for(&relay.active, 0);
+    }
+
+    /// When the relay itself cannot run buzz, the agent sees `other` and
+    /// exit 4, not a refusal of its input.
+    #[test]
+    fn a_relay_failure_is_not_reported_as_bad_input() {
+        let response = run_buzz(
+            Path::new("/nonexistent/buzz"),
+            &[],
+            &[],
+            Duration::from_secs(1),
+        );
+        assert_eq!(response.code, 4);
+        assert!(stderr_of(&response).contains("\"error\":\"other\""));
     }
 }
