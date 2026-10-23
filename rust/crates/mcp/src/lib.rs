@@ -1,6 +1,7 @@
 //! MCP server for pay — exposes HTTP tools with 402 payment support.
 
 mod auth;
+pub mod authority;
 pub mod context;
 pub mod permissions;
 pub mod policy;

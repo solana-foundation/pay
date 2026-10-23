@@ -81,7 +81,15 @@ and does not submit the request or payment.
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let scope = self.context.scope(&ctx)?;
-        tools::curl::run(params, ctx.peer, self.session_cache.clone(), scope).await
+        let authority = self.context.spending_authority(&ctx)?;
+        tools::curl::run(
+            params,
+            ctx.peer,
+            self.session_cache.clone(),
+            scope,
+            authority,
+        )
+        .await
     }
 
     #[tool(
