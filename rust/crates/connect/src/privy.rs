@@ -145,6 +145,15 @@ struct Claims {
     /// When the token was issued; a token without it cannot be placed
     /// against what this process has seen.
     iat: u64,
+    /// When the token expires.
+    exp: u64,
+}
+
+/// A sign-out request's bearer, verified by [`Privy::identify_for_sign_out`]:
+/// who it proves, and whether the token had already expired.
+pub struct SignOutBearer {
+    pub identity: Identity,
+    expired: bool,
 }
 
 /// A user's Solana wallet at Privy.
@@ -339,6 +348,31 @@ impl SignOuts {
         true
     }
 
+    /// Remember that `subject` signed `session` out without counting it
+    /// toward their [`MAX_SIGN_OUTS_PER_USER`] share. Returns false as
+    /// [`Self::insert`] does.
+    fn insert_uncounted(&mut self, subject: &str, session: &str, now: Instant) -> bool {
+        if let Some((_, at)) = self.sessions.get_mut(session) {
+            *at = now;
+            return true;
+        }
+        if self.len() >= MAX_REVOKED_SESSIONS {
+            self.sessions.retain(|_, (_, at)| remembered(at, now));
+            self.users.retain(|_, (_, at)| remembered(at, now));
+            let sessions = &self.sessions;
+            self.by_user.retain(|_, sids| {
+                sids.retain(|sid| sessions.contains_key(sid));
+                !sids.is_empty()
+            });
+            if self.len() >= MAX_REVOKED_SESSIONS {
+                return false;
+            }
+        }
+        self.sessions
+            .insert(session.to_string(), (subject.to_string(), now));
+        true
+    }
+
     /// Forget the oldest remembered session to make room.
     fn evict_oldest(&mut self) {
         let Some((sid, owner)) = self
@@ -469,9 +503,36 @@ impl Privy {
     /// here. Ending a session needs proof it was the caller's, not that it
     /// is still live; refusing an expired or signed-out token would leave
     /// what it approved live.
-    pub async fn identify_for_sign_out(&self, access_token: &str) -> Result<Identity, String> {
+    pub async fn identify_for_sign_out(&self, access_token: &str) -> Result<SignOutBearer, String> {
         self.refresh_keys_for(access_token).await?;
-        self.decode(access_token, &self.sign_out_validation)
+        let (identity, exp) = self.decode_claims(access_token, &self.sign_out_validation)?;
+        Ok(SignOutBearer {
+            identity,
+            expired: exp <= unix_now(),
+        })
+    }
+
+    /// Sign out the session `bearer` proves. An expired bearer still ends
+    /// its session, but does not count toward the user's share of
+    /// remembered sign-outs: otherwise a handful of old leaked tokens, each
+    /// for its own session, would raise the floor that signs the user out
+    /// everywhere, again and again.
+    pub fn sign_out(&self, bearer: &SignOutBearer) {
+        let subject = subject_for_user(&bearer.identity.user_id);
+        let session = &bearer.identity.session.id;
+        if !bearer.expired {
+            return self.revoke_session(&subject, session);
+        }
+        let now = Instant::now();
+        let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+        if revoked.insert_uncounted(&subject, session, now) {
+            return;
+        }
+        self.not_before
+            .fetch_max(unix_now() + 1, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!("too many Privy sign-outs to remember; every earlier token is refused");
+        revoked.evict_oldest();
+        revoked.insert_uncounted(&subject, session, now);
     }
 
     async fn refresh_keys_for(&self, access_token: &str) -> Result<(), String> {
@@ -549,6 +610,16 @@ impl Privy {
         access_token: &str,
         validation: &jsonwebtoken::Validation,
     ) -> Result<Identity, String> {
+        self.decode_claims(access_token, validation)
+            .map(|(identity, _)| identity)
+    }
+
+    /// [`Self::decode`], with the token's `exp`.
+    fn decode_claims(
+        &self,
+        access_token: &str,
+        validation: &jsonwebtoken::Validation,
+    ) -> Result<(Identity, u64), String> {
         let token = access_token.trim();
         let kid = jsonwebtoken::decode_header(token)
             .map_err(|e| e.to_string())?
@@ -592,10 +663,13 @@ impl Privy {
             id: session,
             issued_at: data.claims.iat,
         };
-        Ok(Identity {
-            user_id: data.claims.sub,
-            session,
-        })
+        Ok((
+            Identity {
+                user_id: data.claims.sub,
+                session,
+            },
+            data.claims.exp,
+        ))
     }
 
     /// Whether credentials may still be derived from `session`, a login of
@@ -1500,6 +1574,49 @@ pub(crate) mod tests {
         assert!(privy.verify(&victim).is_err(), "the evicted sign-out holds");
         assert!(privy.verify(&bystander).is_err(), "everyone signs in again");
         assert!(privy.verify(&token("sess_new", unix() + 2)).is_ok());
+    }
+
+    /// A sign-out proven by an expired token still ends its session, but
+    /// does not count toward the user's share: old leaked tokens, each for
+    /// its own session, must not raise the floor that signs the user out of
+    /// every session.
+    #[tokio::test]
+    async fn expired_sign_out_bearers_do_not_sign_the_user_out_everywhere() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sid: &str, iat: u64, exp: u64| {
+            app.token(json!({
+                "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": exp, "iat": iat
+            }))
+        };
+        let live = token("sess_live", unix(), unix() + 600);
+        for i in 0..=2 * MAX_SIGN_OUTS_PER_USER {
+            let leaked = token(&format!("sess_old_{i}"), unix() - 7_200, unix() - 3_600);
+            let bearer = privy.identify_for_sign_out(&leaked).await.unwrap();
+            privy.sign_out(&bearer);
+        }
+        assert!(
+            privy
+                .verify(&token("sess_old_0", unix(), unix() + 600))
+                .is_err(),
+            "an expired bearer still ends its own session"
+        );
+        assert!(
+            privy.verify(&live).is_ok(),
+            "expired bearers do not sign the user out of other sessions"
+        );
+
+        // Positive control: the same number of live sign-outs does.
+        for i in 0..=MAX_SIGN_OUTS_PER_USER {
+            let current = token(&format!("sess_new_{i}"), unix(), unix() + 600);
+            let bearer = privy.identify_for_sign_out(&current).await.unwrap();
+            privy.sign_out(&bearer);
+        }
+        assert!(
+            privy.verify(&live).is_err(),
+            "live sign-outs past the share raise the floor"
+        );
     }
 
     /// One user signing out session after session never fills the list:

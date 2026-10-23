@@ -1766,7 +1766,7 @@ async fn sign_out_session(state: &AppState, headers: &HeaderMap) -> Result<(), A
     };
     // The same refresh-aware check approval uses: a token signed by a key
     // rotated in since the last fetch must still sign its session out.
-    let session = privy.identify_for_sign_out(token).await.map_err(|why| {
+    let bearer = privy.identify_for_sign_out(token).await.map_err(|why| {
         tracing::info!(%why, "privy sign-out token refused");
         ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -1774,9 +1774,8 @@ async fn sign_out_session(state: &AppState, headers: &HeaderMap) -> Result<(), A
             "Your Privy sign-in could not be verified, so it was not signed out. Try again.",
         )
     })?;
-    let subject = crate::privy::subject_for_user(&session.user_id);
-    let session = session.session.id;
-    privy.revoke_session(&subject, &session);
+    privy.sign_out(&bearer);
+    let session = bearer.identity.session.id;
     if let Some(store) = state.oauth() {
         store.revoke_session(&session);
     }
