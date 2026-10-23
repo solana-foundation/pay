@@ -1745,7 +1745,7 @@ mod tests {
                 payer: payer.clone(),
                 payer_authorizer: payer.clone(),
                 receiver: requirements.pay_to.clone(),
-                receiver_authorizer: None,
+                receiver_authorizer: requirements.extra.receiver_authorizer.clone(),
                 token: requirements.asset.clone(),
                 withdraw_delay: requirements.extra.withdraw_delay,
                 salt: "42".into(),

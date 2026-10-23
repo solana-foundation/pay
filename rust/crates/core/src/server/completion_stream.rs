@@ -350,7 +350,7 @@ mod tests {
         };
         let forward = SessionForward::delegated(
             session.clone(),
-            channel.clone(),
+            crate::server::session::DelegatedUse::for_test(&session, &channel).await,
             0,
             plan,
             (20_000, 1_000_000),

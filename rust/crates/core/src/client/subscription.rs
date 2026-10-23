@@ -125,11 +125,14 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         .method_details
         .clone()
         .ok_or_else(|| Error::Mpp("Subscription challenge is missing methodDetails".into()))?;
-    // The activation is built from methodDetails while the prompt shows the
-    // request fields; reject any mismatch (mint, amount, recipient, period)
-    // before either is used.
-    let method_details = request
-        .validated_method_details()
+    // The kit builds the activation from these terms and checks them against
+    // the on-chain Plan; parsing them here refuses a malformed challenge
+    // (amount, period, addresses, currency == mint, decimals) before the
+    // prompt shows any of it.
+    let terms = request
+        .terms()
+        .map_err(|e| Error::Mpp(format!("Invalid subscription request: {e}")))?;
+    let method_details = SubscriptionMethodDetails::from_json(&method_details_value)
         .map_err(|e| Error::Mpp(format!("Invalid subscription methodDetails: {e}")))?;
 
     // The Solana profile uses on-chain Plan PDAs; the SDK reads `planAddress` from
@@ -154,21 +157,24 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
     }
     if method_details.expected_period_hours != Some(period_hours) {
         return Err(Error::Mpp(
-            "Subscription methodDetails.expectedPeriodHours must match the requested cadence"
+            "Subscription methodDetails.expectedPeriodHours must match the requested billing period"
                 .into(),
         ));
     }
+    // The prompt shows `recipient`; the first-period charge goes where
+    // methodDetails says. Refuse a challenge where they differ.
+    if method_details
+        .recipient
+        .as_deref()
+        .is_some_and(|recipient| recipient != request.recipient)
+    {
+        return Err(Error::Mpp(
+            "Subscription methodDetails.recipient must match request.recipient".into(),
+        ));
+    }
 
-    let network = method_details_value
-        .get("network")
-        .and_then(|v| v.as_str())
-        .unwrap_or("mainnet")
-        .to_string();
-
-    let decimals = method_details_value
-        .get("decimals")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(6) as u8;
+    let network = terms.network().to_string();
+    let decimals = terms.decimals();
     if let Some(known) = pay_types::Stablecoin::decimals_for_mint(&method_details.mint)
         && known != decimals
     {

@@ -195,6 +195,10 @@ pub struct SessionForward {
     pub payment_policy: Option<String>,
     /// Releases the exclusive capacity reservation on every terminal path.
     pub(crate) _reservation: Option<DelegatedCapacityLease>,
+    /// The request's authentication under an operator-signed session; every
+    /// delegated charge takes it. `None` for a client-voucher forward, which
+    /// is never charged by the operator.
+    pub delegated: Option<Arc<crate::server::session::DelegatedUse>>,
 }
 
 impl SessionForward {
@@ -247,13 +251,23 @@ impl SessionForward {
             request_body_bytes: None,
             payment_policy: None,
             _reservation: None,
+            delegated: None,
         }
     }
 
+    /// The authenticated request a delegated charge takes, or an error for a
+    /// forward that no `use` proof admitted.
+    pub fn delegated_use(&self) -> Result<&Arc<crate::server::session::DelegatedUse>, String> {
+        self.delegated
+            .as_ref()
+            .ok_or_else(|| "delegated charge requires an authenticated request".to_string())
+    }
+
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn delegated(
         handle: Arc<SessionMpp>,
-        channel_id: String,
+        delegated: Arc<crate::server::session::DelegatedUse>,
         committed_base_units: u64,
         settlement: metering::UptoSettlementPlan,
         capacity_base_units: (u64, u64),
@@ -262,7 +276,7 @@ impl SessionForward {
     ) -> Self {
         Self {
             handle,
-            channel_id,
+            channel_id: delegated.channel_id().to_string(),
             committed_base_units,
             settlement: Some(SessionSettlementPlan::Metered(Box::new(settlement))),
             available_base_units: capacity_base_units.0,
@@ -271,6 +285,7 @@ impl SessionForward {
             request_body_bytes: None,
             payment_policy: None,
             _reservation: Some(reservation),
+            delegated: Some(delegated),
         }
     }
 }
@@ -380,7 +395,7 @@ pub async fn settle_delegated_session(
     let acceptance = pending
         .handle
         .authorize_reserved_usage(
-            &pending.channel_id,
+            pending.delegated_use()?,
             base_units,
             pending._reservation.as_ref(),
         )
@@ -2798,7 +2813,11 @@ async fn session_authorized(
         .process_credential_for_route(credential, route_amount)
         .await
     {
-        Ok(SessionOutcome::Active { state, signature }) => {
+        Ok(SessionOutcome::Active {
+            state,
+            signature,
+            delegated,
+        }) => {
             if sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Client {
                 let mut response = GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
@@ -2821,6 +2840,25 @@ async fn session_authorized(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Bytes::from_static(br#"{"error":"session_backend_unavailable"}"#),
                 ));
+            };
+            // A `topUp` raises the deposit but authenticates no request; only a
+            // `use` proof (or the proof an `open` binds) does.
+            let Some(delegated) = delegated else {
+                let mut response = GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "session_use_required",
+                        "message": "The channel is funded; authenticate the request with the session's use proof.",
+                        "channelId": state.channel_id,
+                    }))
+                    .unwrap_or_default(),
+                );
+                if let Some(reference) = signature {
+                    response
+                        .headers
+                        .extend(session_receipt_annotation(sm.network(), reference).headers);
+                }
+                return GateDecision::Respond(response);
             };
             let available_base_units = state.deposit.saturating_sub(state.cumulative);
             let indivisible_price = match pricing {
@@ -2905,6 +2943,7 @@ async fn session_authorized(
                     request_body_bytes: None,
                     payment_policy: None,
                     _reservation: Some(reservation),
+                    delegated: Some(delegated),
                 })),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),

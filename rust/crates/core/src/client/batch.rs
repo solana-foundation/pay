@@ -752,7 +752,7 @@ mod tests {
             extra: BatchExtra {
                 payment_flow: None,
                 fee_payer: fee_payer.to_string(),
-                receiver_authorizer: None,
+                receiver_authorizer: Some(pay_to.to_string()),
                 withdraw_delay: 3600,
                 token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
                 memo: None,
@@ -813,7 +813,7 @@ mod tests {
             payer: "payer".to_string(),
             payer_authorizer: "operator".to_string(),
             receiver: requirements.pay_to.clone(),
-            receiver_authorizer: None,
+            receiver_authorizer: requirements.extra.receiver_authorizer.clone(),
             token: requirements.asset.clone(),
             withdraw_delay: requirements.extra.withdraw_delay,
             salt: "1".to_string(),

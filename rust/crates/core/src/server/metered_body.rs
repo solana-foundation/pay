@@ -417,6 +417,7 @@ mod tests {
             request_body_bytes: None,
             payment_policy: None,
             _reservation: None,
+            delegated: None,
         }
     }
 

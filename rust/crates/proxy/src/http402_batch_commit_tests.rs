@@ -109,7 +109,7 @@ fn payment_header(requirements: &BatchRequirements, fee_payer: &Pubkey) -> (Stri
         payer: payer.to_string(),
         payer_authorizer: payer.to_string(),
         receiver: requirements.pay_to.clone(),
-        receiver_authorizer: None,
+        receiver_authorizer: requirements.extra.receiver_authorizer.clone(),
         token: requirements.asset.clone(),
         withdraw_delay: requirements.extra.withdraw_delay,
         salt: "42".into(),

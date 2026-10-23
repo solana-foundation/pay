@@ -26,8 +26,7 @@ use pay_kit::mpp::store::{
 };
 use pay_kit::mpp::{
     Base64UrlJson, ChallengeEcho, PaymentChallenge, SessionAction, SessionRequest,
-    SessionVoucherSigner, SignedVoucher, UsePayload, VoucherData, VoucherPayload,
-    VoucherSignatureType, parse_authorization,
+    SessionVoucherSigner, UsePayload, parse_authorization,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -202,6 +201,11 @@ pub enum SessionOutcome {
         /// other variant would otherwise be moved around at its size.
         state: Box<ChannelState>,
         signature: Option<String>,
+        /// The request's authentication under an operator-signed session: a
+        /// `use` proof, or the proof an `open` bound. `None` for a client-signed
+        /// session and for a `topUp`, which authenticates no request. Only a
+        /// request carrying one can be charged.
+        delegated: Option<Arc<DelegatedUse>>,
     },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
     Voucher {
@@ -226,18 +230,93 @@ pub struct DelegatedUsageAuthorization {
     pub idle_timeout_seconds: u32,
 }
 
-/// Attempts per delegated commit before a channel that keeps advancing under
-/// other replicas is reported as busy.
-const DELEGATED_COMMIT_ATTEMPTS: usize = 4;
-/// Fence error raised inside the store update when another writer advanced
-/// the watermark a delegated voucher was signed from.
-const DELEGATED_WATERMARK_MOVED: &str = "delegated session watermark moved";
+/// A request authenticated under an operator-signed session, the only thing
+/// a delegated charge takes (draft-solana-session-00 §Debit Processing: the
+/// request is authenticated before it is charged).
+///
+/// [`SessionMpp`] creates one only after PayKit accepted the request's proof
+/// (`authenticate_use`). Every charge re-authenticates the same proof under
+/// its own idempotency key, `<request>:<n>`: a stream's successive charges
+/// are distinct requests to PayKit, and a retry of one charge after an
+/// ambiguous store result replays it instead of charging twice. The request
+/// key is generated per admitted request, never taken from the client: a
+/// client retry is a new request and is served (and charged) again.
+pub struct DelegatedUse {
+    payload: UsePayload,
+    challenge_id: String,
+    request_key: String,
+    charges: std::sync::atomic::AtomicU64,
+}
 
-/// Outcome of one fenced delegated commit round.
-enum DelegatedCommit {
-    Committed(DelegatedUsageAuthorization),
-    /// Another writer advanced the channel; nothing was written.
-    WatermarkMoved,
+impl DelegatedUse {
+    /// The authenticated channel.
+    pub fn channel_id(&self) -> &str {
+        &self.payload.channel_id
+    }
+
+    /// The idempotency key of this request's next charge.
+    fn next_charge_key(&self) -> String {
+        let n = self.charges.fetch_add(1, Ordering::SeqCst);
+        format!("{}:{n}", self.request_key)
+    }
+}
+
+#[cfg(test)]
+impl DelegatedUse {
+    /// Test support: bind `channel_id`'s stored record to a fixed test
+    /// payer's proof (deterministic, so binding twice keeps the first proof)
+    /// and return an authenticated request for it. The charge still runs
+    /// PayKit's `authenticate_use` against the stored binding.
+    pub(crate) async fn for_test(session: &SessionMpp, channel_id: &str) -> Arc<Self> {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let store = &session.operator_runtime.channel_store;
+        let state = store
+            .get_channel(channel_id)
+            .await
+            .unwrap()
+            .expect("seed the channel before authenticating a request on it");
+        let opening = if state.opening_challenge_id.is_empty() {
+            "test-opening".to_string()
+        } else {
+            state.opening_challenge_id.clone()
+        };
+        let proof =
+            pay_kit::mpp::SessionAuthentication::sign(opening.clone(), channel_id, &key).unwrap();
+        let bound = serde_json::to_string(&proof).unwrap();
+        let payer = proof.payer.clone();
+        store
+            .update_channel(
+                channel_id,
+                Box::new(move |state| {
+                    let mut state = state.expect("seeded channel");
+                    state.payer = payer;
+                    state.authentication = Some(bound);
+                    state.opening_challenge_id = opening;
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        Arc::new(Self {
+            payload: UsePayload {
+                channel_id: channel_id.to_string(),
+                authentication: proof,
+            },
+            challenge_id: "test-request".to_string(),
+            request_key: format!("test-{}", uuid::Uuid::new_v4().simple()),
+            charges: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+impl std::fmt::Debug for DelegatedUse {
+    // The proof is a bearer credential: never format it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegatedUse")
+            .field("channel_id", &self.payload.channel_id)
+            .field("request_key", &self.request_key)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -2057,23 +2136,21 @@ impl SessionMpp {
     /// voucher before releasing that response to the client.
     pub async fn authorize_delegated_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
     ) -> Result<DelegatedUsageAuthorization> {
-        self.authorize_reserved_usage(channel_id, amount, None)
-            .await
+        self.authorize_reserved_usage(delegated, amount, None).await
     }
 
     pub async fn authorize_reserved_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
-        let accepted = self
-            .commit_reserved_usage(channel_id, amount, lease)
+        let accepted = self.commit_reserved_usage(delegated, amount, lease).await?;
+        self.touch_after_delegated_usage(delegated.channel_id())
             .await?;
-        self.touch_after_delegated_usage(channel_id).await?;
         Ok(accepted)
     }
 
@@ -2084,10 +2161,10 @@ impl SessionMpp {
     /// is cancelled, uses the two halves.
     pub async fn commit_delegated_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
     ) -> Result<DelegatedUsageAuthorization> {
-        self.commit_reserved_usage(channel_id, amount, None).await
+        self.commit_reserved_usage(delegated, amount, None).await
     }
 
     /// Extend the channel lifecycle after a committed delegated charge.
@@ -2102,10 +2179,11 @@ impl SessionMpp {
 
     async fn commit_reserved_usage(
         &self,
-        channel_id: &str,
+        delegated: &DelegatedUse,
         amount: u64,
         lease: Option<&DelegatedCapacityLease>,
     ) -> Result<DelegatedUsageAuthorization> {
+        let channel_id = delegated.channel_id();
         let lease_id = lease.and_then(|lease| lease.durable_id.clone());
         if self.channel_binding.is_some() && lease_id.is_none() {
             return Err(Error::PaymentRejected(
@@ -2132,45 +2210,11 @@ impl SessionMpp {
                 "session does not delegate voucher authority to the operator".to_string(),
             ));
         }
-        // Serialize read/sign/verify so concurrent responses on this replica
-        // cannot construct two vouchers from the same cumulative watermark.
-        // Other replicas share only the store, so each attempt is also fenced
-        // on the watermark it signed from (see `try_commit_reserved_usage`).
+        // Serialize charges on this replica so concurrent responses rarely
+        // race; PayKit fences each commit on the watermark it signed from and
+        // retries a lost race, which is what keeps other replicas correct.
         let _guard = self.operator_runtime.delegated_voucher_lock.lock().await;
-        for _ in 0..DELEGATED_COMMIT_ATTEMPTS {
-            match self
-                .try_commit_reserved_usage(
-                    channel_id,
-                    amount,
-                    lease_id.clone(),
-                    deadline,
-                    initial_cumulative,
-                )
-                .await?
-            {
-                DelegatedCommit::Committed(accepted) => return Ok(accepted),
-                DelegatedCommit::WatermarkMoved => continue,
-            }
-        }
-        Err(Error::PaymentRejected(format!(
-            "delegated session channel {channel_id} kept advancing concurrently; retry the request"
-        )))
-    }
 
-    /// One read/sign/commit round of [`Self::commit_reserved_usage`]. The
-    /// commit is fenced on the watermark the voucher was signed from: if
-    /// another replica advanced the channel in between, nothing is written
-    /// and the caller re-reads. Without the fence an identical deterministic
-    /// voucher would land as a no-charge replay and release a second response
-    /// for one debit.
-    async fn try_commit_reserved_usage(
-        &self,
-        channel_id: &str,
-        amount: u64,
-        lease_id: Option<String>,
-        deadline: Option<tokio::time::Instant>,
-        initial_cumulative: Option<u64>,
-    ) -> Result<DelegatedCommit> {
         // The durable store is authoritative. Reading it on every delegated
         // authorization also lets a restarted or different gateway replica
         // continue from a watermark advanced by another process.
@@ -2190,22 +2234,20 @@ impl SessionMpp {
         self.server
             .require_channel_binding(&state)
             .map_err(|error| Error::PaymentRejected(error.to_string()))?;
-        let current = state.cumulative;
         let idle_timeout_seconds = state.idle_timeout_seconds.ok_or_else(|| {
             Error::Mpp(format!(
                 "delegated session channel {channel_id} is missing its negotiated idle timeout"
             ))
         })?;
-        self.record_committed_watermark(channel_id.to_string(), current);
+        self.record_committed_watermark(channel_id.to_string(), state.cumulative);
         if amount == 0 {
-            return Ok(DelegatedCommit::Committed(DelegatedUsageAuthorization {
-                cumulative: current,
+            // Nothing delivered is nothing charged: unused reserved capacity
+            // MUST NOT advance the voucher.
+            return Ok(DelegatedUsageAuthorization {
+                cumulative: state.cumulative,
                 idle_timeout_seconds,
-            }));
+            });
         }
-        let cumulative = current
-            .checked_add(amount)
-            .ok_or_else(|| Error::Mpp("session cumulative amount overflow".to_string()))?;
         let signer = self
             .operator_runtime
             .payment_channel_signer()
@@ -2219,99 +2261,60 @@ impl SessionMpp {
             )));
         }
 
-        let data = VoucherData {
-            channel_id: channel_id.to_string(),
-            cumulative_amount: cumulative.to_string(),
-            expires_at: Some(pay_kit::mpp::DEFAULT_SESSION_EXPIRES_AT),
-        };
-        let message = data
-            .message_bytes()
-            .map_err(|e| Error::Mpp(format!("failed to encode delegated voucher: {e}")))?;
-        let signature = signer
-            .sign_message(&message)
-            .await
-            .map_err(|e| Error::Mpp(format!("failed to sign delegated voucher: {e}")))?;
-        let accepted = match self
+        let authenticated = self
             .server
-            .verify_voucher_with_guard(
-                &VoucherPayload {
-                    channel_id: channel_id.to_string(),
-                    voucher: SignedVoucher {
-                        data,
-                        signer: operator.to_string(),
-                        signature: crate::b58::encode_64(&<[u8; 64]>::from(signature)),
-                        signature_type: VoucherSignatureType::Ed25519,
-                    },
-                },
-                move |state| {
-                    if state.cumulative != current {
-                        return Err(pay_kit::mpp::Error::Other(DELEGATED_WATERMARK_MOVED.into()));
-                    }
-                    if let Some(id) = &lease_id {
-                        if initial_cumulative != Some(state.cumulative) {
-                            return Err(pay_kit::mpp::Error::Other(
-                                "deployment reservation was already consumed".into(),
-                            ));
-                        }
-                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                        {
-                            return Err(pay_kit::mpp::Error::Other(
-                                "deployment request lifetime exceeded".into(),
-                            ));
-                        }
-                        pay_types::deployment_policy::require_reservation(
-                            state,
-                            id,
-                            amount,
-                            unix_millis(),
-                        )
-                        .map_err(|error| pay_kit::mpp::Error::Other(error.to_string()))?;
-                    }
-                    Ok(())
-                },
+            .authenticate_use(
+                &delegated.payload,
+                &delegated.challenge_id,
+                &delegated.next_charge_key(),
             )
             .await
-        {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                let message = error.to_string();
-                // The kit reports a lost race that our fence did not see
-                // first: a different signature at the same cumulative, or
-                // this exact deterministic voucher already landed by another
-                // replica (the kit refuses that replay before our fence runs).
-                if message.contains(DELEGATED_WATERMARK_MOVED)
-                    || message.contains("watermark advanced")
-                    || message.contains("voucher was already accepted")
-                {
-                    return Ok(DelegatedCommit::WatermarkMoved);
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        let charge = self
+            .server
+            .charge_operator_usage(&authenticated, signer.as_ref(), amount, move |state| {
+                if let Some(id) = &lease_id {
+                    if initial_cumulative != Some(state.cumulative) {
+                        return Err(pay_kit::mpp::Error::Other(
+                            "deployment reservation was already consumed".into(),
+                        ));
+                    }
+                    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                        return Err(pay_kit::mpp::Error::Other(
+                            "deployment request lifetime exceeded".into(),
+                        ));
+                    }
+                    pay_types::deployment_policy::require_reservation(
+                        state,
+                        id,
+                        amount,
+                        unix_millis(),
+                    )
+                    .map_err(|error| pay_kit::mpp::Error::Other(error.to_string()))?;
                 }
-                return Err(Error::PaymentRejected(message));
-            }
-        };
-        // The fence makes a replay unreachable; never let one through as a
-        // fresh, paid execution if that ever changes.
-        if accepted.replay || accepted.charged != amount {
-            return Err(Error::PaymentRejected(format!(
-                "delegated voucher for channel {channel_id} did not charge this request"
-            )));
-        }
+                Ok(())
+            })
+            .await
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
         telemetry::record_payment_channel_voucher_cumulative(
             channel_id,
             self.currency(),
             self.network(),
-            accepted.cumulative,
+            charge.cumulative,
         );
-        telemetry::record_payment_channel_voucher_accepted_for_protocol(
-            "mpp/session",
-            self.currency(),
-            self.network(),
-            accepted.charged,
-        );
-        self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
-        Ok(DelegatedCommit::Committed(DelegatedUsageAuthorization {
-            cumulative: accepted.cumulative,
+        if !charge.replay {
+            telemetry::record_payment_channel_voucher_accepted_for_protocol(
+                "mpp/session",
+                self.currency(),
+                self.network(),
+                amount,
+            );
+        }
+        self.record_committed_watermark(channel_id.to_string(), charge.cumulative);
+        Ok(DelegatedUsageAuthorization {
+            cumulative: charge.cumulative,
             idle_timeout_seconds,
-        }))
+        })
     }
 
     pub async fn reserve_delegated_capacity(
@@ -2730,19 +2733,39 @@ impl SessionMpp {
 
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
+                // An operator-signed open authenticates its request with the
+                // proof it binds, the one every later `use` presents.
+                let delegated = match (&p.authentication, self.voucher_signer()) {
+                    (Some(authentication), SessionVoucherSigner::Operator) => Some(
+                        self.authenticate_delegated_use(
+                            UsePayload {
+                                channel_id: state.channel_id.clone(),
+                                authentication: authentication.clone(),
+                            },
+                            &credential.challenge.id,
+                        )
+                        .await?,
+                    ),
+                    _ => None,
+                };
                 Ok(SessionOutcome::Active {
                     state: Box::new(state),
                     signature,
+                    delegated,
                 })
             }
 
             SessionAction::Use(p) => {
                 let state = self.verify_use_authentication(p).await?;
+                let delegated = self
+                    .authenticate_delegated_use(p.clone(), &credential.challenge.id)
+                    .await?;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone()).await?;
                 Ok(SessionOutcome::Active {
                     state: Box::new(state),
                     signature: None,
+                    delegated: Some(delegated),
                 })
             }
 
@@ -2814,6 +2837,7 @@ impl SessionMpp {
                 Ok(SessionOutcome::Active {
                     state: Box::new(state),
                     signature,
+                    delegated: None,
                 })
             }
 
@@ -3038,6 +3062,26 @@ impl SessionMpp {
             "reuse: loaded channel from chain"
         );
         Ok(())
+    }
+
+    /// Authenticate a delegated request with PayKit (`authenticate_use`) and
+    /// return the token its charges take. See [`DelegatedUse`].
+    pub async fn authenticate_delegated_use(
+        &self,
+        payload: UsePayload,
+        challenge_id: &str,
+    ) -> Result<Arc<DelegatedUse>> {
+        let request_key = format!("pay-{}", uuid::Uuid::new_v4().simple());
+        self.server
+            .authenticate_use(&payload, challenge_id, &request_key)
+            .await
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        Ok(Arc::new(DelegatedUse {
+            payload,
+            challenge_id: challenge_id.to_string(),
+            request_key,
+            charges: std::sync::atomic::AtomicU64::new(0),
+        }))
     }
 
     async fn verify_use_authentication(&self, payload: &UsePayload) -> Result<ChannelState> {
@@ -3632,13 +3676,20 @@ mod tests {
         );
         assert!(
             backend
-                .authorize_delegated_usage("durable", 50_000)
+                .authorize_delegated_usage(
+                    &*DelegatedUse::for_test(&backend, "durable").await,
+                    50_000
+                )
                 .await
                 .is_err()
         );
         assert!(
             backend
-                .authorize_reserved_usage("durable", 50_003, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, "durable").await,
+                    50_003,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -3687,6 +3738,7 @@ mod tests {
                 request_body_bytes: None,
                 payment_policy: None,
                 _reservation: Some(lease),
+                delegated: Some(DelegatedUse::for_test(&backend, &channel).await),
             };
             let body = if broken {
                 Body::from_stream(futures_util::stream::once(async {
@@ -3734,13 +3786,21 @@ mod tests {
             .unwrap()
             .unwrap();
         let accepted = backend
-            .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+            .authorize_reserved_usage(
+                &*DelegatedUse::for_test(&backend, &channel).await,
+                50_000,
+                Some(&lease),
+            )
             .await
             .unwrap();
         assert_eq!(accepted.cumulative, 50_000);
         assert!(
             backend
-                .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, &channel).await,
+                    50_000,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -3792,7 +3852,11 @@ mod tests {
             .unwrap();
         assert!(
             backend
-                .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, &channel).await,
+                    50_000,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -3854,7 +3918,11 @@ mod tests {
         assert!(lease.require_active(50_000).await.is_err());
         assert!(
             backend
-                .authorize_reserved_usage("expiry", 50_000, Some(&lease))
+                .authorize_reserved_usage(
+                    &*DelegatedUse::for_test(&backend, "expiry").await,
+                    50_000,
+                    Some(&lease)
+                )
                 .await
                 .is_err()
         );
@@ -4886,7 +4954,9 @@ mod tests {
         let handle = SessionHandle::new(channel, test_session_signer(), challenge)
             .with_authentication(proof);
 
-        let SessionOutcome::Active { state, signature } = session
+        let SessionOutcome::Active {
+            state, signature, ..
+        } = session
             .process(&handle.use_header().await.unwrap())
             .await
             .unwrap()
@@ -5733,9 +5803,10 @@ mod tests {
         )
         .await;
 
+        let delegated = DelegatedUse::for_test(&session, &channel).await;
         let first = tokio::time::timeout(
             Duration::from_secs(2),
-            session.authorize_delegated_usage(&channel, 75),
+            session.authorize_delegated_usage(&delegated, 75),
         )
         .await
         .expect("first delegated voucher timed out")
@@ -5746,7 +5817,7 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(2),
-                session.authorize_delegated_usage(&channel, 25),
+                session.authorize_delegated_usage(&delegated, 25),
             )
             .await
             .expect("second delegated voucher timed out")

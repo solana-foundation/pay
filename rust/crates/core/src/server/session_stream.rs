@@ -394,12 +394,16 @@ impl DelegatedSessionStreamMeter {
             return Ok(());
         }
         let handle = Arc::clone(&self.forward.handle);
-        let channel_id = self.forward.channel_id.clone();
+        let delegated = Arc::clone(
+            self.forward
+                .delegated_use()
+                .map_err(|error| box_error(std::io::Error::other(error)))?,
+        );
         self.in_flight = Some(InFlightCharge {
             amount,
-            commit: tokio::spawn(async move {
-                handle.commit_delegated_usage(&channel_id, amount).await
-            }),
+            commit: tokio::spawn(
+                async move { handle.commit_delegated_usage(&delegated, amount).await },
+            ),
         });
         self.resolve_in_flight().await?;
         self.authorization_exhausted |= exhausted_by_clamp;
@@ -2284,7 +2288,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .expect("session capacity should be available");
         let forward = SessionForward::delegated(
             session.clone(),
-            channel_id.clone(),
+            crate::server::session::DelegatedUse::for_test(&session, &channel_id).await,
             0,
             crate::server::metering::UptoSettlementPlan {
                 metering: metering(vec![MeterDimension {
@@ -2508,7 +2512,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .expect("session capacity should be available");
         SessionForward::delegated(
             session.clone(),
-            channel_id.to_string(),
+            crate::server::session::DelegatedUse::for_test(session, channel_id).await,
             0,
             crate::server::metering::UptoSettlementPlan {
                 metering: metering(dimensions),
@@ -3437,12 +3441,18 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "racing-replicas",
             &shared,
         );
+        let first_request =
+            crate::server::session::DelegatedUse::for_test(&channel.session, &channel_id).await;
+        let second_request =
+            crate::server::session::DelegatedUse::for_test(&second, &channel_id).await;
         // Both replicas read the channel at cumulative 0 and sign the same
         // deterministic voucher for 25; only one of them may land it.
         store.hold_reads_in_lockstep(2);
         let (first, second) = tokio::join!(
-            channel.session.authorize_delegated_usage(&channel_id, 25),
-            second.authorize_delegated_usage(&channel_id, 25),
+            channel
+                .session
+                .authorize_delegated_usage(&first_request, 25),
+            second.authorize_delegated_usage(&second_request, 25),
         );
         let mut cumulatives = [first.unwrap().cumulative, second.unwrap().cumulative];
         cumulatives.sort_unstable();

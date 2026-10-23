@@ -812,9 +812,9 @@ impl BenchScheme for BatchSettlement {
 
     async fn settle_and_close(&self, ctx: &UserCtx, _setup: &UserSetup) -> Result<()> {
         // The gateway redeems accepted vouchers on its own batch schedule, so an
-        // explicit client close is optional. When requested, send a payer-signed
-        // `refund` (forced `request_close`); it needs a fresh blockhash, so
-        // re-probe for a current challenge first.
+        // explicit client close is optional. When requested, send the
+        // cooperative `refund` voucher; it is signed against the current
+        // terms, so re-probe for a challenge first.
         if self.offline || !self.close_after_run {
             return Ok(());
         }
@@ -828,7 +828,6 @@ impl BenchScheme for BatchSettlement {
             .map_err(|e| anyhow::anyhow!("close: bad extra.tokenProgram: {e}"))?;
         let terms = resolve_terms_with_token_program(&requirements, token_program, None)
             .map_err(|e| anyhow::anyhow!("close: resolve batch terms: {e}"))?;
-        let (blockhash, _open_slot) = open_hints(&requirements)?;
         let signer = MemorySigner::from_bytes(&ctx.wallet.keypair)
             .map_err(|e| anyhow::anyhow!("close: payer signer: {e}"))?;
         let channel = BatchChannel::new(
@@ -837,7 +836,7 @@ impl BenchScheme for BatchSettlement {
             handle.charged_cumulative,
             self.deposit_base,
         );
-        let payload = build_refund(&signer, &channel, &terms, blockhash)
+        let payload = build_refund(&signer, &channel, &terms)
             .await
             .map_err(|e| anyhow::anyhow!("build batch refund: {e}"))?;
         let header = encode_payment_header(&requirements, payload)

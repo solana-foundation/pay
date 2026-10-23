@@ -10,7 +10,7 @@ use pay_kit::x402::{
     X402_VERSION_V2,
     client::exact::{
         build_payment_header as build_payment_header_v2, build_payment_header_v1,
-        parse_x402_challenge_for_network,
+        parse_x402_challenge,
     },
     exact::{
         PaymentExtensions, PaymentRequiredEnvelope, PaymentRequirements, SOLANA_DEVNET,
@@ -99,7 +99,11 @@ pub fn scheme_network(network: &str, network_override: Option<&str>) -> String {
 /// Try to parse an x402 challenge from headers and/or body.
 /// Defaults to preferring Solana mainnet when multiple chains are offered.
 pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challenge> {
-    let requirements = parse_x402_challenge_for_network(headers, body, Some(SOLANA_MAINNET))?;
+    // No network pinned: the kit prefers mainnet and otherwise takes the
+    // cheapest Solana offer. Pinning one would refuse every devnet or
+    // sandbox offer; the network the payment signs on is resolved later
+    // from the chosen offer and any `--network` override.
+    let requirements = parse_x402_challenge(headers, body)?;
     let siwx = parse_siwx_extension(headers, body).ok().flatten();
     let extensions =
         parse_payment_required_envelope(headers, body).and_then(|envelope| envelope.extensions);
@@ -1381,7 +1385,7 @@ fn format_amount(amount: &str, currency: &str) -> String {
 }
 
 fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 {
-    // Mirror `parse_x402_challenge_for_network`'s selection order so the
+    // Mirror `parse_x402_challenge`'s selection order so the
     // version we report is the one whose payload the parser actually consumed.
     // If the parser took the v1 header but we reported V2 from the body, the
     // build path would emit a v2 envelope from v1-parsed requirements — same

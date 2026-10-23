@@ -707,6 +707,7 @@ pub(crate) fn build_sandbox_upto_backend(
         resource: resource.to_string(),
         description: None,
         max_timeout_seconds: 300,
+        max_channel_lifetime: pay_kit::x402::upto::MaxChannelLifetime::ONE_HOUR,
         program_id: None,
         withdraw_delay: 0,
         fee_payer_signer,
