@@ -12,7 +12,7 @@ use pay_core::client::session::SessionHandle;
 use pay_kit::mpp::{
     PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication, UsePayload,
     client::{
-        PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
+        OpenBlockhash, PaymentChannelSessionOpenOptions, SessionOpenAuthorization,
         create_payment_channel_session_opener, session::ActiveSession,
     },
     format_authorization,
@@ -169,18 +169,20 @@ async fn open(harness: &Harness, host: &str, payer: &SigningKey, price: u64) -> 
     })
     .await
     .expect("local confirmed bank reaches the challenged slot");
+    let operator = Pubkey::from_str(request.method_details.operator.as_deref().unwrap()).unwrap();
+    let blockhash = OpenBlockhash::verify(
+        &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(harness.endpoints.rpc.clone()),
+        &request,
+    )
+    .await
+    .expect("challenged blockhash is live on the local cluster");
     let mut opened = create_payment_channel_session_opener(
         &request,
         &signer(payer),
         Box::new(signer(&key())),
-        None,
-        PaymentChannelSessionOpenOptions {
-            open: PaymentChannelOpenOptions {
-                deposit: Some(DEPOSIT),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+        blockhash,
+        &SessionOpenAuthorization::operator_signed(DEPOSIT, operator),
+        PaymentChannelSessionOpenOptions::default(),
     )
     .await
     .expect("build real funded open transaction");

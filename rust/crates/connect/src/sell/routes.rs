@@ -1953,7 +1953,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn signed_batch_stream_is_held_until_completion_and_replays_without_second_charge() {
+    async fn signed_batch_stream_is_held_until_completion_and_a_replay_is_not_charged_twice() {
         let fixture = PaidBatchSeller::new().await;
         let (response, rid) = fixture.start().await;
         assert!(
@@ -2004,8 +2004,12 @@ mod tests {
                 .headers()
                 .contains_key(pay_kit::x402::PAYMENT_RESPONSE_HEADER)
         );
-        let replay = to_bytes(replay.into_body(), 4096).await.unwrap();
-        assert_eq!(replay.as_ref(), [first.as_ref(), last.as_ref()].concat());
+        // A replay returns its payment result, never the paid body: the
+        // voucher that unlocks it is public once a claim discloses it.
+        let replay: serde_json::Value =
+            serde_json::from_slice(&to_bytes(replay.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(replay["status"], "already_settled");
+        assert!(!replay.to_string().contains("live"));
         assert_eq!(fixture.channel_state().await.cumulative, 20_000);
         let entry = fixture.state.registry.get(&fixture.id).unwrap();
         assert_eq!(
@@ -3163,6 +3167,7 @@ mod tests {
                     recipient: operator.pubkey(),
                     amount: 1,
                     suggested_deposit: Some(1_000_000),
+                    minimum_deposit: Some(1_000_000),
                     currency: "USDC".into(),
                     decimals: 6,
                     network: "devnet".into(),

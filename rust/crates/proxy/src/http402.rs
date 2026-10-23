@@ -26,11 +26,10 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    BatchForward, GateDecision, GateRequest, GateResponse, MAX_BATCH_CACHED_RESPONSE_BYTES,
-    PaidRequestTelemetry, PaymentGate, ReceiptAnnotation, SessionForward, UpstreamRoute,
-    UptoPaymentTelemetry, batch_cached_response, cache_batch_response, commit_batch, release_batch,
-    resolve_api, settle_batch, settle_delegated_session as settle_delegated_session_forward,
-    settle_upto, settle_upto_metered,
+    BatchForward, GateDecision, GateRequest, GateResponse, PaidRequestTelemetry, PaymentGate,
+    ReceiptAnnotation, SessionForward, UpstreamRoute, UptoPaymentTelemetry, commit_batch,
+    release_batch, resolve_api, settle_batch,
+    settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
@@ -85,11 +84,6 @@ pub struct Ctx {
     /// responded). Taken when settled, so it's never double-settled.
     upto: Option<PendingUpto>,
     batch: Option<BatchForward>,
-    /// A successfully committed streaming response whose body is still being
-    /// captured for idempotent replay. Keeping the outcome until `logging`
-    /// lets pay-kit attach the complete representation after end-of-stream.
-    batch_cache: Option<BatchForward>,
-    batch_response: Option<BatchResponseCapture>,
     /// A delegated MPP session opened pre-serve. Observable streams authorize
     /// cumulative usage before each chunk is released; other responses are
     /// buffered and settled before the body is returned.
@@ -128,38 +122,6 @@ struct PendingUpto {
     settle_amount: u64,
     settlement: Option<UptoSettlementPlan>,
     telemetry: UptoPaymentTelemetry,
-}
-
-struct BatchResponseCapture {
-    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
-    complete: bool,
-}
-
-impl BatchResponseCapture {
-    fn start(status: StatusCode, headers: &HeaderMap) -> Option<Self> {
-        let declared = headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared.is_some_and(|length| length > MAX_BATCH_CACHED_RESPONSE_BYTES) {
-            return None;
-        }
-        Some(Self {
-            cached: Some(batch_cached_response(status, headers, &[])),
-            complete: declared == Some(0),
-        })
-    }
-
-    fn push(&mut self, chunk: &[u8], end_of_stream: bool) {
-        if let Some(cached) = &mut self.cached {
-            if cached.body.len().saturating_add(chunk.len()) <= MAX_BATCH_CACHED_RESPONSE_BYTES {
-                cached.body.extend_from_slice(chunk);
-            } else {
-                self.cached = None;
-            }
-        }
-        self.complete = end_of_stream;
-    }
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -387,17 +349,7 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         if let Some(pending) = ctx.batch.take() {
-            match settle_batch(
-                &self.state,
-                pending,
-                response_status,
-                response_status
-                    .zip(response_body)
-                    .filter(|(_, body)| body.len() <= MAX_BATCH_CACHED_RESPONSE_BYTES)
-                    .map(|(status, body)| batch_cached_response(status, response_headers, body)),
-            )
-            .await
-            {
+            match settle_batch(&self.state, pending, response_status).await {
                 Ok(Some(header)) => extra.push(header),
                 Ok(None) => {}
                 Err(error) => {
@@ -1029,8 +981,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             receipt: None,
             upto: None,
             batch: None,
-            batch_cache: None,
-            batch_response: None,
             session: None,
             client_meter: None,
             paid_request: None,
@@ -1412,13 +1362,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         return Err(batch_commit_failed_error());
                     }
                 }
-                if let Some(capture) = BatchResponseCapture::start(
-                    upstream_response.status,
-                    &upstream_response.headers,
-                ) {
-                    ctx.batch_cache = Some(pending);
-                    ctx.batch_response = Some(capture);
-                }
             } else {
                 release_batch(&self.state, pending).await;
             }
@@ -1436,9 +1379,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         end_of_stream: bool,
         ctx: &mut Ctx,
     ) -> pingora::Result<Option<std::time::Duration>> {
-        if let Some(capture) = ctx.batch_response.as_mut() {
-            capture.push(body.as_deref().unwrap_or_default(), end_of_stream);
-        }
         let Some(observer) = ctx.observer.as_mut() else {
             return Ok(None);
         };
@@ -1478,13 +1418,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // are written, so its receipt reaches the client as a normal
         // PAYMENT-RESPONSE header.
         let mut deferred_payment_headers = Vec::new();
-        if let Some(forward) = ctx.batch_cache.take()
-            && let Some(capture) = ctx.batch_response.take()
-            && capture.complete
-            && let Some(cached) = capture.cached
-        {
-            cache_batch_response(&self.state, &forward, cached).await;
-        }
         // Covers cancellation/disconnect paths that bypassed all explicit
         // drains. Dropping the session releases its capacity lease.
         ctx.session.take();
@@ -1973,9 +1906,8 @@ mod batch_commit_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
-        buffered_upstream_headers, filtered_response_headers, gateway_host, header_pairs,
-        is_control_plane, is_streamed_response, request_host,
+        Http402Gate, buffered_upstream_headers, filtered_response_headers, gateway_host,
+        header_pairs, is_control_plane, is_streamed_response, request_host,
     };
     use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
     use pay_core::PaymentState;
@@ -2595,40 +2527,6 @@ mod tests {
         for path in ["v1/messages", "v1/chat/completions", "api/chat"] {
             assert!(!is_control_plane(path), "{path} must be tracked");
         }
-    }
-
-    #[test]
-    fn batch_response_capture_requires_complete_bounded_body() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("6"));
-        let mut capture =
-            BatchResponseCapture::start(StatusCode::CREATED, &headers).expect("bounded");
-
-        capture.push(b"abc", false);
-        assert!(!capture.complete);
-        capture.push(b"def", true);
-
-        assert!(capture.complete);
-        assert_eq!(
-            capture.cached.as_ref().map(|cached| cached.body.as_slice()),
-            Some(b"abcdef".as_slice())
-        );
-    }
-
-    #[test]
-    fn batch_response_capture_rejects_or_drops_oversized_bodies() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_LENGTH,
-            HeaderValue::from_str(&(MAX_BATCH_CACHED_RESPONSE_BYTES + 1).to_string()).unwrap(),
-        );
-        assert!(BatchResponseCapture::start(StatusCode::OK, &headers).is_none());
-
-        let mut capture = BatchResponseCapture::start(StatusCode::OK, &HeaderMap::new())
-            .expect("unknown length starts bounded");
-        capture.push(&vec![0; MAX_BATCH_CACHED_RESPONSE_BYTES + 1], true);
-        assert!(capture.complete);
-        assert!(capture.cached.is_none());
     }
 
     #[test]

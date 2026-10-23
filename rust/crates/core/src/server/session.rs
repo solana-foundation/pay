@@ -16,6 +16,9 @@
 //! Server records channel state; the client signs vouchers for that channel
 //! ```
 //!
+use pay_kit::core::payment_channel::payer_refund::{
+    DistributeClearance, ObservedAccount, PayerRefund,
+};
 use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineError};
 use pay_kit::mpp::blockhash::BlockhashCache;
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionOpenContext, SessionServer};
@@ -615,6 +618,14 @@ impl SessionOperatorRuntime {
     ) -> Result<
         Option<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>,
     > {
+        self.fetch_payment_channel_account(channel_id)
+            .await?
+            .map(|data| self.decode_payment_channel(&data))
+            .transpose()
+    }
+
+    /// The raw payment-channel account, `None` without an RPC or when absent.
+    async fn fetch_payment_channel_account(&self, channel_id: &str) -> Result<Option<Vec<u8>>> {
         if self.rpc_url.is_none() {
             return Ok(None);
         }
@@ -628,14 +639,107 @@ impl SessionOperatorRuntime {
         pipeline
             .read_owned_account_data(channel, None, deployment.program_id)
             .await
-            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
-            .map(|data| {
-                deployment
-                    .decode_channel(&data)
-                    .map(|state| state.channel)
-                    .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
-            })
-            .transpose()
+            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))
+    }
+
+    fn decode_payment_channel(
+        &self,
+        data: &[u8],
+    ) -> Result<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>
+    {
+        self.config
+            .channel_deployment()
+            .map_err(|error| Error::Mpp(format!("invalid channel deployment: {error}")))?
+            .decode_channel(data)
+            .map(|state| state.channel)
+            .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
+    }
+
+    /// Whether this close may also `distribute`. The program forfeits a due
+    /// refund to the treasury when the payer's token account cannot take it,
+    /// so the kit clears the distribute only once that account is payable, or
+    /// once the channel has been sealed for its grace period. A deferred
+    /// close lands only the settle-and-seal; the settlement worker
+    /// distributes the sealed channel on a later pass.
+    async fn distribute_clearance(
+        &self,
+        pipeline: &TxPipeline,
+        params: &SealParams,
+        channel_account: &[u8],
+        token_program: &solana_pubkey::Pubkey,
+    ) -> Result<Option<DistributeClearance>> {
+        let refund_account = params
+            .payer_refund_account(token_program)
+            .map_err(|error| Error::Mpp(format!("payer refund account: {error}")))?;
+        let refund_data = match pipeline
+            .read_owned_account_data(refund_account, None, *token_program)
+            .await
+        {
+            Ok(data) => Some(data),
+            // Held by another program: the kit reports it unpayable.
+            Err(TxPipelineError::AccountOwnerMismatch { .. }) => None,
+            Err(error) => {
+                return Err(Error::Mpp(format!(
+                    "failed to fetch payer refund account: {error}"
+                )));
+            }
+        };
+        let foreign_owner = solana_pubkey::Pubkey::default();
+        let observed = match &refund_data {
+            Some(Some(data)) => Some(ObservedAccount {
+                owner: *token_program,
+                data,
+            }),
+            Some(None) => None,
+            None => Some(ObservedAccount {
+                owner: foreign_owner,
+                data: &[],
+            }),
+        };
+        let channel_id = params.channel_id.to_string();
+        let sealed_at = self
+            .server
+            .sealed_at(&channel_id)
+            .await
+            .map_err(|error| Error::Mpp(format!("failed to read seal time: {error}")))?;
+        let now = i64::try_from(unix_millis() / 1_000).unwrap_or(i64::MAX);
+        let decision = params
+            .payer_refund(channel_account, token_program, observed, sealed_at, now)
+            .map_err(|error| Error::Mpp(format!("payer refund check: {error}")))?;
+        Ok(match decision {
+            PayerRefund::Clear(clearance) => Some(clearance),
+            PayerRefund::Forfeit {
+                clearance,
+                refund,
+                payer_token_account,
+                reason,
+            } => {
+                tracing::warn!(
+                    channel_id,
+                    refund,
+                    %payer_token_account,
+                    reason,
+                    "payer refund account stayed unpayable past the grace period; distributing anyway"
+                );
+                Some(clearance)
+            }
+            PayerRefund::Deferred {
+                refund,
+                payer_token_account,
+                reason,
+                until,
+            } => {
+                tracing::warn!(
+                    channel_id,
+                    refund,
+                    %payer_token_account,
+                    reason,
+                    until,
+                    "payer refund account cannot take the refund; sealing without distributing"
+                );
+                None
+            }
+        })
     }
 
     async fn submit_payment_channel_settlement(
@@ -669,7 +773,11 @@ impl SessionOperatorRuntime {
         // fails with VoucherWatermarkNotMonotonic (0xEA). When chain already
         // has the latest accepted watermark, seal it without another voucher.
         let channel_id = params.channel_id.to_string();
-        let onchain = self.fetch_payment_channel(&channel_id).await?;
+        let channel_account = self.fetch_payment_channel_account(&channel_id).await?;
+        let onchain = channel_account
+            .as_deref()
+            .map(|data| self.decode_payment_channel(data))
+            .transpose()?;
         let onchain_settled = onchain
             .as_ref()
             .map(|channel| channel.settlement.settled)
@@ -691,6 +799,11 @@ impl SessionOperatorRuntime {
                 ));
             }
         };
+        let channel_account = channel_account
+            .ok_or_else(|| Error::Mpp(format!("payment channel {channel_id} is not on chain")))?;
+        let clearance = self
+            .distribute_clearance(&tx_pipeline, params, &channel_account, &token_program)
+            .await?;
         let instructions = close_instructions(
             params,
             &authorized_signer,
@@ -698,6 +811,7 @@ impl SessionOperatorRuntime {
             rent_payer,
             &treasury,
             &token_program,
+            clearance.as_ref(),
         )?;
 
         // Route through the shared batched worker: concurrent closes pack into
@@ -788,7 +902,8 @@ fn require_open_onchain(rpc_configured: bool, status: Option<u8>) -> Result<()> 
     }
 }
 
-/// The atomic settle-and-seal plus distribute instructions closing a channel.
+/// The atomic settle-and-seal closing a channel, plus its distribute when
+/// `clearance` allows it ([`SessionOperatorRuntime::distribute_clearance`]).
 fn close_instructions(
     params: &SealParams,
     authorized_signer: &solana_pubkey::Pubkey,
@@ -796,6 +911,7 @@ fn close_instructions(
     rent_payer: solana_pubkey::Pubkey,
     treasury: &solana_pubkey::Pubkey,
     token_program: &solana_pubkey::Pubkey,
+    clearance: Option<&DistributeClearance>,
 ) -> Result<Vec<solana_instruction::Instruction>> {
     let mut instructions =
         pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
@@ -808,13 +924,16 @@ fn close_instructions(
             &params.program_id,
         )
         .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
+    let Some(clearance) = clearance else {
+        return Ok(instructions);
+    };
     let distribution = SealParams {
         rent_payer: Some(rent_payer),
         ..params.clone()
     };
     instructions.push(
         distribution
-            .distribute_instruction(treasury, token_program)
+            .distribute_instruction(treasury, token_program, clearance)
             .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
     );
     Ok(instructions)
@@ -3197,7 +3316,7 @@ pub fn test_channel_state(
     authentication: Option<String>,
 ) -> ChannelState {
     let payer = payer.into();
-    ChannelState {
+    let mut state = ChannelState {
         channel_id: channel_id.into(),
         authorized_signer: authorized_signer.into(),
         deposit,
@@ -3228,7 +3347,16 @@ pub fn test_channel_state(
         lifecycle: None,
         schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
         extra: Default::default(),
-    }
+    };
+    // Confirmed open just now, so charges are admitted without a fresh read.
+    state.record_onchain_observation(
+        pay_kit::core::store::OnchainObservation {
+            slot: None,
+            lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+        },
+        unix_millis() / 1_000,
+    );
+    state
 }
 
 fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey> {
@@ -4472,6 +4600,67 @@ mod tests {
         assert!(require_open_onchain(false, None).is_ok());
     }
 
+    /// The clearance for a channel whose deposit is fully settled: no refund
+    /// is due, so its distribute is never deferred.
+    fn fully_settled_clearance(params: &SealParams) -> DistributeClearance {
+        use pay_kit::core::payment_channel::payer_refund::{
+            RefundDeadline, SealedRefundTerms, payer_refund,
+        };
+        let terms = SealedRefundTerms {
+            channel: params.channel_id,
+            payer: params.payer.unwrap(),
+            mint: params.mint.unwrap(),
+            token_program: solana_pubkey::Pubkey::new_unique(),
+            deposit: params.settled,
+            settled: params.settled,
+            payer_withdrawn_at: 0,
+        };
+        let deadline = RefundDeadline {
+            sealed_at: 0,
+            grace_period: 1,
+        };
+        payer_refund(&terms, None, deadline, 0).clearance().unwrap()
+    }
+
+    #[test]
+    fn a_close_without_a_distribute_clearance_only_seals() {
+        let pubkey = |byte: u8| solana_pubkey::Pubkey::new_from_array([byte; 32]);
+        let operator = pubkey(0xAA);
+        let params = SealParams {
+            channel_id: pubkey(0x10),
+            authorized_signer: Some(operator),
+            payer: Some(pubkey(0x20)),
+            rent_payer: Some(pubkey(0x20)),
+            mint: Some(pubkey(0x21)),
+            program_id: pay_kit::core::payment_channels::default_program_id(),
+            channel_version: None,
+            channel_hooks: None,
+            settled: 1_000,
+            voucher_signature: None,
+            voucher_expires_at: None,
+            recipient: operator,
+            splits: Vec::new(),
+            distribution_hash: [0; 32],
+        };
+        let close = |clearance: Option<&DistributeClearance>| {
+            close_instructions(
+                &params,
+                &operator,
+                Some(&[7; 64]),
+                pubkey(0x20),
+                &pubkey(0x22),
+                &pubkey(0x23),
+                clearance,
+            )
+            .unwrap()
+        };
+        let clearance = fully_settled_clearance(&params);
+        let sealed_only = close(None);
+        let distributed = close(Some(&clearance));
+        assert_eq!(distributed.len(), sealed_only.len() + 1);
+        assert_eq!(distributed[..sealed_only.len()], sealed_only[..]);
+    }
+
     #[test]
     fn a_split_heavy_close_settles_only_on_version_one() {
         use pay_kit::core::tx::{TxVersion, build_unsigned_fitting};
@@ -4498,6 +4687,7 @@ mod tests {
                 .collect(),
             distribution_hash: [0; 32],
         };
+        let clearance = fully_settled_clearance(&params);
         let close = close_instructions(
             &params,
             &operator,
@@ -4505,6 +4695,7 @@ mod tests {
             pubkey(0x20),
             &pubkey(0x22),
             &pubkey(0x23),
+            Some(&clearance),
         )
         .unwrap();
         let blockhash = solana_hash::Hash::new_unique();

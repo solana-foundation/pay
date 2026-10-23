@@ -705,6 +705,7 @@ mod gate_tests {
                 currency: USDC_DEVNET.to_string(),
                 network: NETWORK.to_string(),
                 suggested_deposit: Some(1_000_000),
+                minimum_deposit: Some(1_000_000),
                 min_voucher_delta: 1,
                 voucher_signer: pay_kit::mpp::server::session::VoucherSigner::Operator,
                 fee_payer_signer: Some(signer.clone()),

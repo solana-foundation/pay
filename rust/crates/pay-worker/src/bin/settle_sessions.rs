@@ -14,6 +14,7 @@ use axum::Router;
 use axum::routing::get;
 use futures::{StreamExt, stream};
 use pay_api_core::rpc::RpcClient;
+use pay_kit::core::payment_channel::payer_refund::DistributeClearance;
 use pay_kit::core::payment_channels;
 use pay_kit::core::settlement::worker::{RpcBroadcaster, SettlementConfig, spawn};
 use pay_kit::core::store::{
@@ -801,6 +802,7 @@ fn bound_distribution_instruction(
     onchain: &channel::DecodedChannel,
     treasury_owner: &Pubkey,
     token_program: &Pubkey,
+    clearance: &DistributeClearance,
 ) -> Result<solana_instruction::Instruction, JobError> {
     let deployment = channel::session_deployment(config)?;
     if onchain.channel.version != deployment.version {
@@ -823,7 +825,7 @@ fn bound_distribution_instruction(
         splits: config.splits.clone(),
         distribution_hash: onchain.channel.distribution_hash,
     }
-    .distribute_instruction(treasury_owner, token_program)
+    .distribute_instruction(treasury_owner, token_program, clearance)
     .map_err(binding_error)
 }
 
@@ -3045,7 +3047,7 @@ async fn batch_distribution(
                 onchain.mint()
             ))
         })?;
-    if channel::payer_refund_account(
+    if let channel::RefundAccount::Unpayable { reason, .. } = channel::payer_refund_account(
         rpc,
         rpc_url,
         onchain,
@@ -3054,11 +3056,11 @@ async fn batch_distribution(
         stage,
     )
     .await?
-        == channel::RefundAccount::Closed
     {
         warn!(
             channel_id = %onchain.address,
-            "payer refund account is closed; deferring distribution"
+            reason,
+            "payer refund account cannot take the refund; deferring distribution"
         );
         return Ok(None);
     }
@@ -3599,9 +3601,10 @@ async fn build_idle_close_candidate(
         None => channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?,
     };
     // Never recreated at the operator's expense (see `batch_distribution`):
-    // with a refund due and the payer's refund account closed only the close
-    // lands, and the sealed channel is distributed once the payer recreates it.
-    if channel::payer_refund_account(
+    // with a refund due and the payer's refund account unpayable only the
+    // close lands, and the sealed channel is distributed once the payer
+    // repairs it.
+    let refund = channel::payer_refund_account(
         rpc,
         rpc_url,
         onchain,
@@ -3611,42 +3614,45 @@ async fn build_idle_close_candidate(
             settled: close_settled,
         },
     )
-    .await?
-        == channel::RefundAccount::Closed
-    {
-        warn!(
-            channel_id = %state.channel_id,
-            "payer refund account is closed; closing without distributing"
-        );
-        if instructions.is_empty() {
-            return Ok(None);
+    .await?;
+    let clearance = match refund {
+        channel::RefundAccount::Payable(clearance) => clearance,
+        channel::RefundAccount::Unpayable { reason, .. } => {
+            warn!(
+                channel_id = %state.channel_id,
+                reason,
+                "payer refund account cannot take the refund; closing without distributing"
+            );
+            if instructions.is_empty() {
+                return Ok(None);
+            }
+            let before = inventory_snapshot(
+                state.sealed,
+                onchain.channel.status,
+                onchain.channel.settlement.settled,
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
+            );
+            let after = inventory_snapshot(
+                true,
+                STATUS_SEALED,
+                onchain.channel.settlement.settled.max(state.cumulative),
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
+            );
+            return Ok(Some(SettlementCandidate {
+                channel_id: state.channel_id.clone(),
+                instructions,
+                kind: CandidateKind::Watermark,
+                before,
+                after,
+            }));
         }
-        let before = inventory_snapshot(
-            state.sealed,
-            onchain.channel.status,
-            onchain.channel.settlement.settled,
-            onchain.channel.settlement.payout_watermark,
-            state.cumulative,
-            &onchain.mint(),
-        );
-        let after = inventory_snapshot(
-            true,
-            STATUS_SEALED,
-            onchain.channel.settlement.settled.max(state.cumulative),
-            onchain.channel.settlement.payout_watermark,
-            state.cumulative,
-            &onchain.mint(),
-        );
-        return Ok(Some(SettlementCandidate {
-            channel_id: state.channel_id.clone(),
-            instructions,
-            kind: CandidateKind::Watermark,
-            before,
-            after,
-        }));
-    }
+    };
     let distribution = if let Some(config) = bound_config {
-        bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?
+        bound_distribution_instruction(config, onchain, treasury_owner, &token_program, &clearance)?
     } else {
         let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
         channel::build_distribute_ix_for_program(
@@ -3957,6 +3963,23 @@ mod tests {
             default_batch_redis_prefix("sandbox"),
             "pay:batch:v1:localnet:"
         );
+    }
+
+    /// `state`, confirmed open onchain just now, so the kit admits charges
+    /// on it without an RPC read.
+    fn freshly_observed(mut state: ChannelState) -> ChannelState {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.record_onchain_observation(
+            pay_kit::core::store::OnchainObservation {
+                slot: None,
+                lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+            },
+            now,
+        );
+        state
     }
 
     fn channel_state() -> ChannelState {
@@ -4458,7 +4481,14 @@ mod tests {
             &preimage,
             &config.channel_program.unwrap(),
         );
-        let ix = bound_distribution_instruction(&restored, &onchain, &treasury, &token).unwrap();
+        let ix = bound_distribution_instruction(
+            &restored,
+            &onchain,
+            &treasury,
+            &token,
+            &clearance(&onchain),
+        )
+        .unwrap();
         assert_eq!(ix.program_id, base.program_id);
         assert_eq!(ix.data, base.data);
         assert_eq!(&ix.accounts[..base.accounts.len()], &base.accounts);
@@ -4474,7 +4504,57 @@ mod tests {
             ix.accounts[base.accounts.len() + 4]
         );
         restored.channel_version = Some(1);
-        assert!(bound_distribution_instruction(&restored, &onchain, &treasury, &token).is_err());
+        assert!(
+            bound_distribution_instruction(
+                &restored,
+                &onchain,
+                &treasury,
+                &token,
+                &clearance(&onchain)
+            )
+            .is_err()
+        );
+    }
+
+    /// A distribute clearance for `onchain`, as for a channel that owes no
+    /// refund.
+    fn clearance(onchain: &channel::DecodedChannel) -> DistributeClearance {
+        use pay_kit::core::payment_channel::payer_refund::{
+            RefundDeadline, SealedRefundTerms, payer_refund,
+        };
+        let terms = SealedRefundTerms {
+            channel: onchain.address,
+            payer: onchain.payer(),
+            mint: onchain.mint(),
+            token_program: Pubkey::new_unique(),
+            deposit: 0,
+            settled: 0,
+            payer_withdrawn_at: 0,
+        };
+        let deadline = RefundDeadline {
+            sealed_at: 0,
+            grace_period: 0,
+        };
+        payer_refund(&terms, None, deadline, 0).clearance().unwrap()
+    }
+
+    #[test]
+    fn a_bound_distribution_refuses_another_channels_clearance() {
+        let (_, config, onchain) = closing_fixture();
+        let mut other = onchain.clone();
+        other.address = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let token = config.token_program.unwrap();
+        assert!(
+            bound_distribution_instruction(
+                &config,
+                &onchain,
+                &treasury,
+                &token,
+                &clearance(&other)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4485,7 +4565,14 @@ mod tests {
         let preimage = bound_preimage(&config, &onchain).unwrap();
         let v1 = channel::build_distribute_ix(&onchain, &treasury, &token, &preimage).0;
         assert_eq!(
-            bound_distribution_instruction(&config, &onchain, &treasury, &token).unwrap(),
+            bound_distribution_instruction(
+                &config,
+                &onchain,
+                &treasury,
+                &token,
+                &clearance(&onchain)
+            )
+            .unwrap(),
             v1
         );
     }
@@ -4563,6 +4650,8 @@ mod tests {
         // The real candidate builder must verify mint ownership and retain the
         // V2 program and both mandatory distribution-hook account groups.
         let token = restored.token_program.unwrap();
+        // Served for both the mint and the payer's refund account reads.
+        let refund_data = live_refund_account_data(&onchain);
         let app = Router::new().route(
             "/",
             axum::routing::post(
@@ -4571,7 +4660,7 @@ mod tests {
                     axum::Json(serde_json::json!({
                         "jsonrpc": "2.0", "id": request["id"],
                         "result": {"context": {"slot": 42}, "value": [{
-                            "owner": token.to_string(), "data": ["", "base64"],
+                            "owner": token.to_string(), "data": [refund_data, "base64"],
                             "lamports": 1, "executable": false, "rentEpoch": 0
                         }]}
                     }))
@@ -4643,7 +4732,10 @@ mod tests {
         let binding = CloseBinding::new(&state, &config).unwrap();
         let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
         let id = state.channel_id.clone();
-        store.put_channel(&id, state).await.unwrap();
+        store
+            .put_channel(&id, freshly_observed(state))
+            .await
+            .unwrap();
         let server = SessionServer::new(config, store.clone());
         let mut delivery = DeliveryRequest::new(&id, 1);
         delivery.expires_at = Some(2);
@@ -5889,6 +5981,17 @@ mod tests {
         reconcile_batch_with_refund_account(state, onchain, operator, now, None, true).await
     }
 
+    /// Base64 of an initialized token account the payer of `onchain` holds
+    /// for its mint: a refund account the kit's check finds payable.
+    fn live_refund_account_data(onchain: &channel::DecodedChannel) -> String {
+        use base64::Engine as _;
+        let mut data = vec![0u8; 165];
+        data[..32].copy_from_slice(onchain.mint().as_ref());
+        data[32..64].copy_from_slice(onchain.payer().as_ref());
+        data[108] = 1;
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
     /// Reconcile against an RPC whose only account read is the payer's
     /// refund account, live or closed.
     async fn reconcile_batch_with_refund_account(
@@ -5902,11 +6005,13 @@ mod tests {
         let token = pay_api_core::ata::SPL_TOKEN_PROGRAM_ID;
         let refund =
             pay_api_core::ata::associated_token_address(&onchain.payer(), &onchain.mint(), &token);
+        let refund_data = live_refund_account_data(onchain);
         let (url, server) = spawn_rpc(move |request| {
             assert_eq!(request["method"], "getMultipleAccounts");
             assert_eq!(request["params"][0][0], refund.to_string());
-            let account = refund_live
-                .then(|| serde_json::json!({"owner": token.to_string(), "data": ["", "base64"]}));
+            let account = refund_live.then(
+                || serde_json::json!({"owner": token.to_string(), "data": [refund_data, "base64"]}),
+            );
             serde_json::json!({"context": {"slot": 1}, "value": [account]})
         })
         .await;
@@ -6663,7 +6768,10 @@ mod tests {
         let channel_id = active.channel_id_str();
         let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
         store
-            .put_channel(&channel_id, legacy_due_state(&channel_id, &active))
+            .put_channel(
+                &channel_id,
+                freshly_observed(legacy_due_state(&channel_id, &active)),
+            )
             .await
             .unwrap();
         let server = SessionServer::new(SessionConfig::default(), store.clone());

@@ -310,45 +310,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             // for a response that actually served. A failure drops the outcome,
             // leaving the client uncharged and free to retry it.
             if let Some(bf) = batch {
-                let mut served_ok = crate::server::gate::handler_completed(response.status());
-                let mut cached = None;
+                let served_ok = crate::server::gate::handler_completed(response.status());
                 let completion = response.extensions().get::<StreamCompletion>().cloned();
                 if served_ok && let Some(completion) = completion {
-                    response = completion_stream::response(response, completion, bf, true);
+                    response = completion_stream::response(response, completion, bf);
                 } else {
-                    if served_ok {
-                        let cacheable = response.body().size_hint().upper().is_some_and(|length| {
-                            length <= crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES as u64
-                        });
-                        if cacheable {
-                            let (mut parts, body) = response.into_parts();
-                            match axum::body::to_bytes(
-                                body,
-                                crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES,
-                            )
-                            .await
-                            {
-                                Ok(bytes) => {
-                                    cached = Some(crate::server::gate::batch_cached_response(
-                                        parts.status,
-                                        &parts.headers,
-                                        &bytes,
-                                    ));
-                                    parts.headers.remove(header::CONTENT_LENGTH);
-                                    response = Response::from_parts(parts, Body::from(bytes));
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        "failed to buffer x402 batch response; releasing authorization"
-                                    );
-                                    served_ok = false;
-                                    response = StatusCode::BAD_GATEWAY.into_response();
-                                }
-                            }
-                        }
-                    }
-                    match bf.finish(served_ok, cached).await {
+                    match bf.finish(served_ok).await {
                         Ok(Some((n, v))) => {
                             response.headers_mut().append(n, v);
                         }
@@ -457,7 +424,7 @@ pub(super) async fn settle_axum_delegated_response(
         && let Some(completion) = response.extensions().get::<StreamCompletion>().cloned()
     {
         let delivery = DeliveryTask::session(forward, response.headers().clone());
-        return completion_stream::response(response, completion, delivery, false);
+        return completion_stream::response(response, completion, delivery);
     }
 
     let (mut parts, body) = response.into_parts();

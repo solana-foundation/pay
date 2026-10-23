@@ -355,12 +355,13 @@ pub fn open_payment_channel_session_header_with_override(
     approved_payout: Option<&pay_kit::mpp::client::SessionPayout>,
 ) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
-        DerivePaymentChannelOpenParams, PaymentChannelOpenOptions,
-        PaymentChannelSessionOpenOptions, create_payment_channel_session_opener,
-        derive_payment_channel_open,
+        DerivePaymentChannelOpenParams, OpenBlockhash, PaymentChannelOpenOptions,
+        PaymentChannelSessionOpenOptions, SessionOpenAuthorization,
+        create_payment_channel_session_opener, derive_payment_channel_open,
     };
     use pay_kit::mpp::protocol::solana::default_rpc_url;
     use pay_kit::mpp::solana_keychain::MemorySigner;
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 
     crate::mpp_channel_profile::validate_challenge(request)?;
     let details = &request.method_details;
@@ -469,8 +470,16 @@ pub fn open_payment_channel_session_header_with_override(
         .map_err(|_| Error::Mpp("corrupt pending session salt".to_string()))?,
         None => rand::random::<u64>(),
     };
+    // The user approved spending up to `deposit`, which is all an operator
+    // can settle with its own vouchers, so an operator-signed channel names
+    // the challenge's operator as authorized for exactly that deposit.
+    let authorization = match voucher_signer {
+        SessionVoucherSigner::Operator => {
+            SessionOpenAuthorization::operator_signed(deposit, authorized_signer)
+        }
+        _ => SessionOpenAuthorization::client_signed(deposit),
+    };
     let open_options = PaymentChannelOpenOptions {
-        deposit: Some(deposit),
         salt: Some(salt),
         // A Ledger signs v0 only; the kit negotiates against the challenge.
         max_tx_version: signer.max_tx_version(),
@@ -486,6 +495,7 @@ pub fn open_payment_channel_session_header_with_override(
         request,
         payer,
         authorized_signer,
+        authorization: &authorization,
         options: open_options.clone(),
     })
     .map_err(|e| Error::Mpp(format!("derive_payment_channel_open: {e}")))?;
@@ -513,12 +523,20 @@ pub fn open_payment_channel_session_header_with_override(
         None
     };
 
+    // The challenged `recentBlockhash` binds the open to a cluster, so it is
+    // checked against the RPC of the network the deposit was approved for.
+    let rpc_url =
+        crate::config::payment_rpc_url().unwrap_or_else(|| default_rpc_url(&network).to_string());
+    let blockhash = rt
+        .block_on(OpenBlockhash::verify(&RpcClient::new(rpc_url), request))
+        .map_err(|e| Error::Mpp(format!("session open blockhash: {e}")))?;
     let opened = rt
         .block_on(create_payment_channel_session_opener(
             request,
             &signer,
             session_signer,
-            None,
+            blockhash,
+            &authorization,
             PaymentChannelSessionOpenOptions {
                 open: open_options,
                 cumulative: None,
@@ -793,6 +811,7 @@ mod tests {
         operator: &str,
         attempt: Option<&crate::client::attempt::PaymentAttempt>,
     ) -> String {
+        crate::test_rpc::install_blockhash_rpc();
         let mut request = test_request();
         request.currency = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
         request.recipient = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string();
@@ -880,6 +899,7 @@ mod tests {
         auth: crate::signer::AuthOverride,
         store: &dyn crate::accounts::AccountsStore,
     ) -> Result<(SessionHandle, String)> {
+        crate::test_rpc::install_blockhash_rpc();
         let challenge = PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",

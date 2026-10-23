@@ -11,7 +11,6 @@ use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use axum::response::Response;
 use futures_util::StreamExt;
-use pay_kit::core::store::CachedUpstreamResponse;
 use tokio::{sync::oneshot, task::JoinHandle};
 
 use crate::PaymentState;
@@ -128,11 +127,7 @@ impl MeteredSettlement {
 }
 
 type SettlementResult = Result<Option<(HeaderName, HeaderValue)>, String>;
-type Outcome = (
-    bool,
-    Option<CachedUpstreamResponse>,
-    Option<StreamCompletion>,
-);
+type Outcome = (bool, Option<StreamCompletion>);
 
 /// One lifecycle task per admitted authorization, not per chunk or drop.
 ///
@@ -150,9 +145,9 @@ impl DeliveryTask {
     pub(super) fn batch<S: PaymentState>(state: S, forward: BatchForward) -> Self {
         let (outcome, receiver) = oneshot::channel::<Outcome>();
         let task = tokio::spawn(async move {
-            let (success, cached, completion) = receiver.await.unwrap_or((false, None, None));
+            let (success, completion) = receiver.await.unwrap_or((false, None));
             let result = if success {
-                gate::settle_batch_confirmed(&state, forward, cached).await
+                gate::commit_batch(&state, &forward).await
             } else {
                 gate::release_batch(&state, forward).await;
                 Ok(None)
@@ -171,7 +166,7 @@ impl DeliveryTask {
     pub(super) fn session(forward: SessionForward, headers: HeaderMap) -> Self {
         let (outcome, receiver) = oneshot::channel::<Outcome>();
         let task = tokio::spawn(async move {
-            let (success, _, completion) = receiver.await.unwrap_or((false, None, None));
+            let (success, completion) = receiver.await.unwrap_or((false, None));
             if success {
                 let result = gate::settle_delegated_session(forward, &headers, None).await
                     .map(|_| None)
@@ -188,21 +183,16 @@ impl DeliveryTask {
         Self { outcome, task }
     }
 
-    pub(super) async fn finish(
-        self,
-        success: bool,
-        cached: Option<CachedUpstreamResponse>,
-    ) -> SettlementResult {
-        self.finish_observed(success, cached, None).await
+    pub(super) async fn finish(self, success: bool) -> SettlementResult {
+        self.finish_observed(success, None).await
     }
 
     async fn finish_observed(
         self,
         success: bool,
-        cached: Option<CachedUpstreamResponse>,
         completion: Option<StreamCompletion>,
     ) -> SettlementResult {
-        let _ = self.outcome.send((success, cached, completion));
+        let _ = self.outcome.send((success, completion));
         self.task.await.map_err(|error| {
             tracing::error!(%error, "response settlement task failed");
             error.to_string()
@@ -223,11 +213,8 @@ pub(super) fn response(
     response: Response,
     completion: StreamCompletion,
     delivery: DeliveryTask,
-    capture_replay: bool,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
-    let headers = parts.headers.clone();
-    let status = parts.status;
     parts.headers.remove(header::CONTENT_LENGTH);
     let mut source = body.into_data_stream();
     let stream = async_stream::stream! {
@@ -237,14 +224,14 @@ pub(super) fn response(
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    let _ = delivery.finish(false, None).await;
+                    let _ = delivery.finish(false).await;
                     yield Err(std::io::Error::other(error));
                     return;
                 }
             };
             held_bytes = held_bytes.saturating_add(bytes.len());
             if held_bytes > MAX_HELD_RESPONSE_BYTES {
-                let _ = delivery.finish(false, None).await;
+                let _ = delivery.finish(false).await;
                 yield Err(std::io::Error::other(format!(
                     "completion-billed response exceeds {MAX_HELD_RESPONSE_BYTES} bytes"
                 )));
@@ -252,11 +239,7 @@ pub(super) fn response(
             }
             held.push(bytes);
             if completion.completed() {
-                // Existing replay behavior for oversized resources: return the
-                // recorded payment result, never execute the seller twice.
-                let cached = (capture_replay && held_bytes <= gate::MAX_BATCH_CACHED_RESPONSE_BYTES)
-                    .then(|| gate::batch_cached_response(status, &headers, &held.concat()));
-                match delivery.finish_observed(true, cached, Some(completion)).await {
+                match delivery.finish_observed(true, Some(completion)).await {
                     Ok(_) => {
                         for bytes in held {
                             yield Ok(bytes);
@@ -270,7 +253,7 @@ pub(super) fn response(
         // EOF without explicit completion is the handler's own uncharged
         // failure answer (typically an error frame), not a buyer disconnect:
         // a dropped body never reaches here, so nothing leaks to one.
-        let _ = delivery.finish(false, None).await;
+        let _ = delivery.finish(false).await;
         for bytes in held {
             yield Ok(bytes);
         }
@@ -490,7 +473,7 @@ mod tests {
         let (resume, paused) = oneshot::channel();
         let (committed, finished) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let (success, _, completion) = receiver.await.unwrap();
+            let (success, completion) = receiver.await.unwrap();
             assert!(success);
             entered.send(()).unwrap();
             paused.await.unwrap();
@@ -512,7 +495,6 @@ mod tests {
             Response::new(Body::from_stream(source)),
             completion,
             DeliveryTask { outcome, task },
-            false,
         );
         let buyer = tokio::spawn(axum::body::to_bytes(response.into_body(), 1024));
         waiting.await.unwrap();
@@ -550,7 +532,6 @@ mod tests {
             Response::new(Body::from_stream(source)),
             completion,
             DeliveryTask { outcome, task },
-            false,
         );
         assert!(
             axum::body::to_bytes(response.into_body(), 1024)

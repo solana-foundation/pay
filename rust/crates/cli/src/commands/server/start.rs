@@ -2111,7 +2111,10 @@ impl StartCommand {
                         // from the endpoint's resolved metering price.
                         amount: 1,
                         suggested_deposit: Some(cap_base),
-                        minimum_deposit: None,
+                        // A sponsored open costs the fee payer the channel's
+                        // rent, so it must lock the suggested cap; pay
+                        // clients already deposit exactly that.
+                        minimum_deposit: fee_payer.then_some(cap_base),
                         min_voucher_delta: sess.min_voucher_delta,
                         voucher_signer,
                         operator_signing_key: None,

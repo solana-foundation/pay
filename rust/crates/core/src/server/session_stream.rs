@@ -2385,7 +2385,12 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         // Each charge advanced the request's running total under one key:
         // the channel holds one record for the request, not one per charge.
         let record = store.get_channel(&channel_id).await.unwrap().unwrap();
-        assert_eq!(record.processed_uses.len(), 1, "{:?}", record.processed_uses);
+        assert_eq!(
+            record.processed_uses.len(),
+            1,
+            "{:?}",
+            record.processed_uses
+        );
         assert_eq!(record.processed_uses[0].amount, Some(10));
     }
 

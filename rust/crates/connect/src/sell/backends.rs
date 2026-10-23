@@ -490,7 +490,10 @@ impl EndpointBackends {
                     // endpoint's resolved metering price.
                     amount: 1,
                     suggested_deposit: Some(cap_base),
-                    minimum_deposit: None,
+                    // The operator sponsors every open (rent included), so a
+                    // channel must lock the cap the endpoint suggests; pay
+                    // clients already deposit exactly that.
+                    minimum_deposit: Some(cap_base),
                     min_voucher_delta: spec.min_voucher_delta,
                     voucher_signer: pay_kit::mpp::server::session::VoucherSigner::Operator,
                     operator_signing_key: None,

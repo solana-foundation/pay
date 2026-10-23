@@ -289,10 +289,6 @@ async fn streaming_response_is_withheld_when_batch_commit_fails() {
     assert_eq!(*error.etype(), pingora::ErrorType::HTTPStatus(502));
     assert!(response.headers.get("payment-response").is_none());
     assert!(ctx.batch.is_none());
-    assert!(
-        ctx.batch_cache.is_none(),
-        "unpaid responses are never cached"
-    );
 }
 
 #[tokio::test]

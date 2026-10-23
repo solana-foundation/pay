@@ -9,6 +9,10 @@ use std::str::FromStr;
 
 use pay_api_core::ata::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, associated_token_address};
 use pay_api_core::rpc::RpcClient;
+use pay_kit::core::payment_channel::payer_refund::{
+    DistributeClearance, ObservedAccount, PayerRefund, RefundDeadline, SealedRefundTerms,
+    payer_refund,
+};
 use pay_kit::core::payment_channels::{default_program_id, find_event_authority_pda, to_address};
 use pay_kit::core::payment_channels_v2::Deployment;
 use pay_kit::generated::payment_channels::generated::accounts::Channel;
@@ -760,25 +764,38 @@ impl DecodedChannel {
     }
 }
 
-/// Whether the payer's refund token account, which `distribute` may write,
-/// is live at the confirmed commitment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether a `distribute` may run given the payer's refund token account,
+/// decided by the kit's [`payer_refund`] check.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefundAccount {
-    /// This `distribute` refunds nothing, so it never reads the account.
-    NotRead,
-    /// Owned by the channel's token program: `distribute` can land.
-    Live,
-    /// Absent (or not a token account): `distribute` would fail, and with it
-    /// every channel co-batched in the same transaction.
-    Closed,
+    /// This `distribute` refunds nothing, or the account can take the
+    /// refund. The clearance is what the kit's distribute builder takes.
+    Payable(DistributeClearance),
+    /// A refund is due and the account cannot take it: missing, frozen, held
+    /// by another program or owner, or carrying an extension the program
+    /// will not pay into. The program would forfeit the refund to the
+    /// treasury, and a missing account would fail every channel co-batched
+    /// in the same transaction. `missing` when the account does not exist,
+    /// the one case the payer can repair by recreating it.
+    Unpayable { reason: String, missing: bool },
+}
+
+impl RefundAccount {
+    pub fn is_payable(&self) -> bool {
+        matches!(self, Self::Payable(_))
+    }
 }
 
 /// Read the payer's refund account when the `distribute` at `stage` writes
-/// it. The payer can close an emptied account at any time, and the worker
-/// never recreates it at the operator's expense (the rent would go straight
-/// back to the payer on the next close), so a closed account defers that
-/// distribution until the payer recreates it. A distribution that refunds
-/// nothing is never deferred.
+/// it, and decide whether that `distribute` may run. The payer can close or
+/// freeze an emptied account at any time, and the worker never recreates it
+/// at the operator's expense (the rent would go straight back to the payer on
+/// the next close), so an unpayable account defers that distribution until
+/// the payer repairs it or withdraws. A distribution that refunds nothing is
+/// never deferred and never reads the account.
+///
+/// The worker records no seal time, so it never takes the kit's forfeit
+/// after the grace period: a deferred distribute keeps waiting.
 pub async fn payer_refund_account(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -787,23 +804,58 @@ pub async fn payer_refund_account(
     program: &Pubkey,
     stage: DistributeStage,
 ) -> Result<RefundAccount, JobError> {
-    if !channel.distribute_refunds_payer(program, stage) {
-        return Ok(RefundAccount::NotRead);
-    }
-    let address = associated_token_address(&channel.payer(), &channel.mint(), token_program);
-    let account = rpc
-        .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
-        .await?
-        .into_iter()
-        .next()
-        .flatten();
-    Ok(
-        if account.is_some_and(|account| account.owner == token_program.to_string()) {
-            RefundAccount::Live
-        } else {
-            RefundAccount::Closed
+    let mut terms = SealedRefundTerms {
+        channel: channel.address,
+        payer: channel.payer(),
+        mint: channel.mint(),
+        token_program: *token_program,
+        deposit: channel.channel.deposit,
+        settled: match stage {
+            DistributeStage::Open => channel.channel.settlement.settled,
+            DistributeStage::Sealed { settled } => settled,
         },
-    )
+        payer_withdrawn_at: channel.channel.payer_withdrawn_at,
+    };
+    let reads = channel.distribute_refunds_payer(program, stage);
+    let account = if reads {
+        let address = terms.payer_token_account();
+        rpc.get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+    } else {
+        // An open channel's `distribute` pays only the settled delta.
+        terms.settled = terms.deposit;
+        None
+    };
+    let owner = account
+        .as_ref()
+        .map(|account| Pubkey::from_str(&account.owner).unwrap_or_default());
+    let observed = account
+        .as_ref()
+        .zip(owner)
+        .map(|(account, owner)| ObservedAccount {
+            owner,
+            data: &account.data,
+        });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    let deadline = RefundDeadline {
+        sealed_at: now,
+        grace_period: channel.channel.grace_period,
+    };
+    Ok(match payer_refund(&terms, observed, deadline, now) {
+        PayerRefund::Clear(clearance) => RefundAccount::Payable(clearance),
+        PayerRefund::Deferred { reason, .. } | PayerRefund::Forfeit { reason, .. } => {
+            RefundAccount::Unpayable {
+                reason,
+                missing: reads && account.is_none(),
+            }
+        }
+    })
 }
 
 /// Idempotently create the payer's refund token account, funded by the payer
@@ -1282,37 +1334,56 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(read, RefundAccount::NotRead, "{stage:?}");
+            assert!(read.is_payable(), "{stage:?}");
         }
     }
 
+    /// A refund token account at `state` (1 initialized, 2 frozen).
+    fn refund_token_account(channel: &DecodedChannel, state: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 165];
+        data[..32].copy_from_slice(channel.mint().as_ref());
+        data[32..64].copy_from_slice(channel.payer().as_ref());
+        data[108] = state;
+        data
+    }
+
     #[tokio::test]
-    async fn a_closed_refund_account_is_reported_closed() {
+    async fn an_unpayable_refund_account_defers_the_distribute() {
         use axum::{Json, Router, routing::post};
+        use base64::Engine as _;
         let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
         let channel = refund_test_channel();
         let refund =
             associated_token_address(&channel.payer(), &channel.mint(), &SPL_TOKEN_PROGRAM_ID);
-        let system = Pubkey::default().to_string();
+        let spl = || Some(SPL_TOKEN_PROGRAM_ID.to_string());
+        let live = refund_token_account(&channel, 1);
+        let frozen = refund_token_account(&channel, 2);
+        // (owner, data, payable, missing)
         let cases = [
-            (Some(SPL_TOKEN_PROGRAM_ID.to_string()), RefundAccount::Live),
-            (None, RefundAccount::Closed),
-            (Some(system), RefundAccount::Closed),
+            (spl(), live.clone(), true, false),
+            (None, Vec::new(), false, true),
             (
-                Some(TOKEN_2022_PROGRAM_ID.to_string()),
-                RefundAccount::Closed,
+                Some(Pubkey::default().to_string()),
+                live.clone(),
+                false,
+                false,
             ),
+            (Some(TOKEN_2022_PROGRAM_ID.to_string()), live, false, false),
+            // Frozen: the program would forfeit the refund to the treasury.
+            (spl(), frozen, false, false),
+            (spl(), Vec::new(), false, false),
         ];
-        for (owner, expected) in cases {
+        for (owner, data, payable, missing) in cases {
             let app = Router::new().route(
                 "/",
                 post(move |Json(request): Json<serde_json::Value>| {
                     let owner = owner.clone();
+                    let data = base64::engine::general_purpose::STANDARD.encode(&data);
                     async move {
                         assert_eq!(request["method"], "getMultipleAccounts");
                         assert_eq!(request["params"][0][0], refund.to_string());
                         let account = owner.map(
-                            |owner| serde_json::json!({"owner": owner, "data": ["", "base64"]}),
+                            |owner| serde_json::json!({"owner": owner, "data": [data, "base64"]}),
                         );
                         Json(serde_json::json!({
                             "jsonrpc": "2.0", "id": 1,
@@ -1335,7 +1406,14 @@ mod tests {
             .await
             .unwrap();
             server.abort();
-            assert_eq!(read, expected);
+            assert_eq!(read.is_payable(), payable, "{read:?}");
+            if let RefundAccount::Unpayable {
+                missing: read_missing,
+                ..
+            } = read
+            {
+                assert_eq!(read_missing, missing);
+            }
         }
         // An unreachable RPC never reads as closed.
         assert!(

@@ -662,9 +662,11 @@ async fn plan_steps(
 
 /// Build the `distribute` step, recovering + verifying the distribution
 /// preimage from the channel's open transaction first. When a refund is due,
-/// a closed payer refund account is recreated only when the payer itself
+/// a missing payer refund account is recreated only when the payer itself
 /// runs the job; any other operator would fund rent the payer reclaims by
-/// closing it again, so the step waits for the payer instead.
+/// closing it again, so the step waits for the payer instead. An account
+/// that exists but cannot take the refund (frozen, reassigned, carrying an
+/// extension) always waits: the program would forfeit the refund.
 async fn build_distribute_step(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -679,7 +681,7 @@ async fn build_distribute_step(
     let stage = channel::DistributeStage::Sealed {
         settled: decoded.channel.settlement.settled,
     };
-    if channel::payer_refund_account(
+    if let channel::RefundAccount::Unpayable { reason, missing } = channel::payer_refund_account(
         rpc,
         rpc_url,
         decoded,
@@ -688,12 +690,14 @@ async fn build_distribute_step(
         stage,
     )
     .await?
-        == channel::RefundAccount::Closed
     {
-        if *fee_payer != decoded.payer() {
+        // Only a missing account can be repaired here, and only at the
+        // payer's own expense.
+        if !missing || *fee_payer != decoded.payer() {
             warn!(
                 channel = %decoded.address,
-                "payer refund account is closed; distribution waits for the payer to recreate it"
+                reason,
+                "payer refund account cannot take the refund; distribution waits for the payer"
             );
             return Ok(None);
         }
