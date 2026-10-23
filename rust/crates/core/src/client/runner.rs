@@ -2643,9 +2643,17 @@ fn paid_request_args(args: &[String], tool: ToolKind, resource_url: &str) -> Vec
 ///
 /// The tool runs credential-bearing requests with redirects off (see
 /// [`credential_redirect_guard`]); this is how `pay curl -L` and `pay wget`
-/// still reach a resource the paid URL redirects to (a download link, a
-/// canonical path) without the payment, sign-in proof or subscription bearer
-/// ever leaving the URL it was bound to.
+/// still reach a resource the paid URL redirects to (a canonical path, an
+/// `http` to `https` upgrade) without the payment, sign-in proof or
+/// subscription bearer ever leaving the URL it was bound to.
+///
+/// Only a same-origin `Location` is stepped. The hop reruns the caller's args
+/// at the new URL, so the tool treats it as the first host and sends the
+/// caller's own `-H Authorization`, `-H Cookie` and `-u` there, which its own
+/// redirect handling strips on a cross-host hop. A cross-origin redirect is
+/// relayed as the response instead, with a note naming where it points.
+/// The curl hop also runs with `--globoff`, so a `Location` with `{}` or
+/// `[]` stays one transfer.
 fn credential_free_redirect(
     args: &[String],
     tool: ToolKind,
@@ -2656,11 +2664,24 @@ fn credential_free_redirect(
         return None;
     }
     let requested = resolve_request_url(args, tool)?;
-    let next = url::Url::parse(&requested).ok()?.join(location).ok()?;
+    let from = url::Url::parse(&requested).ok()?;
+    let next = from.join(location).ok()?;
     if !matches!(next.scheme(), "http" | "https") {
         return None;
     }
-    retarget_args(args, tool, &requested, next.as_str())
+    if !crate::client::fetch::is_same_origin_redirect(&from, &next) {
+        eprintln!(
+            "pay: not following the redirect to {}, another origin than the paid URL; \
+             request it directly if you trust it",
+            next.origin().ascii_serialization()
+        );
+        return None;
+    }
+    let mut next_args = retarget_args(args, tool, &requested, next.as_str())?;
+    if matches!(tool, ToolKind::Curl) {
+        next_args.insert(0, "--globoff".to_string());
+    }
+    Some(next_args)
 }
 
 /// Debug-log a wrapped tool invocation without any header value or argument.
@@ -3117,25 +3138,38 @@ mod pre_attach_tests {
         assert!(server.collector_was_contacted());
     }
 
+    /// `/start` redirects to `/next` on the same origin, which serves 200.
+    /// Returns the start URL and every request the origin saw.
+    fn same_origin_redirect() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![redirect_to("/next"), OK_RESPONSE.to_string()],
+        );
+        (url, server)
+    }
+
     #[test]
     fn wget_follows_a_paid_redirect_without_the_credential() {
         if check_command_exists("wget").is_err() {
             return;
         }
-        let server = CrossOriginRedirect::start();
-        let args = s(&["-q", "--max-redirect=5", "-O", "-", &server.origin_url]);
+        let (url, server) = same_origin_redirect();
+        let args = s(&["-q", "--max-redirect=5", "-O", "-", &url]);
         let outcome = run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
         assert!(matches!(
             outcome,
             RunOutcome::Completed { exit_code: 0, .. }
         ));
-        let (origin, collector) = server.requests();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "wget stopped at the paid redirect");
         assert!(
-            origin.contains(PAYMENT_SECRET),
+            requests[0].contains(PAYMENT_SECRET),
             "the paid URL got the credential"
         );
-        let collector = collector.expect("wget stopped at the paid redirect");
-        assert!(!collector.contains(PAYMENT_SECRET), "{collector}");
+        assert!(!requests[1].contains(PAYMENT_SECRET), "{}", requests[1]);
     }
 
     #[test]
@@ -3154,22 +3188,81 @@ mod pre_attach_tests {
         if check_command_exists("curl").is_err() {
             return;
         }
-        let server = CrossOriginRedirect::start();
+        let (url, server) = same_origin_redirect();
         // Even `--location-trusted`, which forwards credentials by design,
         // must not hand Pay's header to the next hop.
-        let args = s(&["-s", "--location-trusted", &server.origin_url]);
+        let args = s(&["-s", "--location-trusted", &url]);
         let outcome = run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
         assert!(matches!(
             outcome,
             RunOutcome::Completed { exit_code: 0, .. }
         ));
-        let (origin, collector) = server.requests();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "curl stopped at the paid redirect");
         assert!(
-            origin.contains(PAYMENT_SECRET),
+            requests[0].contains(PAYMENT_SECRET),
             "the paid URL got the credential"
         );
-        let collector = collector.expect("curl stopped at the paid redirect");
-        assert!(!collector.contains(PAYMENT_SECRET), "{collector}");
+        assert!(!requests[1].contains(PAYMENT_SECRET), "{}", requests[1]);
+    }
+
+    /// The hop after a paid redirect reruns the caller's args at the new URL,
+    /// so a cross-origin `Location` would receive the caller's own
+    /// `Authorization`, `Cookie` and `-u`, which the tool's own redirect
+    /// handling strips on a cross-host hop. Pay does not step it.
+    #[test]
+    fn a_paid_cross_origin_redirect_is_not_followed() {
+        let caller = [
+            "-H",
+            "Authorization: Bearer caller-api-key",
+            "-H",
+            "Cookie: sid=caller-cookie",
+        ];
+        if check_command_exists("curl").is_ok() {
+            let server = CrossOriginRedirect::start();
+            let mut args = s(&["-sL", "-u", "user:caller-password"]);
+            args.extend(s(&caller));
+            args.push(server.origin_url.clone());
+            let outcome = run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+            assert!(matches!(outcome, RunOutcome::Completed { .. }));
+            let (origin, collector) = server.requests();
+            assert!(
+                origin.contains(PAYMENT_SECRET),
+                "the paid URL got the credential"
+            );
+            assert_eq!(collector, None, "curl stepped a cross-origin redirect");
+        }
+        if check_command_exists("wget").is_ok() {
+            let server = CrossOriginRedirect::start();
+            let mut args = s(&[
+                "-q",
+                "-O",
+                "-",
+                "--header",
+                "Authorization: Bearer caller-api-key",
+            ]);
+            args.push(server.origin_url.clone());
+            run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+            assert!(
+                !server.collector_was_contacted(),
+                "wget stepped a cross-origin redirect"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hop_after_a_paid_redirect_keeps_curl_globbing_off() {
+        let head = ResponseHead {
+            status: Some(302),
+            headers: vec![("location".to_string(), "/next/[1-9]".to_string())],
+        };
+        let next =
+            credential_free_redirect(&s(&["-sL", "http://a.example/x"]), ToolKind::Curl, &head)
+                .expect("a same-origin hop is stepped");
+        assert_eq!(
+            next,
+            s(&["--globoff", "-sL", "http://a.example/next/[1-9]"])
+        );
     }
 
     #[test]
