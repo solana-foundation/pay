@@ -56,6 +56,12 @@ const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// refuses every token of theirs issued so far instead, in a single entry,
 /// so no one user can fill the list.
 const MAX_SIGN_OUTS_PER_USER: usize = 8;
+/// Most sign-outs by expired tokens one user is remembered by, session by
+/// session. They do not count toward [`MAX_SIGN_OUTS_PER_USER`], so a few
+/// old leaked tokens cannot sign the user out everywhere; past this many the
+/// user falls back to the same one-entry floor, so no one user can fill the
+/// list either.
+const MAX_EXPIRED_SIGN_OUTS_PER_USER: usize = 64;
 /// Most revoked sessions remembered at once.
 pub(crate) const MAX_REVOKED_SESSIONS: usize = 65_536;
 
@@ -264,6 +270,9 @@ struct SignOuts {
     /// The same sessions by subject, so a user's share is counted without
     /// scanning everyone's.
     by_user: HashMap<String, Vec<String>>,
+    /// Sessions signed out by expired tokens, by subject: counted toward
+    /// [`MAX_EXPIRED_SIGN_OUTS_PER_USER`] instead.
+    expired_by_user: HashMap<String, Vec<String>>,
     /// Users who signed out more than [`MAX_SIGN_OUTS_PER_USER`] sessions:
     /// the unix second before which none of their tokens is accepted, and
     /// when it was set.
@@ -331,10 +340,12 @@ impl SignOuts {
             self.sessions.retain(|_, (_, at)| remembered(at, now));
             self.users.retain(|_, (_, at)| remembered(at, now));
             let sessions = &self.sessions;
-            self.by_user.retain(|_, sids| {
-                sids.retain(|sid| sessions.contains_key(sid));
-                !sids.is_empty()
-            });
+            for lists in [&mut self.by_user, &mut self.expired_by_user] {
+                lists.retain(|_, sids| {
+                    sids.retain(|sid| sessions.contains_key(sid));
+                    !sids.is_empty()
+                });
+            }
             if self.len() >= MAX_REVOKED_SESSIONS {
                 return false;
             }
@@ -352,24 +363,55 @@ impl SignOuts {
     /// toward their [`MAX_SIGN_OUTS_PER_USER`] share. Returns false as
     /// [`Self::insert`] does.
     fn insert_uncounted(&mut self, subject: &str, session: &str, now: Instant) -> bool {
-        if let Some((_, at)) = self.sessions.get_mut(session) {
+        let sessions = &mut self.sessions;
+        let theirs = self.expired_by_user.entry(subject.to_string()).or_default();
+        theirs.retain(|sid| {
+            sessions
+                .get(sid)
+                .is_some_and(|(owner, at)| owner == subject && remembered(at, now))
+        });
+        if let Some((_, at)) = sessions.get_mut(session) {
             *at = now;
+            if theirs.is_empty() {
+                self.expired_by_user.remove(subject);
+            }
+            return true;
+        }
+        if theirs.len() >= MAX_EXPIRED_SIGN_OUTS_PER_USER {
+            // Past their share, one entry refuses every token of theirs
+            // issued so far, as for live sign-outs.
+            for sid in theirs.drain(..) {
+                sessions.remove(&sid);
+            }
+            self.expired_by_user.remove(subject);
+            let floor = unix_now() + 1;
+            let entry = self
+                .users
+                .entry(subject.to_string())
+                .or_insert((floor, now));
+            *entry = (entry.0.max(floor), now);
             return true;
         }
         if self.len() >= MAX_REVOKED_SESSIONS {
             self.sessions.retain(|_, (_, at)| remembered(at, now));
             self.users.retain(|_, (_, at)| remembered(at, now));
             let sessions = &self.sessions;
-            self.by_user.retain(|_, sids| {
-                sids.retain(|sid| sessions.contains_key(sid));
-                !sids.is_empty()
-            });
+            for lists in [&mut self.by_user, &mut self.expired_by_user] {
+                lists.retain(|_, sids| {
+                    sids.retain(|sid| sessions.contains_key(sid));
+                    !sids.is_empty()
+                });
+            }
             if self.len() >= MAX_REVOKED_SESSIONS {
                 return false;
             }
         }
         self.sessions
             .insert(session.to_string(), (subject.to_string(), now));
+        self.expired_by_user
+            .entry(subject.to_string())
+            .or_default()
+            .push(session.to_string());
         true
     }
 
@@ -392,10 +434,12 @@ impl SignOuts {
             return;
         };
         self.sessions.remove(&sid);
-        if let Some(sids) = self.by_user.get_mut(&owner) {
-            sids.retain(|other| *other != sid);
-            if sids.is_empty() {
-                self.by_user.remove(&owner);
+        for lists in [&mut self.by_user, &mut self.expired_by_user] {
+            if let Some(sids) = lists.get_mut(&owner) {
+                sids.retain(|other| *other != sid);
+                if sids.is_empty() {
+                    lists.remove(&owner);
+                }
             }
         }
     }
@@ -1616,6 +1660,47 @@ pub(crate) mod tests {
         assert!(
             privy.verify(&live).is_err(),
             "live sign-outs past the share raise the floor"
+        );
+    }
+
+    /// One user's expired-token sign-outs never fill the list: past their
+    /// share they fall back to the per-user floor, which signs out only them.
+    #[tokio::test]
+    async fn one_users_expired_sign_outs_never_fill_the_list() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sub: &str, sid: &str, iat: u64, exp: u64| {
+            app.token(json!({
+                "sub": sub, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": exp, "iat": iat
+            }))
+        };
+        let bystander = token(
+            "did:privy:someone-else",
+            "sess_bystander",
+            unix(),
+            unix() + 600,
+        );
+        for i in 0..4 * MAX_EXPIRED_SIGN_OUTS_PER_USER {
+            let leaked = token(
+                USER,
+                &format!("sess_old_{i}"),
+                unix() - 7_200,
+                unix() - 3_600,
+            );
+            let bearer = privy.identify_for_sign_out(&leaked).await.unwrap();
+            privy.sign_out(&bearer);
+        }
+        assert!(
+            privy.revoked.lock().unwrap().len() <= MAX_EXPIRED_SIGN_OUTS_PER_USER + 1,
+            "one user's expired sign-outs grew the list"
+        );
+        assert!(privy.verify(&bystander).is_ok(), "nobody else signs out");
+        assert!(
+            privy
+                .verify(&token(USER, "sess_fresh", unix() + 2, unix() + 600))
+                .is_ok(),
+            "a later sign-in works"
         );
     }
 
