@@ -1068,6 +1068,7 @@ impl<S: PaymentState> PaymentGate<S> {
         if accepted.contains(&Scheme::X402Exact)
             && let Some(fixed_price) = &fixed_price
             && let Some(x402) = self.state.x402()
+            && self.state.fee_payer_signer().is_some()
         {
             let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             // Parity with MPP charge external_id: resource plus per-challenge
