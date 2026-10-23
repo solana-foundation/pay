@@ -1424,41 +1424,50 @@ fn has_stream_observable_dimension(spec: &SessionMeterSpec) -> bool {
 /// other unit must settle from the buffered response instead of being
 /// silently replaced by the stream's own heuristics.
 pub(crate) fn stream_honors_meters(metering: &Metering) -> bool {
-    metering
-        .dimensions
-        .iter()
-        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
-        .all(|dimension| {
-            let Some(meter) = &dimension.meter else {
-                return true;
-            };
-            if meter.source != pay_types::metering::UsageMeterSource::ResponseJson
-                || dimension.unit != BillingUnit::Tokens
-            {
-                return false;
-            }
-            let canonical: &[&str] = match dimension.direction {
-                MeterDirection::Input => &[
-                    "/usage/prompt_tokens",
-                    "/usage/input_tokens",
-                    "/response/usage/input_tokens",
-                    "/message/usage/input_tokens",
-                    "/usageMetadata/promptTokenCount",
-                ],
-                MeterDirection::Output => &[
-                    "/usage/completion_tokens",
-                    "/usage/output_tokens",
-                    "/response/usage/output_tokens",
-                    "/message/usage/output_tokens",
-                    "/usageMetadata/candidatesTokenCount",
-                ],
-                _ => &[],
-            };
-            meter
-                .path
-                .as_deref()
-                .is_some_and(|path| canonical.contains(&path))
-        })
+    dimensions_honor_meters(
+        metering
+            .dimensions
+            .iter()
+            .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter())),
+    )
+}
+
+/// [`stream_honors_meters`] for the given dimensions only, such as the ones a
+/// request's variant selects.
+pub(crate) fn dimensions_honor_meters<'a>(
+    dimensions: impl IntoIterator<Item = &'a pay_types::metering::MeterDimension>,
+) -> bool {
+    dimensions.into_iter().all(|dimension| {
+        let Some(meter) = &dimension.meter else {
+            return true;
+        };
+        if meter.source != pay_types::metering::UsageMeterSource::ResponseJson
+            || dimension.unit != BillingUnit::Tokens
+        {
+            return false;
+        }
+        let canonical: &[&str] = match dimension.direction {
+            MeterDirection::Input => &[
+                "/usage/prompt_tokens",
+                "/usage/input_tokens",
+                "/response/usage/input_tokens",
+                "/message/usage/input_tokens",
+                "/usageMetadata/promptTokenCount",
+            ],
+            MeterDirection::Output => &[
+                "/usage/completion_tokens",
+                "/usage/output_tokens",
+                "/response/usage/output_tokens",
+                "/message/usage/output_tokens",
+                "/usageMetadata/candidatesTokenCount",
+            ],
+            _ => &[],
+        };
+        meter
+            .path
+            .as_deref()
+            .is_some_and(|path| canonical.contains(&path))
+    })
 }
 
 fn observes_unit(spec: &SessionMeterSpec, unit: BillingUnit) -> bool {

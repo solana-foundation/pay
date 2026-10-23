@@ -622,16 +622,21 @@ impl ClientVoucherMeter {
         let Some(metering) = route.endpoint(api).and_then(|ep| ep.metering.as_ref()) else {
             return Ok(None);
         };
-        // The stream meter reads provider token usage from canonical fields
-        // only. Any other configured meter would be replaced by its own
-        // heuristics and release a response its vouchers may not cover, so
-        // the route is refused before the upstream is called.
-        if !session_stream::stream_honors_meters(metering) {
-            return Err(crate::server::session_metering::SessionMeteringError::UnobservableMeter);
-        }
         let path = uri.path().trim_start_matches('/');
         let props = payment::extract_request_properties(headers, path);
         let variant_hint = payment::extract_variant_hint(path);
+        // The stream meter reads provider token usage from canonical fields
+        // only. Any other configured meter on the dimensions this request
+        // bills would be replaced by its own heuristics and release a
+        // response its vouchers may not cover, so the request is refused
+        // before the upstream is called. Other variants' meters do not
+        // matter here.
+        if !session_stream::dimensions_honor_meters(metering::effective_dimensions(
+            metering,
+            variant_hint.as_deref(),
+        )) {
+            return Err(crate::server::session_metering::SessionMeteringError::UnobservableMeter);
+        }
         let meter =
             session_stream::meter_from_config(metering, &props, variant_hint.as_deref(), context)?;
         Ok(meter.map(|meter| Self {
@@ -2333,7 +2338,36 @@ mod tests {
             "tiers": [{"price_usd": 0.000001}],
             "meter": {"source": "response_json", "path": "/billing/generated"}
         })));
-        api.endpoints = vec![metered, flat, misconfigured, header_metered, custom_path];
+        // One variant meters canonical tokens, the other a response header:
+        // only the variant a request selects decides.
+        let mut variants = endpoint_with_routing("v1/models/{model}", None);
+        variants.metering = Some(
+            serde_json::from_value(serde_json::json!({
+                "schemes": ["mpp-session"],
+                "dimensions": [],
+                "variants": [
+                    {"param": "model", "value": "canonical-model", "dimensions": [{
+                        "direction": "output", "unit": "tokens", "scale": 1,
+                        "tiers": [{"price_usd": 0.000001}],
+                        "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
+                    }]},
+                    {"param": "model", "value": "header-model", "dimensions": [{
+                        "direction": "output", "unit": "bytes", "scale": 1,
+                        "tiers": [{"price_usd": 0.000001}],
+                        "meter": {"source": "response_header", "header": "x-billable-bytes"}
+                    }]}
+                ]
+            }))
+            .unwrap(),
+        );
+        api.endpoints = vec![
+            metered,
+            flat,
+            misconfigured,
+            header_metered,
+            custom_path,
+            variants,
+        ];
 
         let key = || solana_pubkey::Pubkey::new_unique().to_string();
         let handle = std::sync::Arc::new(crate::server::session::SessionMpp::new(
@@ -2439,6 +2473,22 @@ mod tests {
         // (and then waits on a voucher).
         let (_, hits) = client_voucher_exchange("v1/metered", METERED_ANSWER).await;
         assert_eq!(hits, 1);
+    }
+
+    /// Only the dimensions the request's variant selects must be observable:
+    /// a header meter on another variant does not refuse this one.
+    #[tokio::test]
+    async fn client_voucher_meter_check_follows_the_selected_variant() {
+        let (_, hits) = client_voucher_exchange("v1/models/canonical-model", METERED_ANSWER).await;
+        assert_eq!(hits, 1, "the canonical variant reaches the upstream");
+        let (served, hits) =
+            client_voucher_exchange("v1/models/header-model", METERED_ANSWER).await;
+        let (status, _) = served.expect("an unobservable meter answers at once");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits, 0,
+            "the header-metered variant is refused before the upstream"
+        );
     }
 
     #[tokio::test]
