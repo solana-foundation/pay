@@ -2421,6 +2421,7 @@ impl StartCommand {
                     resource: api.subdomain.clone(),
                     description: None,
                     max_age: Some(300),
+                    payment_identifier: Default::default(),
                     // The operator co-signs fees only when configured to.
                     fee_payer_key: if fee_payer {
                         fee_payer_signer.as_ref().map(|s| s.pubkey().to_string())
@@ -4258,6 +4259,7 @@ mod tests {
                 description: None,
                 max_age: Some(300),
                 fee_payer_key: None,
+                payment_identifier: Default::default(),
             },
             store,
         )

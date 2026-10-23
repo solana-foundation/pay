@@ -199,13 +199,17 @@ async fn forwarded_batch() -> (State, Arc<MemoryChannelStore>, String, BatchForw
     let requirements = batch.requirements("0.001").unwrap();
     let (channel_id, header) = payment_header(&requirements, &fee_payer_pubkey);
     let (_, payer) = payer();
-    store
-        .put_channel(
-            &channel_id,
-            channel_state(&channel_id, &payer, &fee_payer_pubkey),
-        )
-        .await
-        .unwrap();
+    let mut channel_state = channel_state(&channel_id, &payer, &fee_payer_pubkey);
+    channel_state.set_binding(&batch.binding());
+    channel_state.set_grace_period(requirements.extra.withdraw_delay);
+    channel_state.record_onchain_observation(
+        pay_kit::core::store::OnchainObservation {
+            slot: Some(341_000_000),
+            lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+        },
+        now(),
+    );
+    store.put_channel(&channel_id, channel_state).await.unwrap();
     let state = State {
         apis: vec![api()],
         batch,

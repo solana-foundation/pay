@@ -1765,13 +1765,32 @@ mod tests {
             let payment = base64::engine::general_purpose::STANDARD
                 .encode(serde_json::to_vec(&payload).unwrap());
             let store = batch.store().clone();
-            store.put_channel(&channel.to_string(), serde_json::from_value(json!({
-                "channel_id": channel.to_string(),
-                "authorized_signer": payer, "payer": config.payer,
-                "deposit": 1_000_000, "cumulative": 0, "sealed": false,
-                "open_slot": config.open_slot, "voucher_signer": "client",
-                "onchain_checked_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-            })).unwrap()).await.unwrap();
+            let mut channel_state: pay_kit::core::store::ChannelState =
+                serde_json::from_value(json!({
+                    "channel_id": channel.to_string(),
+                    "authorized_signer": payer, "payer": config.payer,
+                    "deposit": 1_000_000, "cumulative": 0, "sealed": false,
+                    "open_slot": config.open_slot, "voucher_signer": "client"
+                }))
+                .unwrap();
+            // Model a confirmed deposit on this deployment. A bare checked-at
+            // timestamp no longer satisfies the SDK's admission contract.
+            channel_state.set_binding(&batch.binding());
+            channel_state.set_grace_period(config.withdraw_delay);
+            channel_state.record_onchain_observation(
+                pay_kit::core::store::OnchainObservation {
+                    slot: Some(config.open_slot),
+                    lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+            store
+                .put_channel(&channel.to_string(), channel_state)
+                .await
+                .unwrap();
             let buyer = Router::new()
                 .route(&format!("/{}", sale.chat_path()), post(chat_completions))
                 .layer(middleware::from_fn_with_state(

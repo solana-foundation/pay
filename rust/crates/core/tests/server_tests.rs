@@ -534,6 +534,8 @@ async fn middleware_402_challenge_parseable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_returns_one_challenge_per_configured_currency() {
+    use pay_types::stablecoin_mints::{CASH_MAINNET, USDC_MAINNET, USDT_MAINNET};
+
     let (url, _h) = start_multi_currency_server().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -562,7 +564,8 @@ async fn middleware_returns_one_challenge_per_configured_currency() {
             request.currency
         })
         .collect();
-    assert_eq!(currencies, ["USDC", "CASH", "USDT"]);
+    // The SDK resolves configured symbols to mint addresses on the wire.
+    assert_eq!(currencies, [USDC_MAINNET, CASH_MAINNET, USDT_MAINNET]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

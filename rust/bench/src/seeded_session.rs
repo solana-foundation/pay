@@ -93,6 +93,15 @@ impl ChannelStore for ShardedMemoryChannelStore {
         Box::pin(async { Ok(()) })
     }
 
+    fn delete_channel_if(
+        &self,
+        channel_id: &str,
+        approve: pay_kit::core::store::ChannelPredicate,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let removed = self.data.remove_if(channel_id, |_, state| approve(state));
+        Box::pin(async move { Ok(removed.is_some()) })
+    }
+
     fn update_channel(
         &self,
         channel_id: &str,

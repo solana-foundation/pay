@@ -189,6 +189,38 @@ pub fn build_payment_for_attempt(
     auth_override: crate::signer::AuthOverride,
     attempt: Option<&crate::client::attempt::PaymentAttempt>,
 ) -> Result<BuiltPayment> {
+    build_payment_for_attempt_with_rpc(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        ExactPaymentExecution { attempt, rpc: None },
+    )
+}
+
+/// Execution-scoped state for an exact payment. Supplying an RPC client keeps
+/// challenge blockhash validation on the host-configured endpoint.
+pub struct ExactPaymentExecution<'a> {
+    pub attempt: Option<&'a crate::client::attempt::PaymentAttempt>,
+    pub rpc: Option<RpcClient>,
+}
+
+/// Like [`build_payment_for_attempt`], with an explicit host RPC client.
+pub fn build_payment_for_attempt_with_rpc(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    execution: ExactPaymentExecution<'_>,
+) -> Result<BuiltPayment> {
+    let ExactPaymentExecution {
+        attempt,
+        rpc: rpc_override,
+    } = execution;
     let requirements = &challenge.requirements;
     let cluster_raw = normalize_network(
         requirements
@@ -236,7 +268,7 @@ pub fn build_payment_for_attempt(
             default_rpc_url(&network).to_string()
         }
     });
-    let rpc = RpcClient::new(rpc_url.clone());
+    let rpc = rpc_override.unwrap_or_else(|| RpcClient::new(rpc_url.clone()));
 
     // Value the payment at the decimals it is signed at, before approval.
     let amount = crate::client::prompt::payment_display_amount(
@@ -2009,18 +2041,29 @@ mod tests {
         MemoryAccountsStore::with_file(file)
     }
 
+    fn valid_blockhash_rpc() -> RpcClient {
+        let mut mocks = pay_kit::x402::solana_rpc_client::mock_sender::MocksMap::default();
+        for _ in 0..8 {
+            mocks.insert(
+                pay_kit::x402::solana_rpc_client::api::request::RpcRequest::IsBlockhashValid,
+                serde_json::json!({"context":{"slot":1},"value":true}),
+            );
+        }
+        RpcClient::new_mock_with_mocks_map("fails", mocks)
+    }
+
     fn payment_identifier_challenge(blockhash_seed: u8, amount: &str) -> Challenge {
         Challenge {
             x402_version: pay_kit::x402::X402_VERSION_V2,
             requirements: serde_json::from_value(serde_json::json!({
                 "network": SOLANA_DEVNET,
                 "cluster": "devnet",
-                "recipient": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
+                "payTo": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
                 "amount": amount,
                 "currency": "SOL",
                 "resource": "https://provider.example/resource",
                 "maxAge": 300,
-                "recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string(),
+                "extra": {"recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string()},
             }))
             .unwrap(),
             siwx: None,
@@ -2054,14 +2097,17 @@ mod tests {
             Some(b"{\"q\":1}"),
         );
         let build = |challenge: &Challenge| {
-            build_payment_for_attempt(
+            build_payment_for_attempt_with_rpc(
                 challenge,
                 &store,
                 Some("devnet"),
                 None,
                 Some("https://provider.example/resource"),
                 None,
-                Some(&attempt),
+                ExactPaymentExecution {
+                    attempt: Some(&attempt),
+                    rpc: Some(valid_blockhash_rpc()),
+                },
             )
             .unwrap()
         };
@@ -2102,14 +2148,17 @@ mod tests {
             Some(b"{\"q\":\"other-wallet\"}"),
         );
         let build = |store: &MemoryAccountsStore, seed| {
-            build_payment_for_attempt(
+            build_payment_for_attempt_with_rpc(
                 &payment_identifier_challenge(seed, "1000"),
                 store,
                 Some("devnet"),
                 None,
                 Some("https://provider.example/resource"),
                 None,
-                Some(&attempt),
+                ExactPaymentExecution {
+                    attempt: Some(&attempt),
+                    rpc: Some(valid_blockhash_rpc()),
+                },
             )
             .unwrap()
         };
@@ -2133,12 +2182,17 @@ mod tests {
     fn builds_without_an_attempt_get_fresh_payment_identifiers() {
         let store = payment_identifier_store();
         let build = |seed| {
-            build_payment(
+            build_payment_for_attempt_with_rpc(
                 &payment_identifier_challenge(seed, "1000"),
                 &store,
                 Some("devnet"),
                 None,
                 Some("https://provider.example/resource"),
+                None,
+                ExactPaymentExecution {
+                    attempt: None,
+                    rpc: Some(valid_blockhash_rpc()),
+                },
             )
             .unwrap()
         };

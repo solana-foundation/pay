@@ -148,6 +148,8 @@ struct PayerState {
     /// through. `None` (today's default) authorizes whatever the challenge
     /// advertises, matching the MPP path's unbudgeted behavior.
     per_request_cap_base_units: Option<u128>,
+    /// Trusted RPC endpoint used by exact/charge builders when supplied.
+    rpc_url_override: Option<String>,
 }
 
 impl PayerState {
@@ -198,6 +200,7 @@ impl PayerState {
             network_override,
             account_override,
             per_request_cap_base_units: None,
+            rpc_url_override: None,
         })
     }
 
@@ -1457,12 +1460,17 @@ fn build_payment_authorization(
         ))
     })?;
 
-    let (auth_header, ephemeral_notice) = pay_core::mpp::build_credential(
+    let (auth_header, ephemeral_notice) = pay_core::mpp::build_credential_with_rpc(
         challenge,
         store,
         network_override,
         account_override,
         Some(resource_url),
+        None,
+        state
+            .rpc_url_override
+            .as_ref()
+            .map(|url| pay_kit::x402::solana_rpc_client::rpc_client::RpcClient::new(url.clone())),
     )?;
 
     if let Some(resolved) = ephemeral_notice {
@@ -1614,12 +1622,19 @@ fn build_exact_authorization(
         }
     }
 
-    let built = pay_core::client::x402::build_payment(
+    let built = pay_core::client::x402::build_payment_for_attempt_with_rpc(
         challenge,
         state.store.as_ref(),
         state.network_override.as_deref(),
         state.account_override.as_deref(),
         Some(resource_url),
+        None,
+        pay_core::client::x402::ExactPaymentExecution {
+            attempt: None,
+            rpc: state.rpc_url_override.as_ref().map(|url| {
+                pay_kit::x402::solana_rpc_client::rpc_client::RpcClient::new(url.clone())
+            }),
+        },
     )?;
 
     if let Some(resolved) = built.ephemeral_notice {
@@ -2075,11 +2090,8 @@ mod tests {
         );
     }
 
-    /// A canned MPP charge challenge that signs fully offline: the
-    /// embedded `recentBlockhash` skips the blockhash RPC and the
-    /// embedded `tokenProgram` + `decimals` skip the mint-account RPC
-    /// (verified against `pay_kit::mpp::client::charge::resolve_blockhash`
-    /// / `resolve_token_program`).
+    /// A canned MPP charge challenge. Blockhash validation uses the local
+    /// RPC fixture; embedded token program and decimals avoid mint reads.
     fn challenge_header(network: &str) -> String {
         let request = serde_json::json!({
             "amount": "10000",
@@ -2216,10 +2228,23 @@ mod tests {
     /// touch (or create) the user's real `~/.config/pay/accounts.yml`.
     async fn spawn_payer_with(upstream: PayerUpstream, network_override: Option<&str>) -> String {
         let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
-        let state = Arc::new(
-            PayerState::new(upstream, store, network_override.map(str::to_string), None).unwrap(),
+        let mut state =
+            PayerState::new(upstream, store, network_override.map(str::to_string), None).unwrap();
+        // A supplied challenge blockhash is now validated on the client's RPC.
+        // Keep the real SDK signing/retry path, with only that read mocked.
+        state.rpc_url_override = Some(
+            spawn_server(Router::new().fallback(axum::routing::post(
+                |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                    assert_eq!(request["method"], "isBlockhashValid");
+                    axum::Json(serde_json::json!({
+                        "jsonrpc":"2.0", "id":request["id"],
+                        "result":{"context":{"slot":1},"value":true}
+                    }))
+                },
+            )))
+            .await,
         );
-        spawn_server(router(state)).await
+        spawn_server(router(Arc::new(state))).await
     }
 
     /// Anthropic-dialect payer (pure passthrough — no translation).

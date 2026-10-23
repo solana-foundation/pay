@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use pay_kit::client::{
-    AssetPermission, ClientPermissions, OriginPermissionOverride, PaymentCandidate, SolanaNetwork,
-    UsdAmount,
+    AssetPermission, ClientPermissions, OriginPermissionOverride, PaymentCandidate,
+    PaymentDestination, PaymentTerms, SolanaNetwork, UsdAmount,
 };
 use serde::Deserialize;
 
@@ -191,13 +191,24 @@ impl McpPermissions {
         network: &str,
         asset: &str,
         amount: u64,
+        recipient: &str,
     ) -> Result<(), pay_core::Error> {
         let network = parse_network(network).map_err(permission_error)?;
         let mint =
             pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(asset, Some(network.as_str()))
                 .unwrap_or(asset);
+        let recipient = recipient
+            .parse()
+            .map_err(|_| permission_error("invalid payment recipient"))?;
+        let destinations = [PaymentDestination::new(recipient, amount)];
         self.0
-            .authorize(&PaymentCandidate::new(resource_url, network, mint, amount))
+            .authorize(&PaymentCandidate::new(
+                resource_url,
+                network,
+                mint,
+                amount,
+                &destinations,
+            ))
             .map(|_| ())
             .map_err(|error| permission_error(error.message))
     }
@@ -207,6 +218,17 @@ impl McpPermissions {
         challenge: &mpp::Challenge,
         resource_url: &str,
     ) -> Result<(), pay_core::Error> {
+        // Derive every split from the SDK's parsed terms rather than fabricating
+        // a single destination for the new permission candidate contract.
+        if let Some(terms) = PaymentTerms::from_mpp_charge(challenge, resource_url)
+            .map_err(|error| permission_error(error.message))?
+        {
+            return self
+                .0
+                .authorize(&terms.candidate())
+                .map(|_| ())
+                .map_err(|error| permission_error(error.message));
+        }
         let request: pay_kit::mpp::ChargeRequest = challenge
             .request
             .decode()
@@ -223,7 +245,13 @@ impl McpPermissions {
             .amount
             .parse()
             .map_err(|_| permission_error("MPP amount is not an unsigned integer"))?;
-        self.authorize(resource_url, network, &request.currency, amount)
+        self.authorize(
+            resource_url,
+            network,
+            &request.currency,
+            amount,
+            request.recipient.as_deref().unwrap_or_default(),
+        )
     }
 
     pub fn authorize_x402(
@@ -240,7 +268,13 @@ impl McpPermissions {
             .amount
             .parse()
             .map_err(|_| permission_error("x402 amount is not an unsigned integer"))?;
-        self.authorize(resource_url, network, &requirement.currency, amount)
+        self.authorize(
+            resource_url,
+            network,
+            &requirement.currency,
+            amount,
+            &requirement.recipient,
+        )
     }
 
     pub fn authorize_upto(
@@ -256,6 +290,7 @@ impl McpPermissions {
             requirement
                 .max_amount()
                 .map_err(|error| permission_error(error.to_string()))?,
+            &requirement.pay_to,
         )
     }
 
@@ -272,6 +307,7 @@ impl McpPermissions {
             requirement
                 .amount()
                 .map_err(|error| permission_error(error.to_string()))?,
+            &requirement.pay_to,
         )
     }
 
@@ -292,6 +328,7 @@ impl McpPermissions {
             &request.method_details.network,
             &request.currency,
             deposit,
+            &request.recipient,
         )
     }
 
@@ -308,6 +345,7 @@ impl McpPermissions {
             &requirement.network,
             &requirement.asset,
             escrow,
+            &requirement.pay_to,
         )
     }
 
@@ -348,13 +386,20 @@ assets:
                     "https://api.example.com/report",
                     "mainnet",
                     "USDC",
-                    2_500_000
+                    2_500_000,
+                    "11111111111111111111111111111111"
                 )
                 .is_ok()
         );
         assert!(
             permissions
-                .authorize("https://other.example/report", "mainnet", "USDC", 1)
+                .authorize(
+                    "https://other.example/report",
+                    "mainnet",
+                    "USDC",
+                    1,
+                    "11111111111111111111111111111111"
+                )
                 .is_err()
         );
     }
@@ -372,12 +417,24 @@ assets:
         let hosted = McpPermissions::hosted();
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", "USDC", 50_000_000)
+                .authorize(
+                    "https://any.example/x",
+                    "mainnet",
+                    "USDC",
+                    50_000_000,
+                    "11111111111111111111111111111111"
+                )
                 .is_ok()
         );
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", USDC, 1)
+                .authorize(
+                    "https://any.example/x",
+                    "mainnet",
+                    USDC,
+                    1,
+                    "11111111111111111111111111111111"
+                )
                 .is_ok()
         );
         // Challenge-selected custom mints, native SOL, and other clusters
@@ -385,20 +442,48 @@ assets:
         let custom = "So11111111111111111111111111111111111111112";
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", custom, 1)
+                .authorize(
+                    "https://any.example/x",
+                    "mainnet",
+                    custom,
+                    1,
+                    "11111111111111111111111111111111"
+                )
                 .is_err()
         );
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", "SOL", 1)
+                .authorize(
+                    "https://any.example/x",
+                    "mainnet",
+                    "SOL",
+                    1,
+                    "11111111111111111111111111111111"
+                )
                 .is_err()
         );
         assert!(
             hosted
-                .authorize("https://any.example/x", "devnet", "USDC", 1)
+                .authorize(
+                    "https://any.example/x",
+                    "devnet",
+                    "USDC",
+                    1,
+                    "11111111111111111111111111111111"
+                )
                 .is_err()
         );
-        assert!(hosted.authorize("not a url", "mainnet", "USDC", 1).is_err());
+        assert!(
+            hosted
+                .authorize(
+                    "not a url",
+                    "mainnet",
+                    "USDC",
+                    1,
+                    "11111111111111111111111111111111"
+                )
+                .is_err()
+        );
     }
 
     fn session_challenge(currency: &str, suggested: &str) -> mpp::Challenge {

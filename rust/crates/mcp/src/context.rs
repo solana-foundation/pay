@@ -18,6 +18,17 @@ pub trait PayContext: Send + Sync {
     /// Everything this call needs to act for its caller. Errors when the
     /// call carries no usable identity.
     fn scope(&self, call: &RequestContext<RoleServer>) -> Result<CallScope, rmcp::ErrorData>;
+
+    /// Resolve trusted configuration only; consultation happens after the SDK quote.
+    /// Optional runtime spending authority. Resolve caller identity from trusted
+    /// host/transport context, never clientInfo or agent-supplied arguments.
+    /// Default preserves existing local/hosted behavior and YAML permissions.
+    fn spending_authority(
+        &self,
+        _call: &RequestContext<RoleServer>,
+    ) -> Result<Option<crate::authority::AuthorityBinding>, rmcp::ErrorData> {
+        Ok(None)
+    }
 }
 
 /// One call's view of the world.

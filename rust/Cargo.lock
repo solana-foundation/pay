@@ -5343,11 +5343,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "solana-pay-kit",
+ "solana-pubkey 3.0.0",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -8816,7 +8819,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.10.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=cee5b8ffb15856aab82711df14195d73bdca1838#cee5b8ffb15856aab82711df14195d73bdca1838"
+source = "git+https://github.com/Niri7981/pay-kit.git?rev=7f1369180ca4b047aadff1bea77aed4525e10039#7f1369180ca4b047aadff1bea77aed4525e10039"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

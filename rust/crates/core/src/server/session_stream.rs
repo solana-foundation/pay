@@ -2442,6 +2442,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             self.inner.delete_channel(channel_id)
         }
 
+        fn delete_channel_if(
+            &self,
+            channel_id: &str,
+            approve: pay_kit::core::store::ChannelPredicate,
+        ) -> StoreFuture<'_, bool> {
+            self.inner.delete_channel_if(channel_id, approve)
+        }
+
         fn update_channel(
             &self,
             channel_id: &str,

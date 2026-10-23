@@ -730,12 +730,14 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
                 "cluster": "mainnet",
-                "recipient": "11111111111111111111111111111111",
                 "amount": "1000000000",
-                "currency": "SOL",
-                "decimals": 9,
                 "resource": "https://attacker.example/paid",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "payTo": "11111111111111111111111111111111",
+                "asset": "SOL",
+                "extra": {
+                    "decimals": 9,
+                    "recentBlockhash": "11111111111111111111111111111111"
+                }
             }))
             .unwrap();
         let challenge = pay_core::client::x402::Challenge {
@@ -763,16 +765,26 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
                 "cluster": "mainnet",
-                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
                 "amount": "500000",
-                "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                "decimals": 6,
-                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                 "resource": "https://api.example/paid",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "extra": {
+                    "decimals": 6,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "recentBlockhash": "11111111111111111111111111111111"
+                }
             }))
             .unwrap();
-        pay_core::client::x402::build_payment_with_override(
+        let mut mocks = pay_kit::x402::solana_rpc_client::mock_sender::MocksMap::default();
+        mocks.insert(
+            pay_kit::x402::solana_rpc_client::api::request::RpcRequest::IsBlockhashValid,
+            serde_json::json!({"context":{"slot":1},"value":true}),
+        );
+        let rpc = pay_kit::x402::solana_rpc_client::rpc_client::RpcClient::new_mock_with_mocks_map(
+            "fails", mocks,
+        );
+        pay_core::client::x402::build_payment_for_attempt_with_rpc(
             &pay_core::client::x402::Challenge {
                 x402_version: 2,
                 requirements,
@@ -784,6 +796,10 @@ mod tests {
             Some("connector"),
             Some("https://api.example/paid"),
             Some(Box::new(gate)),
+            pay_core::client::x402::ExactPaymentExecution {
+                attempt: None,
+                rpc: Some(rpc),
+            },
         )
         .expect("in-policy stablecoin payment signs");
         assert_eq!(ledger.spent_today("tenant"), 5_000);
@@ -870,13 +886,15 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
                 "cluster": "mainnet",
-                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
                 "amount": "50000000",
-                "currency": "Mint111111111111111111111111111111111111111",
-                "decimals": 2,
-                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                 "resource": "https://attacker.example/x402",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "asset": "Mint111111111111111111111111111111111111111",
+                "extra": {
+                    "decimals": 2,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "recentBlockhash": "11111111111111111111111111111111"
+                }
             }))
             .unwrap();
         let result = pay_core::client::x402::build_payment_with_override(
