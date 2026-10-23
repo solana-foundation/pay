@@ -44,6 +44,11 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 /// Longest one `buzz messages send` may run while it holds a slot; past it
 /// the send is killed and reported as failed.
 const SEND_DEADLINE: Duration = Duration::from_secs(60);
+/// How long the shim waits for the relay's answer: past both of the relay's
+/// own deadlines, so the shim never gives up on a send the relay may still
+/// post (the agent's retry would post it twice).
+const ANSWER_TIMEOUT: Duration =
+    Duration::from_secs(REQUEST_DEADLINE.as_secs() + SEND_DEADLINE.as_secs() + 10);
 /// Over-cap connections waiting for their "busy" answer. Beyond this they
 /// are closed unanswered, so a flood cannot grow the queue.
 const BUSY_QUEUE: usize = 16;
@@ -417,11 +422,15 @@ fn run_buzz(buzz: &Path, args: &[String], stdin: &[u8], deadline: Duration) -> R
             return Response::failed("the relay could not run buzz");
         }
     };
-    if let Some(mut input) = child.stdin.take() {
-        let _ = input.write_all(stdin);
-    }
-    // Drain both pipes while waiting, so a chatty buzz cannot block on a
-    // full pipe until the deadline.
+    // Feed stdin and drain both pipes on their own threads, so a buzz that
+    // stops reading its input or fills a pipe cannot block the relay past
+    // the deadline; killing the child ends all three.
+    let input = child.stdin.take().map(|mut input| {
+        let stdin = stdin.to_vec();
+        thread::spawn(move || {
+            let _ = input.write_all(&stdin);
+        })
+    });
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         thread::spawn(move || {
             let mut out = Vec::new();
@@ -461,6 +470,9 @@ fn run_buzz(buzz: &Path, args: &[String], stdin: &[u8], deadline: Duration) -> R
             }
         }
     };
+    if let Some(input) = input {
+        let _ = input.join();
+    }
     let (stdout, stderr) = (
         stdout.join().unwrap_or_default(),
         stderr.join().unwrap_or_default(),
@@ -529,7 +541,7 @@ fn relay(args: &[String]) -> io::Result<Response> {
 
 fn send_request(addr: SocketAddr, request: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut body = serde_json::to_vec(request)?;
     body.push(b'\n');
@@ -868,6 +880,29 @@ mod limit_tests {
             stderr_of(&response)
         );
         wait_for(&relay.active, 0);
+    }
+
+    /// A `buzz` that never reads the content it is given is still killed at
+    /// the deadline: the stdin write cannot block the relay.
+    #[test]
+    fn a_send_that_stops_reading_stdin_is_still_killed() {
+        let started = Instant::now();
+        let response = run_buzz(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), "exec sleep 30".to_string()],
+            &vec![b'x'; 4 * 1024 * 1024],
+            Duration::from_millis(300),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stdin write blocked"
+        );
+        assert_eq!(response.code, 4);
+    }
+
+    #[test]
+    fn the_shim_waits_past_the_relays_own_deadlines() {
+        assert!(ANSWER_TIMEOUT > REQUEST_DEADLINE + SEND_DEADLINE);
     }
 
     /// When the relay itself cannot run buzz, the agent sees `other` and
