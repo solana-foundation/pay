@@ -1,7 +1,7 @@
 //! `POST /v1/redeem`
 //!
 //! Activation-campaign redemption. Takes a code + destination, looks up
-//! the gateway hot wallet's recent transactions via Helius, atomically claims
+//! the gateway hot wallet's pre-claim-store transactions via Helius, atomically claims
 //! the code in Redis, then builds + signs + broadcasts a transaction that pays
 //! the code's campaign amount of the configured token to the destination and
 //! stamps `Redeem code <code>` as a memo. Success is only reported once the
@@ -55,8 +55,9 @@ static MEMO_PROGRAM_ID: LazyLock<Pubkey> =
 /// have to use this exact phrasing + a real code to collide.
 const REDEEM_MEMO_PREFIX: &str = "Redeem code ";
 
-/// Cap on Helius pages walked per request. Eight pages covers the
-/// current campaigns with slack.
+/// Cap on Helius pages walked per request. The scan only walks the frozen
+/// pre-rollout history, so the cap has to cover that history once; eight
+/// pages covers it with slack.
 const DEFAULT_MAX_SCAN_PAGES: usize = 8;
 
 /// Helius enhanced-transactions page limit.
@@ -267,8 +268,8 @@ async fn redeem(
         return pending_resp(&signature);
     }
 
-    match await_signature(state, &rpc_url, &signature, cfg.confirm_timeout).await {
-        PayoutStatus::Confirmed => {}
+    let finalized = match await_signature(state, &rpc_url, &signature, cfg.confirm_timeout).await {
+        PayoutStatus::Finalized(finalized) => finalized,
         PayoutStatus::Failed => {
             // Released only once the failure is final, as for any retry.
             warn!(%signature, "redemption payout failed on-chain");
@@ -277,17 +278,12 @@ async fn redeem(
                 Err(response) => response,
             };
         }
+        // Confirmed but not yet final stays pending: a confirmed block can
+        // still be dropped, and a terminal claim would consume the code.
         PayoutStatus::Pending => return pending_resp(&signature),
-    }
+    };
 
-    if let Err(error) = transition_claim(
-        cfg,
-        &req.code,
-        &pending,
-        Some(&ClaimState::Confirmed(signature).encode()),
-    )
-    .await
-    {
+    if let Err(error) = mark_claim_redeemed(cfg, &req.code, &pending, signature, finalized).await {
         // The pending claim already prevents another payout and reconciles
         // to confirmed on the next attempt.
         warn!(%error, %signature, "failed to mark redemption claim confirmed");
@@ -369,20 +365,32 @@ async fn reconcile_existing_claim(
     };
     match landing {
         Landing::Confirmed => {
-            if let Err(error) = transition_claim(
-                cfg,
-                code,
-                &raw,
-                Some(&ClaimState::Confirmed(signature).encode()),
-            )
-            .await
+            let status = match state
+                .rpc
+                .get_signature_status(rpc_url, &signature.to_string())
+                .await
             {
+                Ok(status) => classify_signature_status(status.as_ref()),
+                Err(error) => {
+                    warn!(%error, %signature, "redemption finality lookup failed");
+                    return Err(pending_resp(&signature));
+                }
+            };
+            let PayoutStatus::Finalized(finalized) = status else {
+                // Landed but not final: the pending claim keeps the code.
+                return Err(pending_resp(&signature));
+            };
+            if let Err(error) = mark_claim_redeemed(cfg, code, &raw, signature, finalized).await {
                 warn!(%error, %signature, "failed to mark redemption claim confirmed");
             }
             Err(already_redeemed_resp(&signature))
         }
         Landing::Replaceable(proof) => {
-            match release_signed_claim(cfg, code, &raw, ReleaseProof::CannotLand(proof)).await {
+            let Some(proof) = ReleaseProof::cannot_land(state, rpc_url, &signature, proof).await
+            else {
+                return Err(pending_resp(&signature));
+            };
+            match release_signed_claim(cfg, code, &raw, proof).await {
                 Ok(_) => Ok(()),
                 Err(error) => {
                     warn!(%error, "redemption claim store unavailable");
@@ -423,9 +431,47 @@ impl ChainState for Cluster<'_> {
 /// Why a claim holding a signed payout may be released: nothing signed
 /// under it can ever land.
 enum ReleaseProof {
-    /// The chain proves the payout failed for good or expired unseen.
-    CannotLand(Replaceable),
+    /// The chain proves the payout failed for good.
+    Failed(Replaceable),
+    /// Its blockhash expired unseen, and the ledger's history has no record
+    /// of it either.
+    ExpiredUnseen(Replaceable, HistoryAbsent),
     NeverBroadcast(NeverBroadcast),
+}
+
+/// The ledger's transaction history has no record of the payout.
+struct HistoryAbsent(());
+
+impl ReleaseProof {
+    /// Turn a chain proof into a release. An expiry proof rests on a null
+    /// status, which a lagging or history-less RPC node also returns for a
+    /// payout that landed, so it additionally needs `getTransaction` to find
+    /// nothing; any doubt keeps the claim.
+    async fn cannot_land(
+        state: &AppState,
+        rpc_url: &str,
+        signature: &Signature,
+        proof: Replaceable,
+    ) -> Option<Self> {
+        if proof.reason() == ReplaceReason::Failed {
+            return Some(Self::Failed(proof));
+        }
+        match state
+            .rpc
+            .get_transaction_json_parsed(rpc_url, &signature.to_string())
+            .await
+        {
+            Ok(None) => Some(Self::ExpiredUnseen(proof, HistoryAbsent(()))),
+            Ok(Some(_)) => {
+                warn!(%signature, "expired payout has no status but is in history; keeping claim");
+                None
+            }
+            Err(error) => {
+                warn!(%error, %signature, "redemption history lookup failed");
+                None
+            }
+        }
+    }
 }
 
 /// The RPC rejected the payout in preflight, so it was never forwarded.
@@ -446,21 +492,48 @@ async fn release_signed_claim(
     proof: ReleaseProof,
 ) -> Result<bool, redis::RedisError> {
     let reason = match proof {
-        ReleaseProof::CannotLand(proof) => match proof.reason() {
-            ReplaceReason::Failed => "payout failed for good",
-            ReplaceReason::Expired => "payout expired unseen",
-        },
+        ReleaseProof::Failed(proof) | ReleaseProof::ExpiredUnseen(proof, HistoryAbsent(())) => {
+            match proof.reason() {
+                ReplaceReason::Failed => "payout failed for good",
+                ReplaceReason::Expired => "payout expired unseen",
+            }
+        }
         ReleaseProof::NeverBroadcast(_) => "payout rejected in preflight",
     };
     info!(reason, "releasing redemption claim");
     transition_claim(cfg, code, expected, None).await
 }
 
+/// Proof a payout is finalized without error. Only
+/// [`classify_signature_status`] makes one, and only it unlocks the terminal
+/// claim: anything short of finality can still be rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalizedPayout(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayoutStatus {
-    Confirmed,
+    Finalized(FinalizedPayout),
     Failed,
+    /// Unseen, processed, or confirmed but not yet final.
     Pending,
+}
+
+/// Record the code as redeemed for good. Terminal, so it takes the proof
+/// that the payout behind `expected` is finalized.
+async fn mark_claim_redeemed(
+    cfg: &RedemptionState,
+    code: &str,
+    expected: &str,
+    signature: Signature,
+    _finalized: FinalizedPayout,
+) -> Result<bool, redis::RedisError> {
+    transition_claim(
+        cfg,
+        code,
+        expected,
+        Some(&ClaimState::Confirmed(signature).encode()),
+    )
+    .await
 }
 
 fn classify_signature_status(status: Option<&serde_json::Value>) -> PayoutStatus {
@@ -474,12 +547,12 @@ fn classify_signature_status(status: Option<&serde_json::Value>) -> PayoutStatus
         .get("confirmationStatus")
         .and_then(serde_json::Value::as_str)
     {
-        Some("confirmed" | "finalized") => PayoutStatus::Confirmed,
+        Some("finalized") => PayoutStatus::Finalized(FinalizedPayout(())),
         _ => PayoutStatus::Pending,
     }
 }
 
-/// Poll the payout signature until it confirms, fails, or `timeout` elapses.
+/// Poll the payout signature until it finalizes, fails, or `timeout` elapses.
 async fn await_signature(
     state: &AppState,
     rpc_url: &str,
@@ -519,8 +592,6 @@ fn redeem_memo(code: &str) -> String {
 struct HeliusTx {
     signature: String,
     #[serde(default)]
-    timestamp: Option<i64>,
-    #[serde(default)]
     instructions: Vec<HeliusIx>,
 }
 
@@ -549,6 +620,12 @@ enum DedupScanError {
 /// `Redeem code <code>`. History matches are only candidates: each is fetched
 /// from the trusted RPC and must be a successful hot-wallet payout carrying
 /// the memo. Returns the verified signature when found.
+///
+/// Only legacy history is walked: every payout since the Redis rollout holds
+/// a durable claim, so the scan starts strictly before
+/// [`RedemptionState::legacy_scan_before`] and runs to the end of the frozen
+/// pre-rollout history. Its cost is fixed by that history, not by how much
+/// the wallet has done since.
 async fn find_prior_burn(
     state: &AppState,
     rpc_url: &str,
@@ -563,7 +640,7 @@ async fn find_prior_burn(
     let http = &cfg.http_client;
     let needle = redeem_memo(code);
     let hot_wallet_str = hot_wallet.to_string();
-    let mut cursor: Option<String> = None;
+    let mut cursor = cfg.legacy_scan_before.to_string();
 
     for page in 0..cfg.max_scan_pages {
         let mut url = reqwest::Url::parse(&format!(
@@ -581,9 +658,7 @@ async fn find_prior_burn(
             // silently exclude prior burns from the scan. Match purely on
             // the memo content so reclassification can't cause a miss.
             q.append_pair("limit", &HELIUS_PAGE_LIMIT.to_string());
-            if let Some(c) = cursor.as_deref() {
-                q.append_pair("before-signature", c);
-            }
+            q.append_pair("before-signature", &cursor);
         }
         let txs: Vec<HeliusTx> = http
             .get(url)
@@ -608,19 +683,15 @@ async fn find_prior_burn(
                 }
             }
         }
-        // Underfull page → end of history.
+        // Underfull page → end of history. Only the end of history proves a
+        // code unused: redemptions predating the Redis claim store live
+        // nowhere else, so a scan that cannot reach it fails closed below.
         if txs.len() < HELIUS_PAGE_LIMIT {
             return Ok(None);
         }
-        if let Some(cutoff) = cfg.legacy_scan_cutoff_unix_seconds
-            && txs
-                .last()
-                .and_then(|tx| tx.timestamp)
-                .is_some_and(|timestamp| timestamp <= cutoff)
-        {
-            return Ok(None);
+        if let Some(last) = txs.last() {
+            cursor.clone_from(&last.signature);
         }
-        cursor = txs.last().map(|t| t.signature.clone());
         if page + 1 == cfg.max_scan_pages {
             return Err(DedupScanError::PageCap);
         }
@@ -970,7 +1041,9 @@ pub struct RedemptionState {
     pub solana_rpc_api_key: String,
     pub helius_base: String,
     pub max_scan_pages: usize,
-    pub legacy_scan_cutoff_unix_seconds: Option<i64>,
+    /// The legacy history scan covers only transactions strictly older than
+    /// this one; see `redemption.legacy_scan_before_signature`.
+    pub legacy_scan_before: Signature,
     /// How long a request waits for its payout to confirm before answering
     /// with a pending status.
     pub confirm_timeout: std::time::Duration,
@@ -1048,6 +1121,10 @@ impl RedemptionState {
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest::Client builds with default tls");
+        let legacy_scan_before = crate::config::parse_legacy_scan_before_signature(
+            cfg.legacy_scan_before_signature.as_deref(),
+        )
+        .map_err(Error::SendNotConfigured)?;
         let claim_store = redis::Client::open(cfg.claim_store_url.as_str()).map_err(|error| {
             Error::SendNotConfigured(format!("invalid redemption.claim_store_url: {error}"))
         })?;
@@ -1061,7 +1138,7 @@ impl RedemptionState {
             solana_rpc_api_key: cfg.solana_rpc_api_key.clone(),
             helius_base: cfg.helius_base.clone(),
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
-            legacy_scan_cutoff_unix_seconds: cfg.legacy_scan_cutoff_unix_seconds,
+            legacy_scan_before,
             confirm_timeout: REDEEM_CONFIRM_TIMEOUT,
             grants,
             http_client,
@@ -1160,6 +1237,7 @@ pub(crate) mod tests {
             enabled: true,
             amount: 5_000_000,
             claim_store_url: "redis://127.0.0.1/".to_string(),
+            legacy_scan_before_signature: Some(Signature::from([7u8; 64]).to_string()),
             codes: vec!["LEGACY123".to_string()],
             campaigns: vec![
                 RedemptionCampaignConfig {
@@ -1226,7 +1304,7 @@ pub(crate) mod tests {
 
         use axum::Json;
         use axum::Router;
-        use axum::extract::State;
+        use axum::extract::{Query, State};
         use axum::http::StatusCode;
         use axum::routing::{get, post};
         use pay_api_types::Network;
@@ -1318,7 +1396,7 @@ pub(crate) mod tests {
                     lands_after_tip_read: None,
                     sent: Vec::new(),
                     statuses: HashMap::new(),
-                    next_status: Some(confirmed()),
+                    next_status: Some(finalized()),
                     block_height: 50,
                     last_valid_block_height: 100,
                     transactions: HashMap::new(),
@@ -1328,6 +1406,10 @@ pub(crate) mod tests {
 
         pub(super) fn confirmed() -> Value {
             json!({ "err": null, "confirmationStatus": "confirmed" })
+        }
+
+        pub(super) fn finalized() -> Value {
+            json!({ "err": null, "confirmationStatus": "finalized" })
         }
 
         pub(super) fn failed() -> Value {
@@ -1413,8 +1495,30 @@ pub(crate) mod tests {
             )
         }
 
-        async fn helius_handler(State(history): State<Arc<Mutex<Vec<Value>>>>) -> Json<Value> {
-            Json(Value::Array(history.lock().unwrap().clone()))
+        /// Newest-first history paged like the provider: `limit` entries
+        /// strictly older than `before-signature`, which must be in history.
+        async fn helius_handler(
+            State(history): State<Arc<Mutex<Vec<Value>>>>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Result<Json<Value>, StatusCode> {
+            let history = history.lock().unwrap();
+            let start = match query.get("before-signature") {
+                Some(before) => {
+                    history
+                        .iter()
+                        .position(|tx| tx["signature"] == **before)
+                        .ok_or(StatusCode::BAD_REQUEST)?
+                        + 1
+                }
+                None => 0,
+            };
+            let limit = query
+                .get("limit")
+                .and_then(|limit| limit.parse().ok())
+                .unwrap_or(usize::MAX);
+            Ok(Json(Value::Array(
+                history.iter().skip(start).take(limit).cloned().collect(),
+            )))
         }
 
         pub(super) struct Harness {
@@ -1427,6 +1531,13 @@ pub(crate) mod tests {
         }
 
         pub(super) const CODE: &str = "TESTCODE1";
+
+        /// The first hot-wallet transaction after the Redis rollout. The
+        /// harness history starts with it, so entries pushed after it are
+        /// legacy history and entries inserted before it are newer.
+        pub(super) fn rollout_signature() -> Signature {
+            Signature::from([7u8; 64])
+        }
 
         async fn serve(router: Router) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1445,7 +1556,10 @@ pub(crate) mod tests {
                         .with_state(rpc.clone()),
                 )
                 .await;
-                let history = Arc::new(Mutex::new(Vec::new()));
+                let history = Arc::new(Mutex::new(vec![json!({
+                    "signature": rollout_signature().to_string(),
+                    "instructions": [],
+                })]));
                 let helius_url = serve(
                     Router::new()
                         .route("/v0/addresses/{address}/transactions", get(helius_handler))
@@ -1483,7 +1597,7 @@ pub(crate) mod tests {
                     solana_rpc_api_key: "key".to_string(),
                     helius_base: helius_url,
                     max_scan_pages: 2,
-                    legacy_scan_cutoff_unix_seconds: None,
+                    legacy_scan_before: rollout_signature(),
                     confirm_timeout: Duration::from_millis(300),
                     grants,
                     http_client: reqwest::Client::new(),
@@ -1639,7 +1753,7 @@ pub(crate) mod tests {
             assert!(body.get("signature").is_none());
             assert_eq!(h.claim().await, None);
 
-            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            h.rpc.lock().unwrap().next_status = Some(finalized());
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(h.sent().len(), 2);
@@ -1664,7 +1778,7 @@ pub(crate) mod tests {
             {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.statuses.insert(first.to_string(), failed());
-                rpc.next_status = Some(confirmed());
+                rpc.next_status = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -1702,13 +1816,105 @@ pub(crate) mod tests {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.block_height = 101;
                 rpc.last_valid_block_height = 200;
-                rpc.next_status = Some(confirmed());
+                rpc.next_status = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let sent = h.sent();
             assert_eq!(sent.len(), 2);
             assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[1])));
+        }
+
+        #[tokio::test]
+        async fn a_payout_confirmed_short_of_finality_never_consumes_the_code() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            let first = h.sent()[0];
+            let pending = Some(ClaimState::Pending {
+                signature: first,
+                last_valid_block_height: Some(100),
+            });
+            assert_eq!(h.claim().await, pending);
+
+            // A retry while it is still only confirmed keeps it pending.
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(h.claim().await, pending);
+
+            // The confirmed block is dropped and the blockhash expires: the
+            // code was never redeemed, so it pays out.
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.statuses.remove(&first.to_string());
+                rpc.block_height = 101;
+                rpc.last_valid_block_height = 200;
+                rpc.next_status = Some(finalized());
+            }
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let sent = h.sent();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[1])));
+        }
+
+        #[tokio::test]
+        async fn a_confirmed_payout_is_terminal_once_finalized() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let first = h.sent()[0];
+            h.rpc
+                .lock()
+                .unwrap()
+                .statuses
+                .insert(first.to_string(), finalized());
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], first.to_string());
+            assert_eq!(h.sent().len(), 1);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(first)));
+        }
+
+        #[tokio::test]
+        async fn an_expired_payout_still_in_history_keeps_its_claim() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = None;
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let first = h.sent()[0];
+            // Expired at finalized commitment with a null status, yet the
+            // ledger has the payout: the null is a lagging node, not proof.
+            {
+                let hot = h.hot_wallet();
+                let landed = h.payout_tx(&hot, &hot, Value::Null);
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.block_height = 101;
+                rpc.last_valid_block_height = 200;
+                rpc.next_status = Some(finalized());
+                rpc.transactions.insert(first.to_string(), landed);
+            }
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            assert_eq!(h.sent().len(), 1);
+            assert_eq!(
+                h.claim().await,
+                Some(ClaimState::Pending {
+                    signature: first,
+                    last_valid_block_height: Some(100),
+                })
+            );
         }
 
         #[tokio::test]
@@ -1727,7 +1933,7 @@ pub(crate) mod tests {
             {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.block_height = 101;
-                rpc.lands_after_tip_read = Some(confirmed());
+                rpc.lands_after_tip_read = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -1759,7 +1965,7 @@ pub(crate) mod tests {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.status_slot = 10;
                 rpc.last_valid_block_height = 200;
-                rpc.next_status = Some(confirmed());
+                rpc.next_status = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -1781,7 +1987,7 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .statuses
-                .insert(first.to_string(), confirmed());
+                .insert(first.to_string(), finalized());
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(body["signature"], first.to_string());
@@ -1874,6 +2080,98 @@ pub(crate) mod tests {
             assert_eq!(body["signature"], "PriorSig");
             assert!(h.sent().is_empty());
             assert_eq!(h.claim().await, None);
+        }
+
+        /// `count` memo-less entries newer than the Redis rollout.
+        fn post_rollout_activity(h: &Harness, count: usize) {
+            let mut history = h.history.lock().unwrap();
+            for index in 0..count {
+                history.insert(
+                    0,
+                    json!({ "signature": format!("recent-{index}"), "instructions": [] }),
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn post_rollout_history_does_not_count_against_the_scan_budget() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            // Ten times the page cap of activity since the rollout, which
+            // Redis claims already cover.
+            post_rollout_activity(&h, 10 * 2 * super::super::HELIUS_PAGE_LIMIT);
+            filler(&h, "legacy", 50, 1_000);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_legacy_payout_behind_post_rollout_history_still_blocks_the_code() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            post_rollout_activity(&h, 10 * 2 * super::super::HELIUS_PAGE_LIMIT);
+            filler(&h, "legacy", 150, 1_000);
+            let hot = h.hot_wallet();
+            h.index_candidate("LegacySig", h.payout_tx(&hot, &hot, Value::Null));
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], "LegacySig");
+            assert!(h.sent().is_empty());
+        }
+
+        /// `count` memo-less history entries named `{prefix}-{index}`.
+        fn filler(h: &Harness, prefix: &str, count: usize, timestamp: i64) {
+            let mut history = h.history.lock().unwrap();
+            for index in 0..count {
+                history.push(json!({
+                    "signature": format!("{prefix}-{index}"),
+                    "timestamp": timestamp,
+                    "instructions": [],
+                }));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_payout_older_than_the_claim_store_still_blocks_the_code() {
+            let Some(mut h) = Harness::new().await else {
+                return;
+            };
+            h.cfg.max_scan_pages = 4;
+            // Two full pages of newer activity end exactly at the Redis
+            // rollout; the legacy payout sits on the page after them.
+            let rollout = 1_000;
+            filler(&h, "newer", 100, rollout + 1);
+            filler(&h, "rollout", 100, rollout);
+            let hot = h.hot_wallet();
+            h.index_candidate("LegacySig", h.payout_tx(&hot, &hot, Value::Null));
+            filler(&h, "older", 10, rollout - 1);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], "LegacySig");
+            assert!(h.sent().is_empty());
+        }
+
+        #[tokio::test]
+        async fn history_beyond_the_page_cap_fails_closed() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            // Two full pages of legacy history with no end in reach (cap is
+            // two): a code cannot be proven unused.
+            filler(&h, "busy", 250, 1_000);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert!(h.sent().is_empty());
+
+            // Positive control: history that ends within the cap proves the
+            // code unused and pays it.
+            h.history.lock().unwrap().truncate(150);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 1);
         }
 
         #[tokio::test]

@@ -6,6 +6,7 @@
 //! [`Operator`] as fee payer, session operator and settlement signer. The
 //! gate's verification and settlement code then runs unchanged.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,10 +42,190 @@ fn validate_session_storage(channel_version: Option<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// An RPC endpoint URL. Providers carry credentials in its path or query,
+/// so it shows as its origin only; [`RpcUrl::expose`] is for the client that
+/// dials it, never for a log line.
+#[derive(Clone)]
+pub struct RpcUrl(String);
+
+impl RpcUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+
+    /// The full URL, credentials included.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// `text` (an RPC error, say) with the URL replaced by its origin.
+    ///
+    /// Clients print the URL they parsed, not the string they were given:
+    /// `reqwest` lowercases the host, adds a `/` path and percent-encodes.
+    /// So every form of the URL is redacted, and so are its secret-bearing
+    /// parts on their own (credentials, path segments, query values), raw,
+    /// percent-encoded and decoded.
+    pub fn redact_in(&self, text: &str) -> String {
+        // Shorter fragments are not credentials, and redacting them would
+        // mangle ordinary words in the message.
+        const MIN_SECRET_LEN: usize = 8;
+        const PLACEHOLDER: &str = "\u{0}rpc-url\u{0}";
+        // Every byte but alphanumerics, and only what a URL cannot carry raw.
+        const STRICT: &percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC;
+        const MINIMAL: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+            .add(b' ')
+            .add(b'"')
+            .add(b'#')
+            .add(b'<')
+            .add(b'>')
+            .add(b'`')
+            .add(b'{')
+            .add(b'}');
+        let mut whole = vec![self.0.clone()];
+        let mut parts = Vec::new();
+        if let Ok(url) = url::Url::parse(&self.0) {
+            whole.push(url.as_str().to_string());
+            let tail = &url[url::Position::BeforePath..];
+            if tail != "/" {
+                parts.push(tail.to_string());
+            }
+            parts.push(url.username().to_string());
+            parts.extend(url.password().map(str::to_string));
+            parts.extend(
+                url.path_segments()
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_string),
+            );
+            parts.extend(url.query().map(str::to_string));
+            for (key, value) in url.query_pairs() {
+                parts.push(key.into_owned());
+                parts.push(value.into_owned());
+            }
+        }
+        let spellings = |forms: Vec<String>| {
+            let mut all: Vec<String> = forms
+                .into_iter()
+                .flat_map(|form| {
+                    let decoded = percent_encoding::percent_decode_str(&form)
+                        .decode_utf8_lossy()
+                        .into_owned();
+                    let encode =
+                        |set| percent_encoding::utf8_percent_encode(&form, set).to_string();
+                    let (strict, minimal) = (encode(STRICT), encode(MINIMAL));
+                    let form_encoded: String =
+                        url::form_urlencoded::byte_serialize(form.as_bytes()).collect();
+                    [form.clone(), decoded, strict, minimal, form_encoded]
+                })
+                .filter(|form| form.len() >= MIN_SECRET_LEN)
+                .collect();
+            // Longest first, so a form is never split by one of its parts.
+            all.sort_by_key(|form| std::cmp::Reverse(form.len()));
+            all.dedup();
+            all
+        };
+        let mut redacted = text.to_string();
+        for form in spellings(whole) {
+            redacted = redacted.replace(&form, PLACEHOLDER);
+        }
+        for part in spellings(parts) {
+            redacted = redacted.replace(&part, "…");
+        }
+        redacted.replace(PLACEHOLDER, &self.to_string())
+    }
+}
+
+impl std::fmt::Display for RpcUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match url::Url::parse(&self.0) {
+            Ok(url) if url.has_host() => {
+                let origin = url.origin().ascii_serialization();
+                let elided = url.path() != "/" || url.query().is_some();
+                write!(f, "{origin}{}", if elided { "/…" } else { "" })
+            }
+            _ => f.write_str("[unparseable RPC URL]"),
+        }
+    }
+}
+
+impl std::fmt::Debug for RpcUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RpcUrl({self})")
+    }
+}
+
+/// One endpoint's MPP session backends, one per settlement mint, each over
+/// its own channel store.
+///
+/// Owned by the endpoint, not by a pricing generation: a reprice rebuilds the
+/// other backends but must keep serving, metering and settling the channels
+/// buyers already funded. Each [`SessionMpp`] runs the only lifecycle runloop
+/// over its store, so every generation reuses it rather than starting a
+/// second runloop that would settle and close the same channels again.
+/// Never shared across endpoints, whose channels pay different sellers.
+#[derive(Clone, Default)]
+pub struct SessionStores(Arc<std::sync::Mutex<HashMap<String, EndpointSession>>>);
+
+struct EndpointSession {
+    /// Everything the session backend was built from. A generation asking
+    /// for other terms cannot be served by this backend, and must not start
+    /// a second one over the same channels.
+    terms: String,
+    session: Arc<SessionMpp>,
+    #[cfg(test)]
+    store: Arc<dyn ChannelStore>,
+}
+
+impl SessionStores {
+    /// The endpoint's session backend for `mint`: built by `build` over a
+    /// fresh channel store the first time, the same instance after that.
+    fn session_for(
+        &self,
+        mint: &str,
+        terms: String,
+        build: impl FnOnce(Arc<dyn ChannelStore>) -> SessionMpp,
+    ) -> Result<Arc<SessionMpp>, String> {
+        let mut sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = sessions.get(mint) {
+            if existing.terms != terms {
+                return Err(
+                    "MPP session terms cannot change while the endpoint's channels are live".into(),
+                );
+            }
+            return Ok(existing.session.clone());
+        }
+        let store: Arc<dyn ChannelStore> =
+            Arc::new(pay_kit::core::store::MemoryChannelStore::new());
+        let session = Arc::new(build(store.clone()));
+        sessions.insert(
+            mint.to_string(),
+            EndpointSession {
+                terms,
+                session: session.clone(),
+                #[cfg(test)]
+                store,
+            },
+        );
+        Ok(session)
+    }
+
+    #[cfg(test)]
+    fn for_mint(&self, mint: &str) -> Arc<dyn ChannelStore> {
+        let sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions[mint].store.clone()
+    }
+}
+
 /// The deployment's signing identity behind every seller's endpoint.
 pub struct Operator {
     pub signer: Arc<dyn TransactionSigner>,
-    pub rpc_url: String,
+    pub rpc_url: RpcUrl,
     pub challenge_binding_secret: String,
     /// Shared by every backend; refreshed by [`Operator::spawn_blockhash_refresh`].
     pub blockhashes: BlockhashCache,
@@ -64,7 +245,7 @@ impl Operator {
     ) -> Self {
         Self {
             signer,
-            rpc_url: rpc_url.into(),
+            rpc_url: RpcUrl::new(rpc_url),
             challenge_binding_secret: challenge_binding_secret.into(),
             blockhashes: BlockhashCache::new(),
             batch_store: None,
@@ -132,10 +313,13 @@ impl Operator {
         let cache = self.blockhashes.clone();
         let rpc_url = self.rpc_url.clone();
         let refresh = move || {
-            let rpc = RpcClient::new(rpc_url.clone());
+            let rpc = RpcClient::new(rpc_url.expose().to_string());
             match pay_kit::mpp::blockhash::fetch_blockhash_with_slot(&rpc, rpc.commitment()) {
                 Ok(entry) => cache.set(entry.blockhash, entry.last_valid_block_height, entry.slot),
-                Err(error) => tracing::warn!(%error, "sell operator blockhash refresh failed"),
+                Err(error) => tracing::warn!(
+                    error = %rpc_url.redact_in(&error.to_string()),
+                    "sell operator blockhash refresh failed"
+                ),
             }
         };
         refresh();
@@ -194,6 +378,17 @@ impl EndpointBackends {
         operator: &Operator,
         public_url: &str,
     ) -> Result<Self, String> {
+        Self::build_with_session_stores(sale, operator, public_url, &SessionStores::default())
+    }
+
+    /// [`Self::build`] over the endpoint's existing session channel records,
+    /// so channels opened under an earlier pricing generation keep working.
+    pub fn build_with_session_stores(
+        sale: &SellInference,
+        operator: &Operator,
+        public_url: &str,
+        session_stores: &SessionStores,
+    ) -> Result<Self, String> {
         let problems = sale.validate();
         if !problems.is_empty() {
             return Err(problems.join("; "));
@@ -209,7 +404,7 @@ impl EndpointBackends {
             api.batch_settlement = None;
         }
         let network = sale.network.as_str();
-        let rpc_url = Some(operator.rpc_url.clone());
+        let rpc_url = Some(operator.rpc_url.expose().to_string());
         let mints: Vec<String> = sale
             .currencies
             .iter()
@@ -295,7 +490,10 @@ impl EndpointBackends {
                     // endpoint's resolved metering price.
                     amount: 1,
                     suggested_deposit: Some(cap_base),
-                    minimum_deposit: None,
+                    // The operator sponsors every open (rent included), so a
+                    // channel must lock the cap the endpoint suggests; pay
+                    // clients already deposit exactly that.
+                    minimum_deposit: Some(cap_base),
                     min_voucher_delta: spec.min_voucher_delta,
                     voucher_signer: pay_kit::mpp::server::session::VoucherSigner::Operator,
                     operator_signing_key: None,
@@ -310,28 +508,41 @@ impl EndpointBackends {
                     channel_hooks: channel_hooks.clone(),
                     token_program: Some(token_program),
                 };
-                // Endpoints share the operator's root secret; derive one per
-                // endpoint so a clone's session cannot be replayed into it.
-                let session = SessionMpp::new(
-                    config,
-                    pay_core::server::session::endpoint_challenge_binding_secret(
-                        &operator.challenge_binding_secret,
-                        &sale.endpoint_id,
-                    ),
-                )
-                .with_realm(sale.title.clone())
-                .with_blockhash_cache(operator.blockhashes.clone())
-                .with_payment_channel_signer(operator.signer.clone());
-                // Embedded reconciliation: this process pushes watermarks and
-                // closes idle channels. A settlement worker takes over when
-                // pay-connect's session state moves to Redis.
-                session.start_lifecycle_runloop_with_settlement_and_batching(
-                    std::time::Duration::from_millis(spec.close_delay_ms),
-                    std::time::Duration::from_millis(spec.close_batch_interval_ms),
-                    std::time::Duration::from_millis(spec.settlement_interval_ms),
-                    pay_core::server::session::SessionLifecycleReconciliation::Embedded,
+                let terms = format!(
+                    "{}|{}|{}|{}|{:?}",
+                    sale.recipient,
+                    sale.title,
+                    operator.pubkey(),
+                    cap_base,
+                    spec
                 );
-                sessions.push(Arc::new(session));
+                let session = session_stores.session_for(mint, terms, |store| {
+                    // Endpoints share the operator's root secret; derive one
+                    // per endpoint so a clone's session cannot be replayed
+                    // into it.
+                    let session = SessionMpp::new_with_channel_store(
+                        config,
+                        pay_core::server::session::endpoint_challenge_binding_secret(
+                            &operator.challenge_binding_secret,
+                            &sale.endpoint_id,
+                        ),
+                        store,
+                    )
+                    .with_realm(sale.title.clone())
+                    .with_blockhash_cache(operator.blockhashes.clone())
+                    .with_payment_channel_signer(operator.signer.clone());
+                    // Embedded reconciliation: this process pushes watermarks
+                    // and closes idle channels. A settlement worker takes over
+                    // when pay-connect's session state moves to Redis.
+                    session.start_lifecycle_runloop_with_settlement_and_batching(
+                        std::time::Duration::from_millis(spec.close_delay_ms),
+                        std::time::Duration::from_millis(spec.close_batch_interval_ms),
+                        std::time::Duration::from_millis(spec.settlement_interval_ms),
+                        pay_core::server::session::SessionLifecycleReconciliation::Embedded,
+                    );
+                    session
+                })?;
+                sessions.push(session);
             }
         }
 
@@ -354,6 +565,7 @@ impl EndpointBackends {
                 resource: format!("{}/{}", public_url.trim_end_matches('/'), sale.chat_path()),
                 description: Some(sale.title.clone()),
                 max_timeout_seconds: 300,
+                max_channel_lifetime: pay_kit::x402::upto::MaxChannelLifetime::ONE_HOUR,
                 program_id: None,
                 withdraw_delay: 0,
                 fee_payer_signer: operator.signer.clone(),
@@ -457,6 +669,72 @@ impl PaymentState for EndpointBackends {
 }
 
 #[cfg(test)]
+mod rpc_url_tests {
+    use super::RpcUrl;
+
+    /// Credentials ride in the query (Helius) or the path (QuickNode,
+    /// Alchemy); neither reaches a log line.
+    #[test]
+    fn an_rpc_url_shows_only_its_origin() {
+        for (raw, shown) in [
+            (
+                "https://mainnet.helius-rpc.com/?api-key=secret-1",
+                "https://mainnet.helius-rpc.com/…",
+            ),
+            (
+                "https://x.solana-mainnet.quiknode.pro/secret-2/",
+                "https://x.solana-mainnet.quiknode.pro/…",
+            ),
+            ("http://127.0.0.1:8899", "http://127.0.0.1:8899"),
+            ("not a url secret-3", "[unparseable RPC URL]"),
+        ] {
+            let url = RpcUrl::new(raw);
+            assert_eq!(url.to_string(), shown);
+            assert!(!format!("{url:?}").contains("secret"));
+            assert_eq!(url.expose(), raw);
+            let error = format!("error sending request for url ({raw})");
+            assert!(!url.redact_in(&error).contains("secret"), "{raw}");
+        }
+    }
+
+    /// reqwest prints the URL it parsed: host lowercased, a `/` path added,
+    /// unsafe bytes percent-encoded. None of those spellings leaks either.
+    #[test]
+    fn every_spelling_of_an_rpc_url_is_redacted() {
+        let raw = "https://Mainnet.Helius-RPC.com?api-key=secret-1 x&id=7";
+        let url = RpcUrl::new(raw);
+        let parsed = url::Url::parse(raw).unwrap();
+        assert_ne!(parsed.as_str(), raw);
+        for leaked in [
+            format!("error sending request for url ({parsed})"),
+            format!("request to {} failed", &parsed[url::Position::BeforePath..]),
+            "upstream rejected api-key secret-1 x".to_string(),
+            "upstream rejected api-key secret-1%20x".to_string(),
+            "upstream rejected api-key secret-1+x".to_string(),
+        ] {
+            let redacted = url.redact_in(&leaked);
+            assert!(!redacted.contains("secret"), "{leaked} -> {redacted}");
+        }
+        assert_eq!(
+            url.redact_in(&format!("error sending request for url ({parsed})")),
+            "error sending request for url (https://mainnet.helius-rpc.com/…)"
+        );
+
+        let path = RpcUrl::new("https://user:hunter2-pass@x.quiknode.pro/secret-2/");
+        let redacted = path.redact_in("auth hunter2-pass failed at /secret-2/ via secret-2");
+        assert!(
+            !redacted.contains("secret") && !redacted.contains("hunter2"),
+            "{redacted}"
+        );
+        // Messages that carry no part of the URL are left alone.
+        assert_eq!(
+            path.redact_in("connection refused (os error 61)"),
+            "connection refused (os error 61)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use pay_core::sell_inference::SellPricing;
@@ -523,6 +801,89 @@ mod tests {
         let store = operator.batch_store.as_ref().unwrap();
         assert!(Arc::ptr_eq(first.x402_batch().unwrap().store(), store));
         assert!(Arc::ptr_eq(repriced.x402_batch().unwrap().store(), store));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repriced_backends_keep_the_endpoints_session_channels() {
+        let operator = operator();
+        let stores = SessionStores::default();
+        let build = |usd, stores: &SessionStores| {
+            EndpointBackends::build_with_session_stores(
+                &sale(SellPricing::PerRequest { usd }),
+                &operator,
+                "https://connect.test",
+                stores,
+            )
+            .unwrap()
+        };
+        let first = build(0.02, &stores);
+        let session = first.sessions.first().unwrap().clone();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        stores
+            .for_mint(session.currency())
+            .put_channel(
+                &channel,
+                pay_core::server::session::test_channel_state(
+                    &channel,
+                    1_000_000,
+                    operator.pubkey(),
+                    "operator",
+                    "opening",
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        session.touch_channel(channel.clone()).await.unwrap();
+
+        // A reprice serves the channel the buyer already funded.
+        let repriced = build(0.03, &stores);
+        repriced
+            .sessions
+            .first()
+            .unwrap()
+            .touch_channel(channel.clone())
+            .await
+            .unwrap();
+        // One backend, so one lifecycle runloop, settles the endpoint's channels.
+        assert!(Arc::ptr_eq(
+            first.sessions.first().unwrap(),
+            repriced.sessions.first().unwrap()
+        ));
+        // Another endpoint's stores never see it.
+        let other = build(0.03, &SessionStores::default());
+        assert!(
+            other
+                .sessions
+                .first()
+                .unwrap()
+                .touch_channel(channel)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_terms_cannot_change_under_live_channels() {
+        let operator = operator();
+        let stores = SessionStores::default();
+        let build = |sale: &SellInference| {
+            EndpointBackends::build_with_session_stores(
+                sale,
+                &operator,
+                "https://connect.test",
+                &stores,
+            )
+        };
+        let mut terms = sale(SellPricing::PerRequest { usd: 0.02 });
+        build(&terms).unwrap();
+        // Same session terms at a new price: served by the same backend.
+        terms.pricing = SellPricing::PerRequest { usd: 0.05 };
+        build(&terms).unwrap();
+        terms.session_cap_usd *= 2.0;
+        let error = build(&terms).err().unwrap();
+        assert!(error.contains("session terms"), "{error}");
     }
 
     #[test]

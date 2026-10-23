@@ -55,9 +55,20 @@ pub const DEFAULT_ACCOUNT_NAME: &str = "default";
 /// real-money wallet" throughout the rest of the codebase.
 pub const MAINNET_NETWORK: &str = "mainnet";
 
+/// The account-file slug for a network name a challenge may carry: Solana's
+/// `mainnet-beta` cluster name is `mainnet` here. Every account lookup and
+/// approval decision goes through this, so an alias can never select a
+/// mainnet account while being judged as some other network.
+pub fn canonical_network(network: &str) -> &str {
+    match network {
+        "mainnet-beta" => MAINNET_NETWORK,
+        other => other,
+    }
+}
+
 /// Default auth-gate policy for a network.
 pub fn default_auth_required_for_network(network: &str) -> bool {
-    network == MAINNET_NETWORK
+    canonical_network(network) == MAINNET_NETWORK
 }
 
 // ── Keystore + Account ──────────────────────────────────────────────────────
@@ -1056,6 +1067,15 @@ mod tests {
     }
 
     // ── Keystore display + serde ──────────────────────────────────────────
+
+    #[test]
+    fn mainnet_beta_keeps_the_mainnet_approval_default() {
+        assert!(default_auth_required_for_network("mainnet"));
+        assert!(default_auth_required_for_network("mainnet-beta"));
+        assert!(!default_auth_required_for_network("devnet"));
+        assert_eq!(canonical_network("mainnet-beta"), MAINNET_NETWORK);
+        assert_eq!(canonical_network("localnet"), "localnet");
+    }
 
     #[test]
     fn keystore_display_includes_ephemeral() {

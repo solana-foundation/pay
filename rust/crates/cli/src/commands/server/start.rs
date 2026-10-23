@@ -140,11 +140,10 @@ impl ConfiguredSessionStore {
             .map_err(|error| pay_core::Error::Config(error.to_string()))?;
         match self {
             Self::Static { durable: false, .. } if config.channel_version == Some(2) => {
-                Err(pay_core::Error::Config(
-                    "V2 MPP sessions require durable Redis storage; set PAY_MPP_REDIS_URL or \
-                     PAY_SESSION_REDIS_URL and build with redis-session-store"
-                        .into(),
-                ))
+                Err(pay_core::Error::Config(format!(
+                    "V2 MPP sessions require durable Redis storage; {}",
+                    durable_store_remedy("PAY_MPP_REDIS_URL")
+                )))
             }
             Self::Static { store, .. } => Ok(SessionMpp::new_with_channel_store(
                 config,
@@ -254,9 +253,10 @@ fn x402_exact_backend(
         .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
 }
 
-/// Consumed MPP charge signatures. Replicas behind a deployment policy must
-/// share it; a single hosted gateway without Redis is warned that a restart
-/// forgets which payments were already served.
+/// Consumed MPP charge signatures and challenge generations. Outside local
+/// test clusters a gateway refuses to start without a shared durable store:
+/// a process-local one is forgotten on restart and not seen by a second
+/// replica, so one credential could be served more than once.
 async fn charge_replay_store(
     network: &SolanaNetwork,
     deployment_policy_mode: bool,
@@ -268,21 +268,17 @@ async fn charge_replay_store(
     )
     .await?;
     if !durable && deployment_policy_mode {
-        return Err(pay_core::Error::Config(
-            "deployment gateways need a shared MPP charge replay store; set PAY_MPP_REDIS_URL"
-                .into(),
-        ));
+        return Err(pay_core::Error::Config(format!(
+            "deployment gateways need a shared MPP charge replay store; {}",
+            durable_store_remedy("PAY_MPP_REDIS_URL")
+        )));
     }
     if !durable && requires_durable_store(network, deployment_policy_mode) {
-        eprintln!(
-            "{}",
-            format!(
-                "warning: MPP charges on {} use an in-memory replay store; set PAY_MPP_REDIS_URL \
-                 before running more than one gateway",
-                network.slug()
-            )
-            .yellow()
-        );
+        return Err(pay_core::Error::Config(format!(
+            "MPP charges on {} need a durable replay store; {}",
+            network.slug(),
+            durable_store_remedy("PAY_MPP_REDIS_URL")
+        )));
     }
     Ok(store)
 }
@@ -302,9 +298,9 @@ async fn subscription_store(
     .await?;
     if !durable && serves_subscriptions && requires_durable_store(network, deployment_policy_mode) {
         return Err(pay_core::Error::Config(format!(
-            "{} subscriptions need a durable replay store; set PAY_MPP_REDIS_URL and build \
-             with redis-session-store",
-            network.slug()
+            "{} subscriptions need a durable replay store; {}",
+            network.slug(),
+            durable_store_remedy("PAY_MPP_REDIS_URL")
         )));
     }
     Ok(store)
@@ -342,6 +338,23 @@ fn batch_store_default_prefix(network: &SolanaNetwork) -> String {
     match network {
         SolanaNetwork::Mainnet => PREFIX.to_string(),
         other => format!("{PREFIX}{}:", other.slug()),
+    }
+}
+
+/// What an operator must do when a gateway needs a durable store it does not
+/// have. A binary built without `redis-session-store` cannot open Redis at
+/// all, so setting the URL alone would only move the failure.
+fn durable_store_remedy(url_var: &str) -> String {
+    if cfg!(feature = "redis-session-store") {
+        format!(
+            "set {url_var} to a Redis URL every replica shares (redis:// or rediss://); \
+             only devnet and localnet may run on process memory"
+        )
+    } else {
+        format!(
+            "this pay binary was built without the redis-session-store feature; install a \
+             release build or rebuild with `--features redis-session-store`, then set {url_var}"
+        )
     }
 }
 
@@ -2007,8 +2020,14 @@ impl StartCommand {
                     &rpc_url,
                 )?;
 
-                let session_secret = std::env::var("PAY_MPP_SECRET")
-                    .unwrap_or_else(|_| challenge_binding_secret.clone());
+                // Operators commonly share one `PAY_MPP_SECRET` across APIs;
+                // scope it to this API so its session challenges never
+                // verify at another (replicas of one API derive the same).
+                let session_secret = pay_core::server::session::endpoint_challenge_binding_secret(
+                    &std::env::var("PAY_MPP_SECRET")
+                        .unwrap_or_else(|_| challenge_binding_secret.clone()),
+                    &api.subdomain,
+                );
                 let (channel_program_id, channel_version, channel_hooks) =
                     pay_core::mpp_channel_profile::server_profile()?;
                 if channel_version == Some(2) && sess.reuse_from_chain {
@@ -2092,7 +2111,10 @@ impl StartCommand {
                         // from the endpoint's resolved metering price.
                         amount: 1,
                         suggested_deposit: Some(cap_base),
-                        minimum_deposit: None,
+                        // A sponsored open costs the fee payer the channel's
+                        // rent, so it must lock the suggested cap; pay
+                        // clients already deposit exactly that.
+                        minimum_deposit: fee_payer.then_some(cap_base),
                         min_voucher_delta: sess.min_voucher_delta,
                         voucher_signer,
                         operator_signing_key: None,
@@ -2427,6 +2449,10 @@ impl StartCommand {
                     } else {
                         None
                     },
+                    // The `payment-identifier` extension stays off, as before
+                    // the kit added it.
+                    payment_identifier:
+                        pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
                 };
                 let (exact_store, durable_exact_store) = x402_exact_replay_store().await?;
                 if !durable_exact_store
@@ -2435,9 +2461,9 @@ impl StartCommand {
                     eprintln!(
                         "{}",
                         format!(
-                            "x402 exact disabled: {} payments need a durable replay store; \
-                             set PAY_X402_REDIS_URL",
-                            network.slug()
+                            "x402 exact disabled: {} payments need a durable replay store; {}",
+                            network.slug(),
+                            durable_store_remedy("PAY_X402_REDIS_URL")
                         )
                         .yellow()
                     );
@@ -2477,6 +2503,7 @@ impl StartCommand {
                         resource: api.subdomain.clone(),
                         description: None,
                         max_timeout_seconds: 300,
+                        max_channel_lifetime: pay_kit::x402::upto::MaxChannelLifetime::ONE_HOUR,
                         program_id: None,
                         withdraw_delay: 0,
                         fee_payer_signer: signer,
@@ -2519,8 +2546,9 @@ impl StartCommand {
                             "{}",
                             format!(
                                 "x402 batch-settlement disabled: {} payments need a durable \
-                                 channel store; set PAY_X402_REDIS_URL",
-                                network.slug()
+                                 channel store; {}",
+                                network.slug(),
+                                durable_store_remedy("PAY_X402_REDIS_URL")
                             )
                             .yellow()
                         );
@@ -3324,6 +3352,17 @@ async fn ensure_subscription_plans(
             .unwrap_or_else(|| route.plan_id_numeric(operator_pubkey_str, &api_subdomain));
         let seed = plan_id_seed(plan_id_numeric);
         let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
+        // The challenge's recipient (the endpoint's, else the operator's, as
+        // the gate resolves it) is the Plan's only destination.
+        let recipient = match sub_spec.recipient.as_deref() {
+            Some(recipient) => Pubkey::from_str(recipient).map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "endpoint `{}` has an invalid subscription recipient: {e}",
+                    endpoint.path
+                ))
+            })?,
+            None => operator,
+        };
         // A Plan authorizes every route it is attached to, so one per route.
         if let Some(other) = plans_in_use.insert(plan_pda, route.clone()) {
             return Err(pay_core::Error::Config(format!(
@@ -3355,11 +3394,12 @@ async fn ensure_subscription_plans(
                     "subscription Plan already on-chain — reusing",
                 );
                 let plan = fetch_plan(rpc_url, &plan_pda).await?;
-                plan.require_terms(sub_spec, &operator).map_err(|error| {
-                    pay_core::Error::Config(format!(
-                        "endpoint `{route}` cannot reuse Plan `{plan_pda}`: {error}"
-                    ))
-                })?;
+                plan.require_terms(sub_spec, &operator, &recipient)
+                    .map_err(|error| {
+                        pay_core::Error::Config(format!(
+                            "endpoint `{route}` cannot reuse Plan `{plan_pda}`: {error}"
+                        ))
+                    })?;
                 let plan_created_at = plan.created_at;
                 sub_spec.plan_id = Some(plan_pda.to_string());
                 sub_spec.plan_id_numeric = Some(plan_id_numeric);
@@ -3440,6 +3480,7 @@ async fn ensure_subscription_plans(
                     rpc_url,
                     route.clone(),
                     plan_id_numeric,
+                    &recipient,
                 )
                 .await
                 .map_err(|e| {
@@ -4258,6 +4299,7 @@ mod tests {
                 description: None,
                 max_age: Some(300),
                 fee_payer_key: None,
+                payment_identifier: pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
             },
             store,
         )
@@ -4321,6 +4363,97 @@ mod tests {
         devnet.unwrap();
         localnet.unwrap();
         no_subscriptions.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_mpp_charges_refuse_a_process_local_replay_store() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let mainnet = super::charge_replay_store(&SolanaNetwork::Mainnet, false).await;
+        let custom =
+            super::charge_replay_store(&SolanaNetwork::Unknown("custom".into()), false).await;
+        let deployment = super::charge_replay_store(&SolanaNetwork::Devnet, true).await;
+        let devnet = super::charge_replay_store(&SolanaNetwork::Devnet, false).await;
+        let localnet = super::charge_replay_store(&SolanaNetwork::Localnet, false).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        for refused in [mainnet, custom, deployment] {
+            assert!(
+                refused.is_err(),
+                "a hosted charge gateway fell back to memory"
+            );
+        }
+        // Local test clusters may still run on process memory.
+        devnet.unwrap();
+        localnet.unwrap();
+    }
+
+    /// Hosted gateways refuse to start without Redis, so a shipped binary that
+    /// cannot open Redis cannot serve mainnet at all.
+    #[test]
+    fn release_builds_can_open_a_durable_store() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest: toml_edit::DocumentMut =
+            std::fs::read_to_string(manifest_dir.join("Cargo.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let default = manifest["features"]["default"].as_array().unwrap();
+        assert!(
+            default
+                .iter()
+                .any(|feature| feature.as_str() == Some("redis-session-store")),
+            "the pay CLI must build with redis-session-store by default"
+        );
+
+        // A release path that drops default features would drop it again.
+        let repo = manifest_dir.join("../../..");
+        let mut build_scripts = vec![
+            repo.join("Justfile"),
+            repo.join("rust/Justfile"),
+            repo.join("rust/Dockerfile"),
+            repo.join("rust/.cargo/config.toml"),
+        ];
+        for entry in std::fs::read_dir(repo.join(".github/workflows")).unwrap() {
+            build_scripts.push(entry.unwrap().path());
+        }
+        for path in build_scripts {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("--no-default-features"),
+                "{} builds pay without its default features",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_missing_durable_store_names_the_variable_to_set() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let refused = super::charge_replay_store(&SolanaNetwork::Mainnet, false).await;
+        let local = super::charge_replay_store(&SolanaNetwork::Localnet, false).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        let message = refused.err().unwrap().to_string();
+        assert!(message.contains("PAY_MPP_REDIS_URL"), "{message}");
+        // This binary can already open Redis, so the URL is the only remedy.
+        assert!(!message.contains("redis-session-store"), "{message}");
+        local.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -50,6 +50,11 @@ pub enum SessionMeteringError {
     Overflow { context: &'static str },
     #[error("invalid streamed usage: {0}")]
     InvalidStream(String),
+    #[error(
+        "client-voucher sessions meter provider token usage only; a response header meter, \
+         a custom JSON path or a meter on another unit cannot be observed"
+    )]
+    UnobservableMeter,
 }
 
 pub type Result<T> = std::result::Result<T, SessionMeteringError>;
@@ -133,9 +138,10 @@ pub fn spec_from_metering(
 
 /// Price for one billable usage dimension.
 ///
-/// `price_micro_usd` is quoted per `scale` units. Token and provider-metered
-/// usage is prorated over the cumulative quantity before rounding to microUSD;
-/// discrete units such as requests are billed in whole blocks.
+/// `price_micro_usd` is quoted per `scale` units. Token, quota-unit,
+/// response-measured and provider-metered usage is prorated over the
+/// cumulative quantity before rounding to microUSD; discrete units such as
+/// requests are billed in whole blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeterDimension {
     pub direction: MeterDirection,
@@ -144,6 +150,24 @@ pub struct SessionMeterDimension {
     pub price_micro_usd: u64,
     pub required: bool,
     aggregate: bool,
+}
+
+/// Whether the session stream meter measures this dimension from the
+/// response itself (see `session_stream`). Such quantities, like tokens, are
+/// prorated over `scale`: a short response pays its share of the block.
+pub fn is_response_measured(direction: MeterDirection, unit: BillingUnit) -> bool {
+    direction == MeterDirection::Output
+        && matches!(
+            unit,
+            BillingUnit::Bytes
+                | BillingUnit::Characters
+                | BillingUnit::Tokens
+                | BillingUnit::QuotaUnits
+        )
+}
+
+fn is_prorated(direction: MeterDirection, unit: BillingUnit) -> bool {
+    unit.is_prorated() || is_response_measured(direction, unit)
 }
 
 impl SessionMeterDimension {
@@ -159,7 +183,7 @@ impl SessionMeterDimension {
             scale,
             price_micro_usd,
             required: true,
-            aggregate: unit == BillingUnit::Tokens,
+            aggregate: is_prorated(direction, unit),
         }
     }
 
@@ -175,7 +199,7 @@ impl SessionMeterDimension {
             scale,
             price_micro_usd,
             required: false,
-            aggregate: unit == BillingUnit::Tokens,
+            aggregate: is_prorated(direction, unit),
         }
     }
 }
@@ -706,7 +730,7 @@ fn dimension_from_metering(
         dimension.scale,
         price_micro_usd,
     );
-    rated.aggregate |= dimension.meter.is_some();
+    rated.aggregate |= dimension.is_aggregate_settled();
     Ok(rated)
 }
 
@@ -809,6 +833,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rated.current_base_units, 10_000);
+    }
+
+    #[test]
+    fn quota_units_are_prorated_like_every_other_aggregate_dimension() {
+        // $0.01 per 100 quota units: one observed unit costs $0.0001, the
+        // same proration x402 settlement applies, not a whole $0.01 block.
+        let rate = |unit| {
+            let metering = metering_with_dimensions(vec![one_tier_dimension(
+                MeterDirection::Output,
+                unit,
+                100,
+                0.01,
+            )]);
+            assert_eq!(
+                metering.dimensions[0].is_aggregate_settled(),
+                unit.is_prorated()
+            );
+            let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+            rate_voucher_delta(
+                &spec,
+                StablecoinSettlement::usdc(),
+                &UsageObservation::new(),
+                &UsageObservation::new().with(MeterDirection::Output, unit, 1),
+            )
+            .unwrap()
+            .current_base_units
+        };
+
+        assert_eq!(rate(BillingUnit::QuotaUnits), 100);
+        // Discrete units keep whole-block billing.
+        assert_eq!(rate(BillingUnit::Requests), 10_000);
+    }
+
+    #[test]
+    fn response_measured_output_is_prorated_without_an_explicit_meter() {
+        // $0.01 per 1,000 output characters (or bytes) observed by the stream
+        // meter: a 10-unit response pays $0.0001, not the whole block.
+        let rate = |direction, unit| {
+            let metering =
+                metering_with_dimensions(vec![one_tier_dimension(direction, unit, 1_000, 0.01)]);
+            let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+            rate_voucher_delta(
+                &spec,
+                StablecoinSettlement::usdc(),
+                &UsageObservation::new(),
+                &UsageObservation::new().with(direction, unit, 10),
+            )
+            .unwrap()
+            .current_base_units
+        };
+
+        assert_eq!(rate(MeterDirection::Output, BillingUnit::Characters), 100);
+        assert_eq!(rate(MeterDirection::Output, BillingUnit::Bytes), 100);
+        // Units the stream does not measure keep whole-block billing.
+        assert_eq!(rate(MeterDirection::Usage, BillingUnit::Requests), 10_000);
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //! - sign a legacy credential against it and persist the resulting
 //!   `Authorization: Payment …` header for re-use across requests
 //!   ([`sign_and_persist`]),
-//! - look up a previously-cached header for a given resource URL
-//!   ([`cached_header_for_resource`]).
+//! - look up a previously-cached header for a given resource URL, issued
+//!   to the selected account ([`cached_header_for_account`]).
 //!
 //! The runner / CLI surfaces that actually attach the header on
 //! outgoing requests are wired separately; this module is the
@@ -146,29 +146,81 @@ pub fn persist_token(
 }
 
 /// Look up a cached `Authorization: Payment …` header for the given
-/// resource URL. Supports both the canonical subscription proof and legacy
-/// SIWMPP credentials stored by older clients.
+/// resource URL, issued to the account that would pay for it. Supports both
+/// the canonical subscription proof and legacy SIWMPP credentials stored by
+/// older clients.
+///
+/// The bearer is the subscriber's identity at the merchant, so it is only
+/// ever taken from the account the request is made as: `account_override`,
+/// else each network's default account, restricted to `network_override`
+/// when one is given. The subscription must also be recorded for that
+/// network and its delegation must derive from that account's pubkey, so a
+/// record copied under another account cannot speak for it. When the
+/// selected account has no usable token, the caller goes through the normal
+/// challenge instead of borrowing another account's subscription.
 ///
 /// The URL match is prefix-based: a stored subscription's
 /// `resource_url` matches any request URL that starts with it. This
 /// covers both exact matches (`https://api.example.com/v1`) and
 /// sub-paths (`https://api.example.com/v1/resource`).
-pub fn cached_header_for_resource(store: &dyn AccountsStore, resource_url: &str) -> Option<String> {
+pub fn cached_header_for_account(
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: &str,
+) -> Option<String> {
     let file = store.load().ok()?;
     let now = chrono::Utc::now();
-    for accounts in file.accounts.values() {
-        for account in accounts.values() {
-            for sub in account.subscriptions.values() {
-                if !is_token_usable_for(sub, resource_url, now) {
-                    continue;
-                }
-                if let Some(token) = sub.authenticate_token.as_deref() {
-                    return Some(token.to_string());
-                }
+    for (network, accounts) in &file.accounts {
+        if network_override.is_some_and(|selected| selected != network) {
+            continue;
+        }
+        let name = match account_override {
+            Some(name) => name,
+            None => match file.account_for_network(network) {
+                Some((name, _)) => name,
+                None => continue,
+            },
+        };
+        let Some(account) = accounts.get(name) else {
+            continue;
+        };
+        let Some(subscriber) = account
+            .pubkey
+            .as_deref()
+            .and_then(|pubkey| parse_pubkey(pubkey, "pubkey").ok())
+        else {
+            continue;
+        };
+        for sub in account.subscriptions.values() {
+            if sub.network != *network
+                || !delegation_belongs_to(sub, &subscriber)
+                || !is_token_usable_for(sub, resource_url, now)
+            {
+                continue;
+            }
+            if let Some(token) = sub.authenticate_token.as_deref() {
+                return Some(token.to_string());
             }
         }
     }
     None
+}
+
+/// Whether `sub`'s delegation PDA is the one `subscriber` holds for its plan.
+fn delegation_belongs_to(sub: &Subscription, subscriber: &solana_pubkey::Pubkey) -> bool {
+    let Ok(plan) = parse_pubkey(&sub.plan_id, "plan_id") else {
+        return false;
+    };
+    let program = match sub.program_id.as_deref() {
+        Some(program) => match parse_pubkey(program, "program_id") {
+            Ok(program) => program,
+            Err(_) => return false,
+        },
+        None => default_program_id(),
+    };
+    let (expected, _) = find_subscription_pda(&plan, subscriber, &program);
+    expected.to_string() == sub.delegation_address()
 }
 
 /// Decide whether `request_url` is the stored resource or a path
@@ -241,6 +293,18 @@ mod tests {
     use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use std::collections::BTreeMap;
 
+    const PLAN: &str = "Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR";
+    const SUBSCRIBER: &str = "12YtVRbxyhBVceYVtALMeSyro5jTLEsqHgm78K721WH3";
+    const OTHER_SUBSCRIBER: &str = "6ayEJCQB7gwzwdbWLi65DR9RTRTrS3QunK6j9h2WjQjW";
+
+    fn delegation_for(subscriber: &str) -> String {
+        let plan = parse_pubkey(PLAN, "plan").unwrap();
+        let subscriber = parse_pubkey(subscriber, "subscriber").unwrap();
+        find_subscription_pda(&plan, &subscriber, &default_program_id())
+            .0
+            .to_string()
+    }
+
     fn make_sub(
         id: &str,
         resource_url: Option<&str>,
@@ -250,8 +314,8 @@ mod tests {
     ) -> Subscription {
         Subscription {
             subscription_id: id.to_string(),
-            subscription_delegation: None,
-            plan_id: "Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR".to_string(),
+            subscription_delegation: Some(delegation_for(SUBSCRIBER)),
+            plan_id: PLAN.to_string(),
             program_id: None,
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             currency: Some("USDC".to_string()),
@@ -284,7 +348,7 @@ mod tests {
                 provider: None,
                 active: false,
                 auth_required: Some(false),
-                pubkey: Some("12YtVRbxyhBVceYVtALMeSyro5jTLEsqHgm78K721WH3".to_string()),
+                pubkey: Some(SUBSCRIBER.to_string()),
                 vault: None,
                 account: None,
                 path: None,
@@ -314,7 +378,8 @@ mod tests {
             SubscriptionStatus::Active,
         );
         let store = store_with(sub);
-        let hit = cached_header_for_resource(&store, "https://api.example.com/v1/resource");
+        let hit =
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1/resource");
         assert_eq!(hit.as_deref(), Some(token));
     }
 
@@ -331,7 +396,12 @@ mod tests {
         );
         sub.expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
         let lookup = |sub: Subscription| {
-            cached_header_for_resource(&store_with(sub), "https://api.example.com/v1/resource")
+            cached_header_for_account(
+                &store_with(sub),
+                None,
+                None,
+                "https://api.example.com/v1/resource",
+            )
         };
         assert_eq!(lookup(sub.clone()), None);
 
@@ -356,7 +426,8 @@ mod tests {
         let store = store_with(sub);
 
         assert_eq!(
-            cached_header_for_resource(&store, "https://api.example.com/v1/resource").as_deref(),
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1/resource")
+                .as_deref(),
             Some(token)
         );
     }
@@ -372,7 +443,9 @@ mod tests {
             SubscriptionStatus::Active,
         );
         let store = store_with(sub);
-        assert!(cached_header_for_resource(&store, "https://api.example.com/v1").is_none());
+        assert!(
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1").is_none()
+        );
     }
 
     #[test]
@@ -386,7 +459,9 @@ mod tests {
             SubscriptionStatus::Cancelled,
         );
         let store = store_with(sub);
-        assert!(cached_header_for_resource(&store, "https://api.example.com/v1").is_none());
+        assert!(
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1").is_none()
+        );
     }
 
     #[test]
@@ -400,7 +475,9 @@ mod tests {
             SubscriptionStatus::Active,
         );
         let store = store_with(sub);
-        assert!(cached_header_for_resource(&store, "https://other.example.com/v1").is_none());
+        assert!(
+            cached_header_for_account(&store, None, None, "https://other.example.com/v1").is_none()
+        );
     }
 
     #[test]
@@ -419,18 +496,24 @@ mod tests {
         );
         let store = store_with(sub);
         assert!(
-            cached_header_for_resource(&store, "https://api.example.com.attacker.com/x").is_none(),
+            cached_header_for_account(&store, None, None, "https://api.example.com.attacker.com/x")
+                .is_none(),
             "hostname-suffix attack must be rejected"
         );
         // But a real sub-resource still matches.
         assert!(
-            cached_header_for_resource(&store, "https://api.example.com/v1/resource").is_some()
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1/resource")
+                .is_some()
         );
         // Exact match also OK.
-        assert!(cached_header_for_resource(&store, "https://api.example.com").is_some());
+        assert!(cached_header_for_account(&store, None, None, "https://api.example.com").is_some());
         // Query / fragment past the host also OK.
-        assert!(cached_header_for_resource(&store, "https://api.example.com?a=1").is_some());
-        assert!(cached_header_for_resource(&store, "https://api.example.com#frag").is_some());
+        assert!(
+            cached_header_for_account(&store, None, None, "https://api.example.com?a=1").is_some()
+        );
+        assert!(
+            cached_header_for_account(&store, None, None, "https://api.example.com#frag").is_some()
+        );
     }
 
     #[test]
@@ -443,7 +526,113 @@ mod tests {
             SubscriptionStatus::Active,
         );
         let store = store_with(sub);
-        assert!(cached_header_for_resource(&store, "https://api.example.com/v1").is_none());
+        assert!(
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1").is_none()
+        );
+    }
+
+    fn account(pubkey: &str, active: bool, subscriptions: Vec<Subscription>) -> Account {
+        Account {
+            backend: BackendKind::Ephemeral,
+            provider: None,
+            active,
+            auth_required: Some(false),
+            pubkey: Some(pubkey.to_string()),
+            vault: None,
+            account: None,
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: subscriptions
+                .into_iter()
+                .map(|sub| (sub.subscription_id.clone(), sub))
+                .collect(),
+        }
+    }
+
+    fn live_sub(token: &str) -> Subscription {
+        make_sub(
+            "sub-a",
+            Some("https://api.example.com/v1"),
+            Some(token),
+            None,
+            SubscriptionStatus::Active,
+        )
+    }
+
+    /// Account `alice` (mainnet default) holds a live subscription; `bob`,
+    /// on the same network, does not.
+    fn two_account_store() -> MemoryAccountsStore {
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "alice",
+            account(SUBSCRIBER, true, vec![live_sub("Payment alice")]),
+        );
+        file.upsert("mainnet", "bob", account(OTHER_SUBSCRIBER, false, vec![]));
+        MemoryAccountsStore::with_file(file)
+    }
+
+    #[test]
+    fn cached_header_belongs_to_the_selected_account() {
+        let store = two_account_store();
+        let url = "https://api.example.com/v1/data";
+        // Positive controls: the default account and naming it explicitly.
+        assert_eq!(
+            cached_header_for_account(&store, None, None, url).as_deref(),
+            Some("Payment alice")
+        );
+        assert_eq!(
+            cached_header_for_account(&store, Some("mainnet"), Some("alice"), url).as_deref(),
+            Some("Payment alice")
+        );
+        // Bob is selected: alice's bearer must not speak for him.
+        assert_eq!(
+            cached_header_for_account(&store, None, Some("bob"), url),
+            None
+        );
+        // Another network was selected: mainnet records do not apply.
+        assert_eq!(
+            cached_header_for_account(&store, Some("devnet"), Some("alice"), url),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_header_skips_a_non_default_account() {
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "alice",
+            account(SUBSCRIBER, false, vec![live_sub("Payment alice")]),
+        );
+        file.upsert("mainnet", "bob", account(OTHER_SUBSCRIBER, true, vec![]));
+        let store = MemoryAccountsStore::with_file(file);
+        assert_eq!(
+            cached_header_for_account(&store, None, None, "https://api.example.com/v1"),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_header_requires_the_delegation_and_network_of_the_account() {
+        let url = "https://api.example.com/v1";
+        let lookup = |sub: Subscription| {
+            let mut file = AccountsFile::default();
+            file.upsert("mainnet", "alice", account(SUBSCRIBER, true, vec![sub]));
+            cached_header_for_account(&MemoryAccountsStore::with_file(file), None, None, url)
+        };
+        assert!(lookup(live_sub("Payment ok")).is_some());
+
+        // A record whose delegation belongs to another subscriber.
+        let mut foreign = live_sub("Payment foreign");
+        foreign.subscription_delegation = Some(delegation_for(OTHER_SUBSCRIBER));
+        assert_eq!(lookup(foreign), None);
+
+        // A record for another network filed under this one.
+        let mut misfiled = live_sub("Payment devnet");
+        misfiled.network = "devnet".to_string();
+        assert_eq!(lookup(misfiled), None);
     }
 
     #[test]

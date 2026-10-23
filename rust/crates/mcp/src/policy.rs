@@ -729,13 +729,14 @@ mod tests {
         let requirements: pay_kit::x402::exact::PaymentRequirements =
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
-                "cluster": "mainnet",
-                "recipient": "11111111111111111111111111111111",
+                "payTo": "11111111111111111111111111111111",
                 "amount": "1000000000",
-                "currency": "SOL",
-                "decimals": 9,
+                "asset": "SOL",
                 "resource": "https://attacker.example/paid",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "extra": {
+                    "decimals": 9,
+                    "recentBlockhash": "11111111111111111111111111111111",
+                },
             }))
             .unwrap();
         let challenge = pay_core::client::x402::Challenge {
@@ -758,18 +759,20 @@ mod tests {
         assert_eq!(ledger.spent_today("tenant"), 0, "nothing recorded as USD");
 
         // Control: the same store and policy sign an in-policy USDC payment.
+        pay_core::test_rpc::install_blockhash_rpc();
         let gate = PolicyGate::new("tenant", SpendPolicy::dollars(1.0, 10.0), ledger.clone());
         let requirements: pay_kit::x402::exact::PaymentRequirements =
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
-                "cluster": "mainnet",
-                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
                 "amount": "500000",
-                "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                "decimals": 6,
-                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                 "resource": "https://api.example/paid",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "extra": {
+                    "decimals": 6,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "recentBlockhash": "11111111111111111111111111111111",
+                },
             }))
             .unwrap();
         pay_core::client::x402::build_payment_with_override(
@@ -847,7 +850,7 @@ mod tests {
 
     #[test]
     fn hosted_permissions_refuse_native_sol_before_any_payment_is_built() {
-        let hosted = crate::McpPermissions::hosted();
+        let hosted = crate::McpPermissions::hosted(&crate::ApprovedRecipients::Any);
         assert!(
             hosted
                 .authorize_mpp(&mpp_charge("SOL", "1000000000"), "https://a.example/x")

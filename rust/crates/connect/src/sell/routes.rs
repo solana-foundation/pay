@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
 
-use super::backends::{EndpointBackends, Operator};
+use super::backends::{EndpointBackends, Operator, SessionStores};
 use super::queue::{Admission, EndpointQueue, Event, QueueError};
 use crate::protocol::ApiError;
 
@@ -229,6 +229,8 @@ pub struct EndpointEntry {
     token_hash: [u8; 32],
     pub queue: Arc<EndpointQueue>,
     live: RwLock<Arc<Live>>,
+    /// Session channels outlive pricing generations; see [`SessionStores`].
+    session_stores: SessionStores,
     /// Stop taking requests once this much has been earned (micro-USD).
     earn_cap_micro: u64,
     /// Earned and temporarily reserved capacity are updated under one lock so
@@ -650,8 +652,13 @@ fn live_for(
     entry: &Arc<EndpointEntry>,
     sale: SellInference,
 ) -> Result<Arc<Live>, ApiError> {
-    let backends = EndpointBackends::build(&sale, &state.operator, &state.public_url)
-        .map_err(|message| ApiError::bad_request("invalid_endpoint", message))?;
+    let backends = EndpointBackends::build_with_session_stores(
+        &sale,
+        &state.operator,
+        &state.public_url,
+        &entry.session_stores,
+    )
+    .map_err(|message| ApiError::bad_request("invalid_endpoint", message))?;
     let routes = Router::new()
         .route(&format!("/{}", sale.chat_path()), post(chat_completions))
         .route(&format!("/{}", sale.models_path()), get(models))
@@ -732,6 +739,7 @@ async fn create(
             gated: Router::new(),
             streaming: Router::new(),
         })),
+        session_stores: SessionStores::default(),
         earn_cap_micro: (input.earn_cap_usd * USD_MICRO).round() as u64,
         earnings: Mutex::new(Earnings::default()),
     });
@@ -764,8 +772,8 @@ async fn update(
     let mut sale = entry.sale();
     sale.pricing = input.pricing.into();
     let live = live_for(&state, &entry, sale)?;
-    // Requests already in flight retain this generation. Once the old router
-    // drops, its session lifecycle detaches until its channels finish.
+    // Requests already in flight retain this generation. Both generations
+    // share the endpoint's session backends and their one lifecycle runloop.
     *entry.live.write().unwrap_or_else(|p| p.into_inner()) = live;
     tracing::info!(endpoint = %id, "sell_inference pricing updated");
     Ok(Json(view_of(&state, &entry, None)))
@@ -1737,7 +1745,7 @@ mod tests {
                 payer: payer.clone(),
                 payer_authorizer: payer.clone(),
                 receiver: requirements.pay_to.clone(),
-                receiver_authorizer: None,
+                receiver_authorizer: requirements.extra.receiver_authorizer.clone(),
                 token: requirements.asset.clone(),
                 withdraw_delay: requirements.extra.withdraw_delay,
                 salt: "42".into(),
@@ -1765,13 +1773,31 @@ mod tests {
             let payment = base64::engine::general_purpose::STANDARD
                 .encode(serde_json::to_vec(&payload).unwrap());
             let store = batch.store().clone();
-            store.put_channel(&channel.to_string(), serde_json::from_value(json!({
+            let mut record: pay_kit::core::store::ChannelState = serde_json::from_value(json!({
                 "channel_id": channel.to_string(),
                 "authorized_signer": payer, "payer": config.payer,
                 "deposit": 1_000_000, "cumulative": 0, "sealed": false,
                 "open_slot": config.open_slot, "voucher_signer": "client",
-                "onchain_checked_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-            })).unwrap()).await.unwrap();
+            }))
+            .unwrap();
+            // Admission needs this deployment's binding and a fresh
+            // observation of the open channel in place of a chain read.
+            record.set_binding(&batch.binding());
+            record.set_grace_period(config.withdraw_delay);
+            record.record_onchain_observation(
+                pay_kit::core::store::OnchainObservation {
+                    slot: None,
+                    lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+            store
+                .put_channel(&channel.to_string(), record)
+                .await
+                .unwrap();
             let buyer = Router::new()
                 .route(&format!("/{}", sale.chat_path()), post(chat_completions))
                 .layer(middleware::from_fn_with_state(
@@ -1872,7 +1898,12 @@ mod tests {
                 json!({"chunks":[{"choices":[{"delta":{"content":"partial"}}]}]}),
             )
             .await;
-        body.next().await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body.next())
+                .await
+                .is_err(),
+            "an uncharged prefix is held"
+        );
         fixture.event(&rid, "complete", json!({})).await;
         let entry = fixture.state.registry.get(&fixture.id).unwrap();
         assert_eq!(entry.earned_usd(), 0.0, "enqueue is not payment settlement");
@@ -1922,7 +1953,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn signed_batch_stream_is_live_and_completion_replays_without_second_charge() {
+    async fn signed_batch_stream_is_held_until_completion_and_a_replay_is_not_charged_twice() {
         let fixture = PaidBatchSeller::new().await;
         let (response, rid) = fixture.start().await;
         assert!(
@@ -1938,18 +1969,21 @@ mod tests {
                 json!({"chunks":[{"choices":[{"delta":{"content":"live"}}]}]}),
             )
             .await;
-        let first = tokio::time::timeout(Duration::from_secs(1), body.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&first).contains("live"));
+        // A buyer cannot read an uncharged prefix and disconnect.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body.next())
+                .await
+                .is_err(),
+            "partial output is held until the charge commits"
+        );
         assert_eq!(
             fixture.channel_state().await.cumulative,
             0,
             "partial answer is not a flat completion"
         );
         fixture.event(&rid, "complete", json!({})).await;
+        let first = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("live"));
         let last = body.next().await.unwrap().unwrap();
         assert_eq!(last, "data: [DONE]\n\n");
         assert_eq!(
@@ -1970,8 +2004,12 @@ mod tests {
                 .headers()
                 .contains_key(pay_kit::x402::PAYMENT_RESPONSE_HEADER)
         );
-        let replay = to_bytes(replay.into_body(), 4096).await.unwrap();
-        assert_eq!(replay.as_ref(), [first.as_ref(), last.as_ref()].concat());
+        // A replay returns its payment result, never the paid body: the
+        // voucher that unlocks it is public once a claim discloses it.
+        let replay: serde_json::Value =
+            serde_json::from_slice(&to_bytes(replay.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(replay["status"], "already_settled");
+        assert!(!replay.to_string().contains("live"));
         assert_eq!(fixture.channel_state().await.cumulative, 20_000);
         let entry = fixture.state.registry.get(&fixture.id).unwrap();
         assert_eq!(
@@ -2007,11 +2045,17 @@ mod tests {
                     json!({"chunks":[{"choices":[{"delta":{"content":"partial"}}]}]}),
                 )
                 .await;
-            assert!(body.next().await.unwrap().is_ok());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), body.next())
+                    .await
+                    .is_err()
+            );
             if fail {
                 fixture
                     .event(&rid, "fail", json!({"message":"failed after text"}))
                     .await;
+                // The worker's own failure answer is released uncharged.
+                assert!(body.next().await.unwrap().is_ok());
                 assert!(
                     String::from_utf8_lossy(&body.next().await.unwrap().unwrap())
                         .contains("worker_failed")
@@ -3123,6 +3167,7 @@ mod tests {
                     recipient: operator.pubkey(),
                     amount: 1,
                     suggested_deposit: Some(1_000_000),
+                    minimum_deposit: Some(1_000_000),
                     currency: "USDC".into(),
                     decimals: 6,
                     network: "devnet".into(),

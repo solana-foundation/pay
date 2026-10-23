@@ -4,6 +4,11 @@ use axum::{Router, body::Body, http::Request, response::Response};
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio::sync::Notify;
 
+/// A Firestore-shaped creation time that orders like the fixture revision.
+fn created_at(revision: u64) -> Value {
+    json!(format!("2026-01-01T00:00:00.{revision:06}Z"))
+}
+
 #[derive(Default)]
 struct State {
     documents: BTreeMap<String, Value>,
@@ -69,6 +74,18 @@ impl Fixture {
                     .map(|doc| json!({"document": doc}))
                     .collect::<Vec<_>>()
             ))
+        } else if path.ends_with(":batchGet") {
+            ok(json!(
+                body["documents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|name| match state.documents.get(name.as_str().unwrap()) {
+                        Some(doc) => json!({"found": doc}),
+                        None => json!({"missing": name}),
+                    })
+                    .collect::<Vec<_>>()
+            ))
         } else if path.ends_with(":commit") {
             let writes = body["writes"].as_array().unwrap();
             if writes.iter().any(|write| {
@@ -89,6 +106,12 @@ impl Fixture {
                         let mut update = update.clone();
                         state.revision += 1;
                         update["updateTime"] = json!(format!("revision-{}", state.revision));
+                        let name = update["name"].as_str().unwrap();
+                        update["createTime"] = state
+                            .documents
+                            .get(name)
+                            .and_then(|existing| existing.get("createTime").cloned())
+                            .unwrap_or_else(|| created_at(state.revision));
                         state
                             .documents
                             .insert(update["name"].as_str().unwrap().to_owned(), update);
@@ -142,7 +165,7 @@ impl Fixture {
                     .documents
                     .get(name)
                     .and_then(|existing| existing.get("createTime").cloned())
-                    .unwrap_or_else(|| json!(format!("created-{}", state.revision)));
+                    .unwrap_or_else(|| created_at(state.revision));
                 state.documents.insert(name.to_owned(), document.clone());
                 ok(document)
             } else {
@@ -606,6 +629,108 @@ async fn logical_names_cannot_shadow_a_physical_store_id() {
         .await
         .unwrap();
     assert_eq!(store.name, "weather");
+    server.abort();
+    let _ = server.await;
+}
+
+fn document_request() -> DocumentRequest {
+    DocumentRequest {
+        driver: DRIVER_ID.into(),
+        store_id: "weather".into(),
+        key: "key".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_read_authorized_before_recreation_never_returns_the_replacement() {
+    let (driver, fixture, server) = fixture().await;
+    let a = tenant("channelA");
+    let b = tenant("channelB");
+    create_and_write(&driver, &a, json!("original")).await;
+    // Channel A's parent check passes, then the store is deleted and
+    // recreated for channel B before A's child read.
+    fixture.arm("read");
+    let stale_driver = driver.clone();
+    let stale = tokio::spawn(async move {
+        stale_driver
+            .get_document(&tenant("channelA"), document_request())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), fixture.paused.notified())
+        .await
+        .unwrap();
+    driver
+        .delete_document_store(&a, store_request())
+        .await
+        .unwrap();
+    create_and_write(&driver, &b, json!("replacement")).await;
+    fixture.resume.notify_one();
+    assert!(stale.await.unwrap().is_err(), "stale read must fail closed");
+    // The new owner reads its own document.
+    let read = driver.get_document(&b, document_request()).await.unwrap();
+    assert_eq!(read.value, json!("replacement"));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn retained_documents_are_not_adopted_by_a_recreated_store() {
+    let (driver, _fixture, server) = fixture().await;
+    let create = |tenant: Tenant| {
+        let driver = driver.clone();
+        async move {
+            driver
+                .create_document_store(
+                    &tenant,
+                    CreateDocumentStoreRequest {
+                        driver: DRIVER_ID.into(),
+                        class: CLASS_ID.into(),
+                        name: "weather".into(),
+                        region: None,
+                        reclaim_policy: ReclaimPolicy::Retain,
+                        access: Default::default(),
+                        driver_options: Value::Null,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let put = |tenant: Tenant, value: Value| {
+        let driver = driver.clone();
+        async move {
+            driver
+                .put_document(
+                    &tenant,
+                    PutDocumentRequest {
+                        driver: DRIVER_ID.into(),
+                        store_id: "weather".into(),
+                        key: "key".into(),
+                        value,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let a = tenant("channelA");
+    let b = tenant("channelB");
+    create(a.clone()).await;
+    put(a.clone(), json!("secret")).await;
+    let read = driver.get_document(&a, document_request()).await.unwrap();
+    assert_eq!(read.value, json!("secret"));
+    driver
+        .delete_document_store(&a, store_request())
+        .await
+        .unwrap();
+
+    // Channel B recreates the name; channel A's retained child stays put
+    // but is not part of B's store.
+    create(b.clone()).await;
+    assert!(driver.get_document(&b, document_request()).await.is_err());
+    put(b.clone(), json!("fresh")).await;
+    let read = driver.get_document(&b, document_request()).await.unwrap();
+    assert_eq!(read.value, json!("fresh"));
     server.abort();
     let _ = server.await;
 }

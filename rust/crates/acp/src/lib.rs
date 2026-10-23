@@ -131,6 +131,20 @@ impl BuzzDeliveryTracker {
         self.observe_agent_message(&message)
     }
 
+    /// Whether `channel` is the Buzz destination of a turn in progress. A
+    /// relay publishing on the agent's behalf only sends where it answers.
+    pub fn is_live_destination(&self, channel: &str) -> bool {
+        let Ok(channel) = Uuid::parse_str(channel.trim()) else {
+            return false;
+        };
+        let channel = channel.to_string();
+        self.turns.values().any(|turn| {
+            turn.destination
+                .as_ref()
+                .is_some_and(|destination| destination.channel == channel)
+        })
+    }
+
     fn observe_client_message(&mut self, message: &Value) {
         if message.get("method").and_then(Value::as_str) != Some("session/prompt") {
             return;
@@ -411,6 +425,22 @@ mod tests {
                 content: "Hello from Goose".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn only_a_turn_in_progress_makes_its_channel_live() {
+        let mut tracker = BuzzDeliveryTracker::default();
+        assert!(!tracker.is_live_destination(CHANNEL));
+        tracker.observe_client_message(&prompt_request(
+            9,
+            &format!("[Context]\nScope: dm\nChannel: {CHANNEL}\n"),
+        ));
+        assert!(tracker.is_live_destination(CHANNEL));
+        assert!(tracker.is_live_destination(&CHANNEL.to_uppercase()));
+        assert!(!tracker.is_live_destination("00000000-0000-0000-0000-000000000000"));
+        assert!(!tracker.is_live_destination("general"));
+        tracker.observe_agent_message(&prompt_response(9));
+        assert!(!tracker.is_live_destination(CHANNEL));
     }
 
     #[test]

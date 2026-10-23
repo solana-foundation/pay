@@ -3,10 +3,12 @@
 use std::path::Path;
 
 use pay_kit::client::{
-    AssetPermission, ClientPermissions, OriginPermissionOverride, PaymentCandidate, SolanaNetwork,
-    UsdAmount,
+    AssetPermission, ClientPermissions, OriginPermissionOverride, PaymentCandidate,
+    PaymentDestination, PaymentTerms, SolanaNetwork, UsdAmount,
 };
+use pay_kit::mpp::client::SessionPayout;
 use serde::Deserialize;
+use solana_pubkey::Pubkey;
 
 use pay_core::client::{mpp, x402};
 
@@ -20,6 +22,10 @@ pub struct PermissionConfig {
     /// Solana clusters that may receive payments. Omit for mainnet only.
     #[serde(default)]
     pub networks: Option<Vec<String>>,
+    /// Wallets a payment may transfer to, as its primary recipient or any
+    /// split. Omit to allow any recipient; approvals still name every one.
+    #[serde(default)]
+    pub recipients: Option<Vec<String>>,
     /// Global stablecoin cap, such as `"$1.00"`.
     #[serde(default)]
     pub max_payment: Option<String>,
@@ -94,6 +100,17 @@ impl PermissionConfig {
                 builder = builder.allow_network(parse_network(network)?);
             }
         }
+        if let Some(recipients) = &self.recipients {
+            if recipients.is_empty() {
+                return Err("MCP permissions recipients must not be empty".into());
+            }
+            for recipient in recipients {
+                let recipient = recipient
+                    .parse::<Pubkey>()
+                    .map_err(|_| format!("invalid MCP permission recipient `{recipient}`"))?;
+                builder = builder.allow_recipient(recipient);
+            }
+        }
         if let Some(cap) = &self.max_payment {
             builder = builder.max_amount_per_payment(parse_usd(cap)?);
         } else if self.unlimited_amount {
@@ -165,6 +182,17 @@ fn parse_network(value: &str) -> Result<SolanaNetwork, String> {
     }
 }
 
+/// Which wallets a hosted tenant's payments may reach, as the primary
+/// recipient or any split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovedRecipients {
+    /// The tenant approved no specific recipients: the server names who is
+    /// paid. Every approval still lists each destination and its share.
+    Any,
+    /// Only these wallets may receive any leg of a payment.
+    Only(Vec<Pubkey>),
+}
+
 /// Compiled permission checks attached to a local MCP call.
 #[derive(Debug, Clone)]
 pub struct McpPermissions(ClientPermissions);
@@ -175,55 +203,85 @@ impl McpPermissions {
     }
 
     /// Permissions for hosted tenants: mainnet and known stablecoins only,
-    /// from any origin. Amounts are bounded by the tenant spending policy.
-    pub fn hosted() -> Self {
+    /// from any origin, paying only `recipients`. Amounts are bounded by the
+    /// tenant spending policy.
+    pub fn hosted(recipients: &ApprovedRecipients) -> Self {
+        let recipients = match recipients {
+            ApprovedRecipients::Any => None,
+            ApprovedRecipients::Only(wallets) => {
+                Some(wallets.iter().map(Pubkey::to_string).collect())
+            }
+        };
         Self::from_config(&PermissionConfig {
             networks: Some(vec!["mainnet".to_string()]),
+            recipients,
             unlimited_amount: true,
             ..Default::default()
         })
-        .expect("hosted payment permissions are statically valid")
+        .expect("hosted payment permissions are valid for any recipient list")
     }
 
+    /// Authorize a payment to one recipient for its whole amount.
     fn authorize(
         &self,
         resource_url: &str,
         network: &str,
         asset: &str,
         amount: u64,
+        recipient: &str,
+    ) -> Result<(), pay_core::Error> {
+        let recipient = parse_recipient(recipient)?;
+        self.authorize_destinations(
+            resource_url,
+            network,
+            asset,
+            amount,
+            &[PaymentDestination::new(recipient, amount)],
+        )
+    }
+
+    /// Authorize a payment split across `destinations`, which must add up
+    /// to `amount`.
+    fn authorize_destinations(
+        &self,
+        resource_url: &str,
+        network: &str,
+        asset: &str,
+        amount: u64,
+        destinations: &[PaymentDestination],
     ) -> Result<(), pay_core::Error> {
         let network = parse_network(network).map_err(permission_error)?;
         let mint =
             pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(asset, Some(network.as_str()))
                 .unwrap_or(asset);
+        self.authorize_candidate(&PaymentCandidate::new(
+            resource_url,
+            network,
+            mint,
+            amount,
+            destinations,
+        ))
+    }
+
+    fn authorize_candidate(&self, candidate: &PaymentCandidate<'_>) -> Result<(), pay_core::Error> {
         self.0
-            .authorize(&PaymentCandidate::new(resource_url, network, mint, amount))
+            .authorize(candidate)
             .map(|_| ())
             .map_err(|error| permission_error(error.message))
     }
 
+    /// Authorize an MPP charge on the terms the builder pays: the primary
+    /// recipient and every split leg, each checked against the recipient
+    /// allowlist.
     pub fn authorize_mpp(
         &self,
         challenge: &mpp::Challenge,
         resource_url: &str,
     ) -> Result<(), pay_core::Error> {
-        let request: pay_kit::mpp::ChargeRequest = challenge
-            .request
-            .decode()
-            .map_err(|error| permission_error(format!("invalid MPP charge: {error}")))?;
-        let details: pay_kit::mpp::protocol::solana::MethodDetails = request
-            .method_details
-            .clone()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| permission_error(format!("invalid MPP method details: {error}")))?
-            .unwrap_or_default();
-        let network = details.network.as_deref().unwrap_or("mainnet");
-        let amount = request
-            .amount
-            .parse()
-            .map_err(|_| permission_error("MPP amount is not an unsigned integer"))?;
-        self.authorize(resource_url, network, &request.currency, amount)
+        let terms = PaymentTerms::from_mpp_charge(challenge, resource_url)
+            .map_err(|error| permission_error(error.message))?
+            .ok_or_else(|| permission_error("MPP challenge is not a Solana stablecoin charge"))?;
+        self.authorize_candidate(&terms.candidate())
     }
 
     pub fn authorize_x402(
@@ -240,7 +298,13 @@ impl McpPermissions {
             .amount
             .parse()
             .map_err(|_| permission_error("x402 amount is not an unsigned integer"))?;
-        self.authorize(resource_url, network, &requirement.currency, amount)
+        self.authorize(
+            resource_url,
+            network,
+            &requirement.currency,
+            amount,
+            &requirement.recipient,
+        )
     }
 
     pub fn authorize_upto(
@@ -256,6 +320,7 @@ impl McpPermissions {
             requirement
                 .max_amount()
                 .map_err(|error| permission_error(error.to_string()))?,
+            &requirement.pay_to,
         )
     }
 
@@ -272,27 +337,35 @@ impl McpPermissions {
             requirement
                 .amount()
                 .map_err(|error| permission_error(error.to_string()))?,
+            &requirement.pay_to,
         )
     }
 
-    /// Authorize the deposit an operator-signed session open would lock.
+    /// Authorize the deposit an operator-signed session open would lock and
+    /// the payout it commits it to: the channel payee and every distribution
+    /// split, each checked against the recipient allowlist. Returns that
+    /// payout, which the opener must be held to.
     pub fn authorize_session(
         &self,
         challenge: &mpp::Challenge,
         resource_url: &str,
-    ) -> Result<(), pay_core::Error> {
+    ) -> Result<SessionPayout, pay_core::Error> {
         let request: pay_kit::mpp::SessionRequest = challenge
             .request
             .decode()
             .map_err(|error| permission_error(format!("invalid MPP session: {error}")))?;
         let deposit = pay_core::session::operator_session_deposit(&request)
             .map_err(|error| permission_error(error.to_string()))?;
-        self.authorize(
+        let payout = SessionPayout::from_request(&request)
+            .map_err(|error| permission_error(format!("invalid MPP session payout: {error}")))?;
+        self.authorize_destinations(
             resource_url,
             &request.method_details.network,
             &request.currency,
             deposit,
-        )
+            &session_destinations(&payout, deposit)?,
+        )?;
+        Ok(payout)
     }
 
     /// Authorize the escrow a batch `open` or `top_up` would deposit.
@@ -308,6 +381,7 @@ impl McpPermissions {
             &requirement.network,
             &requirement.asset,
             escrow,
+            &requirement.pay_to,
         )
     }
 
@@ -316,6 +390,37 @@ impl McpPermissions {
             "{kind} is not supported when MCP payment permissions are enabled"
         )))
     }
+}
+
+/// Split a session deposit the way the channel would distribute it: each
+/// split its basis-point share, the payee the remainder.
+fn session_destinations(
+    payout: &SessionPayout,
+    deposit: u64,
+) -> Result<Vec<PaymentDestination>, pay_core::Error> {
+    let shares: u32 = payout.splits.iter().map(|split| u32::from(split.bps)).sum();
+    if shares > 10_000 {
+        return Err(permission_error("MPP session splits exceed the deposit"));
+    }
+    let mut destinations = vec![PaymentDestination::new(payout.payee, 0)];
+    let mut shared = 0u64;
+    for split in &payout.splits {
+        let share = u64::try_from(u128::from(deposit) * u128::from(split.bps) / 10_000)
+            .map_err(|_| permission_error("MPP session split overflows"))?;
+        shared = shared
+            .checked_add(share)
+            .filter(|shared| *shared <= deposit)
+            .ok_or_else(|| permission_error("MPP session splits exceed the deposit"))?;
+        destinations.push(PaymentDestination::new(split.recipient, share));
+    }
+    destinations[0].amount = deposit - shared;
+    Ok(destinations)
+}
+
+fn parse_recipient(recipient: &str) -> Result<Pubkey, pay_core::Error> {
+    recipient
+        .parse()
+        .map_err(|_| permission_error("payment recipient is not a valid Solana address"))
 }
 
 fn permission_error(message: impl Into<String>) -> pay_core::Error {
@@ -348,13 +453,14 @@ assets:
                     "https://api.example.com/report",
                     "mainnet",
                     "USDC",
-                    2_500_000
+                    2_500_000,
+                    PAYEE
                 )
                 .is_ok()
         );
         assert!(
             permissions
-                .authorize("https://other.example/report", "mainnet", "USDC", 1)
+                .authorize("https://other.example/report", "mainnet", "USDC", 1, PAYEE)
                 .is_err()
         );
     }
@@ -365,19 +471,26 @@ assets:
         assert!(error.to_string().contains("unknown field"));
     }
 
+    const PAYEE: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
     const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
     #[test]
     fn hosted_permissions_allow_known_stablecoins_on_mainnet_only() {
-        let hosted = McpPermissions::hosted();
+        let hosted = McpPermissions::hosted(&ApprovedRecipients::Any);
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", "USDC", 50_000_000)
+                .authorize(
+                    "https://any.example/x",
+                    "mainnet",
+                    "USDC",
+                    50_000_000,
+                    PAYEE
+                )
                 .is_ok()
         );
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", USDC, 1)
+                .authorize("https://any.example/x", "mainnet", USDC, 1, PAYEE)
                 .is_ok()
         );
         // Challenge-selected custom mints, native SOL, and other clusters
@@ -385,20 +498,137 @@ assets:
         let custom = "So11111111111111111111111111111111111111112";
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", custom, 1)
+                .authorize("https://any.example/x", "mainnet", custom, 1, PAYEE)
                 .is_err()
         );
         assert!(
             hosted
-                .authorize("https://any.example/x", "mainnet", "SOL", 1)
+                .authorize("https://any.example/x", "mainnet", "SOL", 1, PAYEE)
                 .is_err()
         );
         assert!(
             hosted
-                .authorize("https://any.example/x", "devnet", "USDC", 1)
+                .authorize("https://any.example/x", "devnet", "USDC", 1, PAYEE)
                 .is_err()
         );
-        assert!(hosted.authorize("not a url", "mainnet", "USDC", 1).is_err());
+        assert!(
+            hosted
+                .authorize("not a url", "mainnet", "USDC", 1, PAYEE)
+                .is_err()
+        );
+    }
+
+    const SPLIT: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+
+    /// A mainnet USDC charge paying `primary` and one split to `split`.
+    fn split_charge(primary: &str, split: &str) -> mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": "5000000",
+            "currency": "USDC",
+            "recipient": primary,
+            "methodDetails": {
+                "network": "mainnet",
+                "decimals": 6,
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "splits": [{ "recipient": split, "amount": "4000000" }],
+            },
+        });
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    fn only(recipients: &[&str]) -> McpPermissions {
+        McpPermissions::hosted(&ApprovedRecipients::Only(
+            recipients.iter().map(|r| r.parse().unwrap()).collect(),
+        ))
+    }
+
+    #[test]
+    fn hosted_charges_bind_the_primary_recipient_and_every_split() {
+        let url = "https://merchant.example/paid";
+        // A split to a wallet the tenant never approved is refused even
+        // though the primary recipient and the total are in policy.
+        let error = only(&[PAYEE])
+            .authorize_mpp(&split_charge(PAYEE, SPLIT), url)
+            .unwrap_err();
+        assert!(error.to_string().contains(SPLIT), "{error}");
+        // So is a primary recipient outside the list.
+        assert!(
+            only(&[SPLIT])
+                .authorize_mpp(&split_charge(PAYEE, SPLIT), url)
+                .is_err()
+        );
+        // Control: approving both legs admits the same charge.
+        assert!(
+            only(&[PAYEE, SPLIT])
+                .authorize_mpp(&split_charge(PAYEE, SPLIT), url)
+                .is_ok()
+        );
+        // A tenant without approved recipients pays whoever the server names.
+        assert!(
+            McpPermissions::hosted(&ApprovedRecipients::Any)
+                .authorize_mpp(&split_charge(PAYEE, SPLIT), url)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn hosted_recipient_allowlist_covers_every_scheme() {
+        let x402 = x402::Challenge {
+            x402_version: 2,
+            requirements: serde_json::from_value(serde_json::json!({
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "payTo": SPLIT,
+                "amount": "1000",
+                "asset": USDC,
+                "resource": "https://merchant.example/paid",
+            }))
+            .unwrap(),
+            siwx: None,
+            extensions: None,
+        };
+        let url = "https://merchant.example/paid";
+        assert!(only(&[PAYEE]).authorize_x402(&x402, url).is_err());
+        assert!(only(&[SPLIT]).authorize_x402(&x402, url).is_ok());
+        let batch = batch_challenge("1000");
+        assert!(only(&[SPLIT]).authorize_batch(&batch, url).is_err());
+        assert!(only(&[PAYEE]).authorize_batch(&batch, url).is_ok());
+    }
+
+    #[test]
+    fn yaml_recipients_restrict_payment_destinations() {
+        let config: PermissionConfig =
+            serde_yml::from_str(&format!("recipients: [{PAYEE}]\nunlimited_amount: true\n"))
+                .unwrap();
+        let permissions = McpPermissions::from_config(&config).unwrap();
+        let url = "https://merchant.example/paid";
+        assert!(
+            permissions
+                .authorize_mpp(&split_charge(PAYEE, SPLIT), url)
+                .is_err()
+        );
+        assert!(
+            permissions
+                .authorize_mpp(&split_charge(PAYEE, PAYEE), url)
+                .is_ok()
+        );
+        assert!(
+            serde_yml::from_str::<PermissionConfig>("recipients: []")
+                .map(|config| config.build())
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            serde_yml::from_str::<PermissionConfig>("recipients: [not-a-key]")
+                .map(|config| config.build())
+                .unwrap()
+                .is_err()
+        );
     }
 
     fn session_challenge(currency: &str, suggested: &str) -> mpp::Challenge {
@@ -440,10 +670,70 @@ assets:
                 .is_err()
         );
         assert!(
-            McpPermissions::hosted()
+            McpPermissions::hosted(&ApprovedRecipients::Any)
                 .authorize_session(&session_challenge("SOL", "1"), "https://a.example/x")
                 .is_err()
         );
+    }
+
+    /// A mainnet USDC operator session paying `payee`, with one 25% split.
+    fn split_session(payee: &str, split: &str) -> mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": "1",
+            "currency": "USDC",
+            "recipient": payee,
+            "suggestedDeposit": "1000000",
+            "methodDetails": {
+                "network": "mainnet",
+                "channelProgram": "11111111111111111111111111111111",
+                "voucherSigner": "operator",
+                "distributionSplits": [{ "recipient": split, "shareBps": 2500 }],
+            },
+        });
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "session",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn hosted_sessions_bind_the_payee_and_every_distribution_split() {
+        let url = "https://a.example/x";
+        let challenge = split_session(PAYEE, SPLIT);
+        let error = only(&[PAYEE])
+            .authorize_session(&challenge, url)
+            .unwrap_err();
+        assert!(error.to_string().contains(SPLIT), "{error}");
+        assert!(only(&[SPLIT]).authorize_session(&challenge, url).is_err());
+
+        // Control: approving both returns the payout the opener is held to.
+        let payout = only(&[PAYEE, SPLIT])
+            .authorize_session(&challenge, url)
+            .unwrap();
+        assert_eq!(payout.payee.to_string(), PAYEE);
+        assert_eq!(payout.splits.len(), 1);
+        assert_eq!(payout.splits[0].recipient.to_string(), SPLIT);
+        assert_eq!(payout.splits[0].bps, 2500);
+    }
+
+    #[test]
+    fn session_destinations_share_the_deposit_like_the_channel() {
+        let payout = SessionPayout {
+            payee: PAYEE.parse().unwrap(),
+            splits: vec![pay_kit::mpp::program::payment_channels::Distribution {
+                recipient: SPLIT.parse().unwrap(),
+                bps: 2500,
+            }],
+        };
+        let destinations = session_destinations(&payout, 1_000_001).unwrap();
+        assert_eq!(destinations[0].amount, 750_001);
+        assert_eq!(destinations[1].amount, 250_000);
+        let mut over = payout.clone();
+        over.splits[0].bps = 10_001;
+        assert!(session_destinations(&over, 1_000).is_err());
     }
 
     fn batch_challenge(min_deposit: &str) -> x402::BatchChallenge {

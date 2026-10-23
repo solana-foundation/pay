@@ -10,7 +10,7 @@ use pay_kit::x402::{
     X402_VERSION_V2,
     client::exact::{
         build_payment_header as build_payment_header_v2, build_payment_header_v1,
-        parse_x402_challenge_for_network,
+        parse_x402_challenge,
     },
     exact::{
         PaymentExtensions, PaymentRequiredEnvelope, PaymentRequirements, SOLANA_DEVNET,
@@ -99,7 +99,11 @@ pub fn scheme_network(network: &str, network_override: Option<&str>) -> String {
 /// Try to parse an x402 challenge from headers and/or body.
 /// Defaults to preferring Solana mainnet when multiple chains are offered.
 pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challenge> {
-    let requirements = parse_x402_challenge_for_network(headers, body, Some(SOLANA_MAINNET))?;
+    // No network pinned: the kit prefers mainnet and otherwise takes the
+    // cheapest Solana offer. Pinning one would refuse every devnet or
+    // sandbox offer; the network the payment signs on is resolved later
+    // from the chosen offer and any `--network` override.
+    let requirements = parse_x402_challenge(headers, body)?;
     let siwx = parse_siwx_extension(headers, body).ok().flatten();
     let extensions =
         parse_payment_required_envelope(headers, body).and_then(|envelope| envelope.extensions);
@@ -223,7 +227,7 @@ pub fn build_payment_for_attempt(
         should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+    let rpc_url = crate::config::payment_rpc_url().unwrap_or_else(|| {
         if surfpool_detected {
             // `default_rpc_url("localnet")` is `http://localhost:8899`
             // (the in-process test-validator default). For an
@@ -252,7 +256,8 @@ pub fn build_payment_for_attempt(
         &amount,
         &prompt_context.reason,
         &prompt_context.operator,
-    );
+    )
+    .with_payment_destinations(&requirements.recipient, &[]);
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_payment_with_intent_and_override(
             &network,
@@ -308,14 +313,10 @@ pub fn build_payment_for_attempt(
                     &payer,
                     &network,
                     "x402-payment-identifier",
-                    &[
-                        &requirements.network,
-                        requirements.cluster.as_deref().unwrap_or_default(),
-                        &requirements.amount,
-                        &requirements.currency,
-                        &requirements.recipient,
-                        &requirements.resource,
-                    ],
+                    &[&payment_identifier_terms(
+                        requirements,
+                        challenge.extensions.as_ref(),
+                    )?],
                 )
                 .reuse_or_insert(
                     std::time::Duration::from_secs(
@@ -436,7 +437,7 @@ fn resolve_channel_route(
     )?;
 
     let network = network_override.map(str::to_string).unwrap_or(cluster);
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+    let rpc_url = crate::config::payment_rpc_url().unwrap_or_else(|| {
         if surfpool_detected {
             crate::config::SANDBOX_RPC_URL.to_string()
         } else {
@@ -655,6 +656,66 @@ pub fn build_upto_payment_with_override(
         headers: vec![(X402_V2_PAYMENT_HEADER, header)],
         ephemeral_notice,
     })
+}
+
+/// The offer terms an x402 `payment-identifier` is reused for: every field
+/// of the requirements and the advertised extensions except the ones a fresh
+/// 402 for the same offer legitimately changes (the blockhash and slot the
+/// transaction is built against, the raw wire echo that carries them, and
+/// the per-challenge fields of a `sign-in-with-x` offer: its nonce and the
+/// times and request id stamped on each challenge).
+///
+/// A memo, order reference, fee payer or any other field the server adds
+/// changes what is being paid for, so it gets its own identifier rather than
+/// replaying another order's.
+fn payment_identifier_terms(
+    requirements: &PaymentRequirements,
+    extensions: Option<&serde_json::Value>,
+) -> Result<String> {
+    const VOLATILE: [&str; 5] = [
+        "recentBlockhash",
+        "recent_blockhash",
+        "lastValidBlockHeight",
+        "recentSlot",
+        "accepted",
+    ];
+    let strip = |value: &mut serde_json::Value| {
+        if let Some(object) = value.as_object_mut() {
+            for key in VOLATILE {
+                object.remove(key);
+            }
+        }
+    };
+    let mut terms = serde_json::to_value(requirements)?;
+    strip(&mut terms);
+    if let Some(extra) = terms.get_mut("extra") {
+        strip(extra);
+    }
+    let mut extensions = extensions.cloned();
+    if let Some(siwx) = extensions
+        .as_mut()
+        .and_then(|extensions| extensions.get_mut(pay_kit::x402::SIGN_IN_WITH_X))
+    {
+        const PER_CHALLENGE: [&str; 5] = [
+            "nonce",
+            "issuedAt",
+            "expirationTime",
+            "notBefore",
+            "requestId",
+        ];
+        let strip_challenge = |fields: &mut serde_json::Value| {
+            if let Some(fields) = fields.as_object_mut() {
+                for key in PER_CHALLENGE {
+                    fields.remove(key);
+                }
+            }
+        };
+        strip_challenge(siwx);
+        if let Some(info) = siwx.get_mut("info") {
+            strip_challenge(info);
+        }
+    }
+    Ok(serde_json::json!({ "requirements": terms, "extensions": extensions }).to_string())
 }
 
 const UPTO_HEADER_KIND: &str = "x402-upto-header";
@@ -1324,7 +1385,7 @@ fn format_amount(amount: &str, currency: &str) -> String {
 }
 
 fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 {
-    // Mirror `parse_x402_challenge_for_network`'s selection order so the
+    // Mirror `parse_x402_challenge`'s selection order so the
     // version we report is the one whose payload the parser actually consumed.
     // If the parser took the v1 header but we reported V2 from the body, the
     // build path would emit a v2 envelope from v1-parsed requirements — same
@@ -1670,6 +1731,50 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_offer_without_a_network_is_never_payable() {
+        // draft x402 v2: `network` is a required PaymentRequirements field;
+        // a missing one must not be read as Solana mainnet.
+        let offer = |network: Option<&str>| {
+            let mut accept = serde_json::json!({
+                "scheme": "exact",
+                "amount": "10000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
+                "maxTimeoutSeconds": 300,
+                "extra": { "feePayer": "93syNmtT1tTd5ZtPwHqzGf6CM7fKhMmArpv4AM4FtyNX" }
+            });
+            if let Some(network) = network {
+                accept["network"] = network.into();
+            }
+            serde_json::json!({
+                "x402Version": 2,
+                "resource": { "url": "https://api.example.com/v1/test" },
+                "accepts": [accept]
+            })
+            .to_string()
+        };
+        let classify = |body: &str| {
+            crate::client::runner::classify_402(&[], Some(body), "https://api.example.com/v1/test")
+        };
+
+        let missing = offer(None);
+        assert!(parse(&[], Some(&missing)).is_none());
+        assert!(!matches!(
+            classify(&missing),
+            crate::client::runner::RunOutcome::X402Challenge { .. }
+        ));
+
+        // Control: the same offer naming mainnet is payable.
+        let named = offer(Some(SOLANA_MAINNET));
+        let challenge = parse(&[], Some(&named)).expect("a mainnet offer parses");
+        assert_eq!(challenge.requirements.network, SOLANA_MAINNET);
+        assert!(matches!(
+            classify(&named),
+            crate::client::runner::RunOutcome::X402Challenge { .. }
+        ));
+    }
+
+    #[test]
     fn parse_batch_prefers_the_allowlisted_blockrun_operator() {
         let exact = serde_json::json!({
             "scheme": "exact",
@@ -1982,6 +2087,7 @@ mod tests {
     }
 
     fn payment_identifier_store() -> MemoryAccountsStore {
+        crate::test_rpc::install_blockhash_rpc();
         const TEST_KEYPAIR_BYTES: [u8; 64] = [
             41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
             204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
@@ -2010,17 +2116,27 @@ mod tests {
     }
 
     fn payment_identifier_challenge(blockhash_seed: u8, amount: &str) -> Challenge {
+        payment_identifier_challenge_with_extra(blockhash_seed, amount, None)
+    }
+
+    fn payment_identifier_challenge_with_extra(
+        blockhash_seed: u8,
+        amount: &str,
+        extra: Option<serde_json::Value>,
+    ) -> Challenge {
+        // The kit reads each term from its x402 field only (RULINGS X1).
+        let mut extra = extra.unwrap_or_else(|| serde_json::json!({}));
+        extra["recentBlockhash"] = bs58::encode([blockhash_seed; 32]).into_string().into();
         Challenge {
             x402_version: pay_kit::x402::X402_VERSION_V2,
             requirements: serde_json::from_value(serde_json::json!({
                 "network": SOLANA_DEVNET,
-                "cluster": "devnet",
-                "recipient": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
+                "payTo": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
                 "amount": amount,
-                "currency": "SOL",
+                "asset": "SOL",
                 "resource": "https://provider.example/resource",
-                "maxAge": 300,
-                "recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string(),
+                "maxTimeoutSeconds": 300,
+                "extra": extra,
             }))
             .unwrap(),
             siwx: None,
@@ -2090,6 +2206,106 @@ mod tests {
         assert_ne!(
             sent_payment_identifier(&first),
             sent_payment_identifier(&next)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_payment_identifier_is_not_reused_for_another_order() {
+        let store = payment_identifier_store();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"sku\":\"widget\"}"),
+        );
+        let build = |challenge: &Challenge| {
+            build_payment_for_attempt(
+                challenge,
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        let order = |seed, memo: &str| {
+            payment_identifier_challenge_with_extra(
+                seed,
+                "1000",
+                Some(serde_json::json!({ "memo": memo, "recentSlot": seed.to_string() })),
+            )
+        };
+        let first = build(&order(1, "order-A"));
+        // Positive control: a fresh blockhash and slot for the same order
+        // is a retry and keeps its identifier.
+        let retry = build(&order(2, "order-A"));
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&retry)
+        );
+        // A different memo is a different order.
+        let other = build(&order(2, "order-B"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&other)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_fresh_sign_in_nonce_keeps_the_payment_identifier() {
+        let store = payment_identifier_store();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"q\":\"siwx\"}"),
+        );
+        let build = |challenge: &Challenge| {
+            build_payment_for_attempt(
+                challenge,
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        // Every 402 for the offer also offers sign-in with a new challenge.
+        let offer = |seed: u8, nonce: &str, domain: &str| {
+            let mut challenge = payment_identifier_challenge(seed, "1000");
+            challenge.extensions.as_mut().unwrap()["sign-in-with-x"] = serde_json::json!({
+                "info": {
+                    "domain": domain,
+                    "uri": format!("https://{domain}"),
+                    "version": "1",
+                    "nonce": nonce,
+                    "issuedAt": format!("2026-04-27T00:00:0{seed}Z"),
+                    "expirationTime": format!("2026-04-27T00:05:0{seed}Z"),
+                    "requestId": format!("req-{seed}"),
+                },
+                "supportedChains": [{
+                    "chainId": SOLANA_DEVNET,
+                    "type": "ed25519",
+                    "signatureScheme": "siws"
+                }]
+            });
+            challenge
+        };
+        let first = build(&offer(1, "nonce-1", "provider.example"));
+        let retry = build(&offer(2, "nonce-2", "provider.example"));
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&retry)
+        );
+        // Positive control: the rest of the extension is still offer terms.
+        let elsewhere = build(&offer(3, "nonce-3", "other.example"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&elsewhere)
         );
         attempt.resolved();
     }

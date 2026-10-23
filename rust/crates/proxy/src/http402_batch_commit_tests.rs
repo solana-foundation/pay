@@ -109,7 +109,7 @@ fn payment_header(requirements: &BatchRequirements, fee_payer: &Pubkey) -> (Stri
         payer: payer.to_string(),
         payer_authorizer: payer.to_string(),
         receiver: requirements.pay_to.clone(),
-        receiver_authorizer: None,
+        receiver_authorizer: requirements.extra.receiver_authorizer.clone(),
         token: requirements.asset.clone(),
         withdraw_delay: requirements.extra.withdraw_delay,
         salt: "42".into(),
@@ -147,7 +147,7 @@ fn payment_header(requirements: &BatchRequirements, fee_payer: &Pubkey) -> (Stri
 }
 
 fn channel_state(channel_id: &str, payer: &Pubkey, rent_payer: &Pubkey) -> ChannelState {
-    ChannelState {
+    let mut state = ChannelState {
         channel_id: channel_id.to_string(),
         authorized_signer: payer.to_string(),
         deposit: 5_000,
@@ -178,7 +178,17 @@ fn channel_state(channel_id: &str, payer: &Pubkey, rent_payer: &Pubkey) -> Chann
         lifecycle: None,
         schema_version: 2,
         extra: Default::default(),
-    }
+    };
+    // A fresh observation of the open channel stands in for the gateway's
+    // own chain read, so admission needs no RPC.
+    state.record_onchain_observation(
+        pay_kit::mpp::store::OnchainObservation {
+            slot: None,
+            lifecycle: pay_kit::mpp::store::ObservedLifecycle::Open,
+        },
+        now(),
+    );
+    state
 }
 
 fn now() -> u64 {
@@ -199,13 +209,11 @@ async fn forwarded_batch() -> (State, Arc<MemoryChannelStore>, String, BatchForw
     let requirements = batch.requirements("0.001").unwrap();
     let (channel_id, header) = payment_header(&requirements, &fee_payer_pubkey);
     let (_, payer) = payer();
-    store
-        .put_channel(
-            &channel_id,
-            channel_state(&channel_id, &payer, &fee_payer_pubkey),
-        )
-        .await
-        .unwrap();
+    let mut state = channel_state(&channel_id, &payer, &fee_payer_pubkey);
+    // Admission requires the record to carry this deployment's binding.
+    state.set_binding(&batch.binding());
+    state.set_grace_period(3_600);
+    store.put_channel(&channel_id, state).await.unwrap();
     let state = State {
         apis: vec![api()],
         batch,
@@ -281,10 +289,6 @@ async fn streaming_response_is_withheld_when_batch_commit_fails() {
     assert_eq!(*error.etype(), pingora::ErrorType::HTTPStatus(502));
     assert!(response.headers.get("payment-response").is_none());
     assert!(ctx.batch.is_none());
-    assert!(
-        ctx.batch_cache.is_none(),
-        "unpaid responses are never cached"
-    );
 }
 
 #[tokio::test]
@@ -349,4 +353,53 @@ async fn buffered_response_is_released_when_batch_commit_succeeds() {
     assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
     assert!(raw.to_ascii_lowercase().contains("payment-response"));
     assert!(raw.contains("protected-content"));
+}
+
+#[tokio::test]
+async fn streaming_redirect_commits_the_batch_voucher() {
+    for (status, committed) in [(303, 3_000), (307, 3_000), (404, 2_000), (500, 2_000)] {
+        let (state, store, channel_id, forward) = forwarded_batch().await;
+        let gate = Http402Gate::new(state, "127.0.0.1:1");
+        let (mut session, _client) = request_session().await;
+        let mut ctx = gate.new_ctx();
+        ctx.batch = Some(forward);
+        let mut response = ResponseHeader::build(status, None).unwrap();
+
+        gate.response_filter(&mut session, &mut response, &mut ctx)
+            .await
+            .unwrap();
+
+        let channel = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(channel.cumulative, committed, "status {status}");
+        assert_eq!(
+            response.headers.get("payment-response").is_some(),
+            committed > 2_000,
+            "status {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn buffered_redirect_commits_the_batch_voucher() {
+    for (status, committed) in [(302, 3_000), (400, 2_000)] {
+        let (state, store, channel_id, forward) = forwarded_batch().await;
+        let gate = Http402Gate::new(state, "127.0.0.1:1");
+        let (mut session, mut client) = request_session().await;
+        let mut ctx = gate.new_ctx();
+        ctx.batch = Some(forward);
+        let served = axum::response::Response::builder()
+            .status(status)
+            .header("location", "/done")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        gate.finish_inline(&mut session, &mut ctx, served)
+            .await
+            .unwrap();
+
+        let raw = read_response(&mut client).await;
+        assert!(raw.starts_with(&format!("HTTP/1.1 {status}")), "{raw}");
+        let channel = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(channel.cumulative, committed, "status {status}");
+    }
 }

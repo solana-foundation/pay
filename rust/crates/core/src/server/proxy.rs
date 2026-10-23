@@ -57,7 +57,40 @@ pub const STRIP_HEADERS: &[&str] = &[
     "x-pay-wallet-resolver-proof",
     "x-pay-payment-policy",
     "x-pay-payment-policy-version",
+    // Caller-supplied proxy routing metadata. The gateway admitted the request
+    // for its own Host; a host-aware upstream must not be steered to another
+    // tenant or resource under the gateway's upstream credential.
+    // Each `x-forwarded-*` and `x-original-*` variant is stripped by
+    // `STRIP_HEADER_PREFIXES`; these are the rest of the family.
+    "forwarded",
+    "x-real-ip",
+    "x-host",
+    "x-http-host",
+    "x-rewrite-url",
+    "x-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+    "x-cluster-client-ip",
 ];
+
+/// Header families stripped when forwarding to upstream, whatever the suffix:
+/// proxies and frameworks keep adding variants (`X-Forwarded-Server`,
+/// `X-Forwarded-Uri`, `X-Original-URL`, ...) that a host- or path-aware
+/// upstream may trust for routing.
+pub const STRIP_HEADER_PREFIXES: &[&str] = &["x-forwarded-", "x-original-"];
+
+/// Whether a caller request header must never reach the upstream. Header
+/// names compare case-insensitively; both adapters strip through this.
+pub fn is_stripped_request_header(name: &str) -> bool {
+    STRIP_HEADERS
+        .iter()
+        .any(|stripped| name.eq_ignore_ascii_case(stripped))
+        || STRIP_HEADER_PREFIXES.iter().any(|prefix| {
+            name.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+}
 
 /// Return an upstream URL that is safe to attach to logs and traces.
 ///
@@ -239,7 +272,7 @@ pub async fn forward_request_with_session_metering_and_identity(
     for (name, value) in &prepared.headers {
         upstream_req = upstream_req.header(name.as_str(), value);
     }
-    let upstream_url = upstream_url_for_logging(&prepared.url);
+    let upstream_url = prepared.url_for_logging();
 
     // Forward body. Always set content-length for POST/PUT/PATCH
     // (some upstreams like Google APIs require it even when empty).
@@ -249,8 +282,20 @@ pub async fn forward_request_with_session_metering_and_identity(
         upstream_req = upstream_req.header("content-length", "0");
     }
 
+    // Build the response meter before spending an upstream call on it.
+    let meter = match session_context {
+        Some(context) => {
+            ClientVoucherMeter::for_route(api, route, uri, headers, context).map_err(|error| {
+                // Releasing the response unmetered would hand out usage the
+                // client's vouchers never cover.
+                tracing::error!(%error, path = uri.path(), "session response metering unavailable");
+                error_response(StatusCode::BAD_GATEWAY, "Session metering unavailable")
+            })?
+        }
+        None => None,
+    };
     let upstream_resp = upstream_req.send().await.map_err(|e| {
-        let error = upstream_error_for_logging(&e);
+        let error = prepared.error_for_logging(&e);
         telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &error);
         tracing::error!(%error, upstream = %upstream_url, "Upstream request failed");
         error_response(StatusCode::BAD_GATEWAY, "Upstream request failed")
@@ -282,6 +327,9 @@ pub async fn forward_request_with_session_metering_and_identity(
             response_headers.insert(n, v);
         }
     }
+    prepared
+        .url_credentials
+        .scrub_response_headers(&mut response_headers);
 
     let mut resp = Response::builder().status(status);
     for (name, value) in &response_headers {
@@ -296,18 +344,29 @@ pub async fn forward_request_with_session_metering_and_identity(
         .split(';')
         .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"));
 
-    let stream = upstream_resp.bytes_stream();
-    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context)
+    let Some(meter) = meter
+        .and_then(|meter| meter.for_status(status))
         .map(|meter| meter.with_request_body_bytes(body.len() as u64))
-    {
+    else {
         return Ok(resp
-            .body(Body::from_stream(session_stream::meter_response_stream(
-                stream, meter, is_sse,
-            )))
+            .body(Body::from_stream(upstream_resp.bytes_stream()))
+            .unwrap());
+    };
+    if crate::server::gate::is_streaming_response(&response_headers) {
+        return Ok(resp
+            .body(Body::from_stream(
+                meter.meter_stream(upstream_resp.bytes_stream(), is_sse),
+            ))
             .unwrap());
     }
-
-    Ok(resp.body(Body::from_stream(stream)).unwrap())
+    let body = collect_upstream_body(upstream_resp, meter.body_limit())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to buffer session-metered response");
+            error_response(StatusCode::BAD_GATEWAY, "Response metering failed")
+        })?;
+    meter.settle_body(&body).await?;
+    Ok(resp.body(Body::from(body)).unwrap())
 }
 
 /// Outcome of preparing an upstream request: either a locally-built response
@@ -402,8 +461,16 @@ pub async fn prepare_upstream_with_identity(
         telemetry::record_upstream_error(&api.subdomain, uri.path(), "[invalid upstream URL]", &e);
         error_response(StatusCode::BAD_GATEWAY, &e)
     })?;
+    if let RoutingConfig::Proxy { path_rewrites, .. } = routing {
+        // Rewrite values come from the environment and may be credentials.
+        for rewrite in path_rewrites {
+            if let Ok(value) = std::env::var(&rewrite.env) {
+                prepared.url_credentials.push_path(&value);
+            }
+        }
+    }
 
-    let upstream_log_url = upstream_url_for_logging(&prepared.url);
+    let upstream_log_url = prepared.url_for_logging();
     tracing::debug!(
         subdomain = %api.subdomain,
         upstream = %upstream_log_url,
@@ -413,7 +480,7 @@ pub async fn prepare_upstream_with_identity(
     // Forward headers.
     for (name, value) in headers.iter() {
         let name_str = name.as_str();
-        if STRIP_HEADERS.contains(&name_str) {
+        if is_stripped_request_header(name_str) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -463,7 +530,7 @@ pub async fn prepare_upstream_with_identity(
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    &upstream_url_for_logging(&prepared.url),
+                    &prepared.url_for_logging(),
                     &e,
                 );
                 error_response(StatusCode::BAD_GATEWAY, &e)
@@ -498,7 +565,7 @@ pub async fn prepare_upstream_with_identity(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        &upstream_url_for_logging(&prepared.url),
+                        &prepared.url_for_logging(),
                         &format!("OAuth2 token error: {e}"),
                     );
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
@@ -520,7 +587,7 @@ pub async fn prepare_upstream_with_identity(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        &upstream_url_for_logging(&prepared.url),
+                        &prepared.url_for_logging(),
                         &e,
                     );
                     tracing::error!(error = %e, "Failed to fetch access token");
@@ -533,33 +600,141 @@ pub async fn prepare_upstream_with_identity(
     Ok(UpstreamPlan::Forward(prepared))
 }
 
-fn build_session_stream_meter(
-    api: &ApiSpec,
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-    session_context: Option<SessionStreamContext>,
-) -> Option<session_stream::SessionStreamMeter> {
-    let context = session_context?;
-    let match_method = if *method == Method::HEAD {
-        "GET"
-    } else {
-        method.as_str()
-    };
-    let path = uri.path().trim_start_matches('/');
-    let endpoint = metering::find_endpoint(api, match_method, path)?;
-    let metering = endpoint.metering.as_ref()?;
-    let props = payment::extract_request_properties(headers, path);
-    let variant_hint = payment::extract_variant_hint(path);
+/// Response meter for a client-voucher session forward: usage is released
+/// only once the client's vouchers cover it. Shared by both adapters and
+/// keyed to the endpoint the gate billed.
+pub struct ClientVoucherMeter {
+    meter: session_stream::SessionStreamMeter,
+    body_limit: usize,
+}
 
-    match session_stream::meter_from_config(metering, &props, variant_hint.as_deref(), context) {
-        Ok(Some(meter)) => Some(meter),
-        Ok(None) => None,
-        Err(error) => {
-            tracing::debug!(%error, path, "session stream metering disabled for endpoint");
-            None
+impl ClientVoucherMeter {
+    /// `Ok(None)` means the endpoint's price is not observable in the
+    /// response (request-only pricing, already covered by the admitting
+    /// voucher).
+    pub fn for_route(
+        api: &ApiSpec,
+        route: &UpstreamRoute,
+        uri: &Uri,
+        headers: &HeaderMap,
+        context: SessionStreamContext,
+    ) -> crate::server::session_metering::Result<Option<Self>> {
+        let Some(metering) = route.endpoint(api).and_then(|ep| ep.metering.as_ref()) else {
+            return Ok(None);
+        };
+        let path = uri.path().trim_start_matches('/');
+        let props = payment::extract_request_properties(headers, path);
+        let variant_hint = payment::extract_variant_hint(path);
+        // The stream meter reads provider token usage from canonical fields
+        // only. Any other configured meter on the dimensions this request
+        // bills would be replaced by its own heuristics and release a
+        // response its vouchers may not cover, so the request is refused
+        // before the upstream is called. Other variants' meters do not
+        // matter here.
+        if !session_stream::dimensions_honor_meters(metering::effective_dimensions(
+            metering,
+            variant_hint.as_deref(),
+        )) {
+            return Err(crate::server::session_metering::SessionMeteringError::UnobservableMeter);
+        }
+        let meter =
+            session_stream::meter_from_config(metering, &props, variant_hint.as_deref(), context)?;
+        Ok(meter.map(|meter| Self {
+            meter,
+            body_limit: metering::upto_response_body_limit(metering),
+        }))
+    }
+
+    /// Use the exact forwarded request body size as the missing-input bound.
+    pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
+        self.meter = self.meter.with_request_body_bytes(bytes);
+        self
+    }
+
+    /// The meter for an upstream response with `status`, or `None` to relay
+    /// it as sent. Like every other session mode, only a completed handler
+    /// (2xx or 3xx) is charged; an upstream error page carries no paid
+    /// output and need not parse as the endpoint's usage format.
+    pub fn for_status(self, status: StatusCode) -> Option<Self> {
+        crate::server::gate::handler_completed(status).then_some(self)
+    }
+
+    /// Largest complete response body this endpoint meters.
+    pub fn body_limit(&self) -> usize {
+        self.body_limit
+    }
+
+    /// Meter a streamed response: each chunk is withheld until a commit
+    /// covers the usage it carries.
+    pub fn meter_stream<S>(
+        self,
+        stream: S,
+        is_sse: bool,
+    ) -> impl futures_util::Stream<Item = Result<Bytes, session_stream::BoxError>> + Send + 'static
+    where
+        S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
+        session_stream::meter_response_stream(stream, self.meter, is_sse)
+    }
+
+    /// Meter a complete response body, returning once the client's vouchers
+    /// cover it. Its usage is known only after the whole body is read. On
+    /// failure the body must not be released; the error is the response to
+    /// send instead.
+    #[allow(clippy::result_large_err)]
+    pub async fn settle_body(self, body: &[u8]) -> Result<(), Response> {
+        match self.meter.settle_complete_body(body, false).await {
+            Ok(()) => Ok(()),
+            Err(error @ session_stream::CompleteBodyError::Unmeterable(_)) => {
+                tracing::warn!(%error, "session-metered response cannot be metered");
+                Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Response metering failed",
+                ))
+            }
+            Err(error @ session_stream::CompleteBodyError::Uncovered(_)) => {
+                tracing::warn!(%error, "session-metered response usage not covered");
+                Err(session_voucher_required_response())
+            }
         }
     }
+}
+
+/// Read a complete upstream response body, refusing one larger than `limit`.
+pub async fn collect_upstream_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, session_stream::BoxError> {
+    use futures_util::StreamExt;
+    let too_large = || -> session_stream::BoxError {
+        Box::new(std::io::Error::other(
+            "response body exceeds configured limit",
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut stream = response.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
+/// The response for a client-voucher session whose usage no voucher covered.
+pub fn session_voucher_required_response() -> Response {
+    error_response(
+        StatusCode::PAYMENT_REQUIRED,
+        "Commit a session voucher covering this response",
+    )
 }
 
 /// Resolve the API spec from a Host header subdomain.
@@ -585,6 +760,315 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
 pub struct PreparedUpstreamRequest {
     pub url: reqwest::Url,
     pub headers: Vec<(String, String)>,
+    /// Secrets the gateway placed in the upstream URL. They must never come
+    /// back to the caller (e.g. in a relayed redirect) or reach a log.
+    pub url_credentials: UrlCredentials,
+}
+
+/// Secrets the gateway placed in an upstream URL: query credentials (API
+/// keys, HMAC signatures, fetched access tokens) and environment-backed path
+/// rewrite values. Kept to scrub them from responses and diagnostics.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct UrlCredentials {
+    /// Whole query values: redacted wherever they appear.
+    query: Vec<String>,
+    /// Path segments a rewrite inserted: redacted where they form a segment,
+    /// since a short identifier can also occur as unrelated text.
+    path_segments: Vec<String>,
+}
+
+/// How a URL-bearing response header embeds its URLs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlHeaderSyntax {
+    /// The whole value is one URI reference.
+    Reference,
+    /// RFC 8288 link-values: `<uri-reference>; params`, comma separated.
+    LinkList,
+    /// `<delay>[; url=<uri-reference>]`.
+    Refresh,
+}
+
+/// Response headers that carry URLs the caller follows or reads, with how
+/// each embeds them. Every entry is scrubbed of gateway credentials, so a new
+/// URL-bearing header only needs a line here.
+pub const URL_RESPONSE_HEADERS: [(axum::http::HeaderName, UrlHeaderSyntax); 4] = [
+    (axum::http::header::LOCATION, UrlHeaderSyntax::Reference),
+    (
+        axum::http::header::CONTENT_LOCATION,
+        UrlHeaderSyntax::Reference,
+    ),
+    (axum::http::header::LINK, UrlHeaderSyntax::LinkList),
+    (
+        axum::http::HeaderName::from_static("refresh"),
+        UrlHeaderSyntax::Refresh,
+    ),
+];
+
+impl UrlCredentials {
+    fn push(&mut self, value: &str) {
+        if !value.is_empty() {
+            self.query.push(value.to_string());
+        }
+    }
+
+    /// Record a value a path rewrite inserted into the upstream path.
+    fn push_path(&mut self, value: &str) {
+        self.path_segments.extend(
+            value
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    /// `url` safe for logs, traces and telemetry: query values and any path
+    /// segment carrying a secret are redacted.
+    pub fn url_for_logging(&self, url: &reqwest::Url) -> String {
+        let mut safe = upstream_url_for_logging(url);
+        if let Ok(mut parsed) = reqwest::Url::parse(&safe)
+            && let Some(segments) = parsed.path_segments().map(|segments| {
+                segments
+                    .map(|segment| {
+                        let decoded = percent_encoding::percent_decode_str(segment)
+                            .decode_utf8_lossy()
+                            .into_owned();
+                        if self.path_segments.contains(&decoded)
+                            || self
+                                .query
+                                .iter()
+                                .any(|secret| decoded.contains(secret.as_str()))
+                        {
+                            "[REDACTED]".to_string()
+                        } else {
+                            decoded
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            && parsed
+                .path_segments_mut()
+                .map(|mut path| {
+                    path.clear().extend(segments);
+                })
+                .is_ok()
+        {
+            safe = parsed.to_string();
+        }
+        self.redact(&safe)
+    }
+
+    /// A reqwest failure safe for logs: its attached URL is redacted.
+    pub fn error_for_logging(&self, error: &reqwest::Error) -> String {
+        let mut safe = error.to_string();
+        if let Some(url) = error.url() {
+            safe = safe.replace(url.as_str(), &self.url_for_logging(url));
+        }
+        self.redact(&safe)
+    }
+
+    /// `text` with every secret, raw or percent-encoded, replaced.
+    pub fn redact(&self, text: &str) -> String {
+        let mut safe = text.to_string();
+        for secret in &self.query {
+            for form in Self::forms(secret) {
+                safe = safe.replace(&form, "[REDACTED]");
+            }
+        }
+        safe
+    }
+
+    fn forms(secret: &str) -> [String; 3] {
+        [
+            secret.to_string(),
+            url::form_urlencoded::byte_serialize(secret.as_bytes()).collect(),
+            percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        ]
+    }
+
+    fn exposed_in(&self, value: &str) -> bool {
+        let decoded = percent_encoding::percent_decode_str(value).decode_utf8_lossy();
+        self.query.iter().any(|secret| {
+            Self::forms(secret)
+                .iter()
+                .any(|form| value.contains(form.as_str()))
+                || decoded.contains(secret.as_str())
+        }) || [
+            &['/', '?', '#', '&', '='][..],
+            // Delimiters around a URL embedded in a structured header value.
+            &[
+                '/', '?', '#', '&', '=', '<', '>', ';', ',', '"', '\'', ' ', '\t',
+            ][..],
+        ]
+        .iter()
+        .any(|delimiters| {
+            decoded
+                .split(*delimiters)
+                .any(|part| self.path_segments.iter().any(|secret| secret == part))
+        })
+    }
+
+    /// `value` with every query pair carrying a credential removed, or
+    /// `None` when the credential cannot be removed from it. The rest of the
+    /// reference is kept as written, so a relative redirect still resolves
+    /// against the request it answers.
+    fn scrub_url(&self, value: &str) -> Option<String> {
+        if !self.exposed_in(value) {
+            return Some(value.to_string());
+        }
+        let (reference, fragment) = match value.split_once('#') {
+            Some((reference, fragment)) => (reference, Some(fragment)),
+            None => (value, None),
+        };
+        let (target, query) = match reference.split_once('?') {
+            Some((target, query)) => (target, Some(query)),
+            None => (reference, None),
+        };
+        let mut scrubbed = target.to_string();
+        if let Some(query) = query {
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| {
+                    !url::form_urlencoded::parse(pair.as_bytes())
+                        .any(|(_, pair)| self.query.iter().any(|secret| *secret == pair))
+                })
+                .collect();
+            if !kept.is_empty() {
+                scrubbed.push('?');
+                scrubbed.push_str(&kept.join("&"));
+            }
+        }
+        if let Some(fragment) = fragment {
+            scrubbed.push('#');
+            scrubbed.push_str(fragment);
+        }
+        (!self.exposed_in(&scrubbed)).then_some(scrubbed)
+    }
+
+    /// `value`, a list of RFC 8288 link-values, without the credentials its
+    /// targets carry. A link whose credential cannot be removed is dropped;
+    /// `None` when no link survives.
+    fn scrub_link_list(&self, value: &str) -> Option<String> {
+        let links = split_link_values(value);
+        let mut changed = false;
+        let mut kept = Vec::new();
+        for link in &links {
+            let link = link.trim();
+            if link.is_empty() {
+                continue;
+            }
+            let parsed = link.strip_prefix('<').and_then(|rest| rest.split_once('>'));
+            let scrubbed = match parsed {
+                Some((target, params)) => self
+                    .scrub_url(target)
+                    .map(|target| format!("<{target}>{params}")),
+                None => Some(link.to_string()),
+            }
+            .filter(|link| !self.exposed_in(link));
+            match scrubbed {
+                Some(scrubbed) => {
+                    changed |= scrubbed != link;
+                    kept.push(scrubbed);
+                }
+                None => changed = true,
+            }
+        }
+        if !changed {
+            return Some(value.to_string());
+        }
+        (!kept.is_empty()).then(|| kept.join(", "))
+    }
+
+    /// `value`, a `Refresh` header, without the credentials its target
+    /// carries, or `None` when they cannot be removed.
+    fn scrub_refresh(&self, value: &str) -> Option<String> {
+        let (delay, target) = match value.find([';', ',']) {
+            Some(at) => (&value[..at], value[at + 1..].trim()),
+            None => (value, ""),
+        };
+        let target = target
+            .get(..3)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("url"))
+            .and_then(|_| target[3..].trim_start().strip_prefix('='))
+            .map(str::trim_start)
+            .unwrap_or(target);
+        let target = ['"', '\'']
+            .iter()
+            .find_map(|quote| {
+                target
+                    .strip_prefix(*quote)
+                    .and_then(|rest| rest.strip_suffix(*quote))
+            })
+            .unwrap_or(target);
+        if target.is_empty() {
+            return Some(value.to_string());
+        }
+        let scrubbed = self.scrub_url(target)?;
+        if scrubbed == target {
+            return Some(value.to_string());
+        }
+        Some(format!("{}; url={scrubbed}", delay.trim()))
+    }
+
+    /// Remove injected credentials from URL-bearing response headers; a
+    /// header that would still expose one is dropped.
+    pub fn scrub_response_headers(&self, headers: &mut HeaderMap) {
+        if self.query.is_empty() && self.path_segments.is_empty() {
+            return;
+        }
+        for (name, syntax) in URL_RESPONSE_HEADERS {
+            let values: Vec<HeaderValue> = headers.get_all(&name).iter().cloned().collect();
+            if values.is_empty() {
+                continue;
+            }
+            headers.remove(&name);
+            for value in values {
+                if let Some(scrubbed) = value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| match syntax {
+                        UrlHeaderSyntax::Reference => self.scrub_url(value),
+                        UrlHeaderSyntax::LinkList => self.scrub_link_list(value),
+                        UrlHeaderSyntax::Refresh => self.scrub_refresh(value),
+                    })
+                    .filter(|value| !self.exposed_in(value))
+                    .and_then(|value| HeaderValue::from_str(&value).ok())
+                {
+                    headers.append(name.clone(), scrubbed);
+                }
+            }
+        }
+    }
+}
+
+/// Split a `Link` header into its link-values: commas inside a `<...>`
+/// target or a quoted parameter do not separate them.
+fn split_link_values(value: &str) -> Vec<&str> {
+    let mut values = Vec::new();
+    let (mut start, mut in_target, mut in_quote, mut escaped) = (0, false, false, false);
+    for (at, c) in value.char_indices() {
+        if in_quote {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '<' if !in_target => in_target = true,
+            '>' if in_target => in_target = false,
+            '"' if !in_target => in_quote = true,
+            ',' if !in_target => {
+                values.push(&value[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    values.push(&value[start..]);
+    values
 }
 
 impl std::fmt::Debug for PreparedUpstreamRequest {
@@ -596,7 +1080,7 @@ impl std::fmt::Debug for PreparedUpstreamRequest {
             .collect::<Vec<_>>();
         formatter
             .debug_struct("PreparedUpstreamRequest")
-            .field("url", &upstream_url_for_logging(&self.url))
+            .field("url", &self.url_for_logging())
             .field("header_names", &header_names)
             .finish()
     }
@@ -611,7 +1095,24 @@ impl PreparedUpstreamRequest {
         Ok(Self {
             url,
             headers: Vec::new(),
+            url_credentials: UrlCredentials::default(),
         })
+    }
+
+    /// The upstream URL safe for logs, traces and telemetry.
+    pub fn url_for_logging(&self) -> String {
+        self.url_credentials.url_for_logging(&self.url)
+    }
+
+    /// A reqwest failure for this request, safe for logs.
+    pub fn error_for_logging(&self, error: &reqwest::Error) -> String {
+        self.url_credentials.error_for_logging(error)
+    }
+
+    /// Free text that may quote this request's URL, safe for logs.
+    pub fn redact_for_logging(&self, text: &str) -> String {
+        self.url_credentials
+            .redact(&text.replace(self.url.as_str(), &self.url_for_logging()))
     }
 
     fn add_forwarded_header(&mut self, name: &str, value: &str) {
@@ -632,8 +1133,9 @@ impl PreparedUpstreamRequest {
             .map(|(_, value)| value.as_str())
     }
 
-    fn append_query_param(&mut self, name: &str, value: &str) {
+    fn append_query_credential(&mut self, name: &str, value: &str) {
         self.url.query_pairs_mut().append_pair(name, value);
+        self.url_credentials.push(value);
     }
 
     fn set_query_param(&mut self, name: &str, value: &str) {
@@ -725,7 +1227,7 @@ fn apply_prepared_request_auth(
                      can't inject `?{key}=...` into the upstream request."
                 ));
             }
-            prepared.append_query_param(key, &secret);
+            prepared.append_query_credential(key, &secret);
             Ok(())
         }
         AuthConfig::Hmac {
@@ -777,7 +1279,7 @@ async fn apply_access_token_auth(
 
     let token = access_token(fetch).await?;
     let rendered = render_access_token_template(&inject.template, &token)?;
-    apply_hmac_target(
+    apply_credential_target(
         prepared,
         &inject.target.kind,
         &inject.target.name,
@@ -831,7 +1333,7 @@ fn apply_hmac_auth(
         key_id.as_deref(),
     )?;
 
-    apply_hmac_target(
+    apply_credential_target(
         prepared,
         &auth.signature.destination.kind,
         &auth.signature.destination.name,
@@ -850,6 +1352,20 @@ fn apply_hmac_target(
     match kind {
         HmacTargetType::Header => prepared.set_header(name, value),
         HmacTargetType::QueryParam => prepared.set_query_param(name, value),
+    }
+}
+
+/// Write a credential (signature, access token) to its target, remembering a
+/// query credential so it can be scrubbed from the response.
+fn apply_credential_target(
+    prepared: &mut PreparedUpstreamRequest,
+    kind: &HmacTargetType,
+    name: &str,
+    value: &str,
+) {
+    apply_hmac_target(prepared, kind, name, value);
+    if matches!(kind, HmacTargetType::QueryParam) {
+        prepared.url_credentials.push(value);
     }
 }
 
@@ -1699,6 +2215,7 @@ mod tests {
                 "authorization".to_string(),
                 "Bearer header-secret".to_string(),
             )],
+            url_credentials: UrlCredentials::default(),
         };
 
         let debug = format!("{request:?}");
@@ -1734,6 +2251,477 @@ mod tests {
             batch_settlement: None,
             recipients: std::collections::HashMap::new(),
         }
+    }
+
+    /// A JSON upstream answer reporting 50 completion tokens.
+    const METERED_ANSWER: (StatusCode, &str, &str) = (
+        StatusCode::OK,
+        "application/json",
+        r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
+    );
+
+    /// A client-voucher session admitted at cumulative 1_000 requests `path`
+    /// from a JSON upstream reporting 50 completion tokens. Returns the first
+    /// body bytes released within 500ms, if any.
+    async fn client_voucher_first_bytes(path: &str) -> Option<Bytes> {
+        client_voucher_exchange(path, METERED_ANSWER)
+            .await
+            .0
+            .and_then(|(_, first)| first)
+    }
+
+    /// A client-voucher session admitted at cumulative 1_000 requests `path`
+    /// from an upstream answering `upstream`. Returns the status and first
+    /// body bytes released within 500ms, if any, and how many requests
+    /// reached the upstream.
+    async fn client_voucher_exchange(
+        path: &str,
+        (status, content_type, body): (StatusCode, &'static str, &'static str),
+    ) -> (Option<(StatusCode, Option<Bytes>)>, usize) {
+        use futures_util::StreamExt;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        let upstream = axum::Router::new().fallback(move || async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                body,
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await });
+
+        let metering = |dimension: serde_json::Value| {
+            serde_json::from_value(serde_json::json!({
+                "schemes": ["mpp-session"],
+                "dimensions": [dimension],
+            }))
+            .unwrap()
+        };
+        let mut api = make_api("test");
+        api.routing = RoutingConfig::Proxy {
+            url: format!("http://{addr}"),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        let mut metered = endpoint_with_routing("v1/metered", None);
+        metered.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "tokens", "scale": 1,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
+        })));
+        let mut flat = endpoint_with_routing("v1/flat", None);
+        flat.metering = Some(metering(serde_json::json!({
+            "direction": "usage", "unit": "requests", "scale": 1,
+            "tiers": [{"price_usd": 0.001}]
+        })));
+        // Scale 0 fails meter construction.
+        let mut misconfigured = endpoint_with_routing("v1/misconfigured", None);
+        misconfigured.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "tokens", "scale": 0,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
+        })));
+        // Meters the stream meter cannot observe: a response header and a
+        // custom JSON path.
+        let mut header_metered = endpoint_with_routing("v1/header-metered", None);
+        header_metered.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "bytes", "scale": 1,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_header", "header": "x-billable-bytes"}
+        })));
+        let mut custom_path = endpoint_with_routing("v1/custom-path", None);
+        custom_path.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "tokens", "scale": 1,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_json", "path": "/billing/generated"}
+        })));
+        // One variant meters canonical tokens, the other a response header:
+        // only the variant a request selects decides.
+        let mut variants = endpoint_with_routing("v1/models/{model}", None);
+        variants.metering = Some(
+            serde_json::from_value(serde_json::json!({
+                "schemes": ["mpp-session"],
+                "dimensions": [],
+                "variants": [
+                    {"param": "model", "value": "canonical-model", "dimensions": [{
+                        "direction": "output", "unit": "tokens", "scale": 1,
+                        "tiers": [{"price_usd": 0.000001}],
+                        "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
+                    }]},
+                    {"param": "model", "value": "header-model", "dimensions": [{
+                        "direction": "output", "unit": "bytes", "scale": 1,
+                        "tiers": [{"price_usd": 0.000001}],
+                        "meter": {"source": "response_header", "header": "x-billable-bytes"}
+                    }]}
+                ]
+            }))
+            .unwrap(),
+        );
+        api.endpoints = vec![
+            metered,
+            flat,
+            misconfigured,
+            header_metered,
+            custom_path,
+            variants,
+        ];
+
+        let key = || solana_pubkey::Pubkey::new_unique().to_string();
+        let handle = std::sync::Arc::new(crate::server::session::SessionMpp::new(
+            pay_kit::mpp::server::session::SessionConfig {
+                operator: key(),
+                recipient: key(),
+                currency: key(),
+                network: "localnet".to_string(),
+                ..Default::default()
+            },
+            "test-secret",
+        ));
+        let uri: Uri = format!("/{path}").parse().unwrap();
+        let route = UpstreamRoute::for_tests(&api, &Method::POST, path);
+        let served = async {
+            let response = forward_request_with_session_metering(
+                &api,
+                &route,
+                Method::POST,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+                Some(SessionStreamContext::new(handle, key(), 1_000)),
+            )
+            .await
+            .unwrap_or_else(|response| response);
+            let status = response.status();
+            let first = response.into_body().into_data_stream().next().await;
+            (status, first.map(|chunk| chunk.unwrap()))
+        };
+        let served = tokio::time::timeout(std::time::Duration::from_millis(500), served)
+            .await
+            .ok();
+        (served, hits.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn client_voucher_response_is_withheld_until_its_usage_is_covered() {
+        assert_eq!(client_voucher_first_bytes("v1/metered").await, None);
+    }
+
+    #[tokio::test]
+    async fn client_voucher_upstream_error_is_relayed_unmetered() {
+        let page = "<html><body>502 Bad Gateway</body></html>";
+        let (status, first) =
+            client_voucher_exchange("v1/metered", (StatusCode::BAD_GATEWAY, "text/html", page))
+                .await
+                .0
+                .expect("an upstream error waits on no voucher");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(first.as_deref(), Some(page.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn client_voucher_unmeterable_answer_is_a_gateway_error() {
+        let (status, first) = client_voucher_exchange(
+            "v1/metered",
+            (
+                StatusCode::OK,
+                "text/html",
+                "<html>protected-content</html>",
+            ),
+        )
+        .await
+        .0
+        .expect("an unmeterable answer waits on no voucher");
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a body the meter cannot read is no voucher shortfall"
+        );
+        assert!(
+            !String::from_utf8_lossy(&first.unwrap_or_default()).contains("protected-content"),
+            "the unmetered answer is never released"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_voucher_meter_failure_never_calls_the_upstream() {
+        let (served, hits) = client_voucher_exchange("v1/misconfigured", METERED_ANSWER).await;
+        let (status, _) = served.expect("a meter failure answers at once");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(hits, 0, "no upstream call is spent on an unmeterable route");
+
+        // Positive control: a route whose meter builds reaches the upstream.
+        let (_, hits) = client_voucher_exchange("v1/flat", METERED_ANSWER).await;
+        assert_eq!(hits, 1);
+    }
+
+    #[tokio::test]
+    async fn client_voucher_meters_it_cannot_observe_never_call_the_upstream() {
+        for path in ["v1/header-metered", "v1/custom-path"] {
+            let (served, hits) = client_voucher_exchange(path, METERED_ANSWER).await;
+            let (status, first) = served.expect("an unobservable meter answers at once");
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{path}");
+            assert!(
+                !String::from_utf8_lossy(&first.unwrap_or_default()).contains("protected-content"),
+                "{path}"
+            );
+            assert_eq!(hits, 0, "{path} spent an upstream call it cannot meter");
+        }
+        // Positive control: the canonical token meter reaches the upstream
+        // (and then waits on a voucher).
+        let (_, hits) = client_voucher_exchange("v1/metered", METERED_ANSWER).await;
+        assert_eq!(hits, 1);
+    }
+
+    /// Only the dimensions the request's variant selects must be observable:
+    /// a header meter on another variant does not refuse this one.
+    #[tokio::test]
+    async fn client_voucher_meter_check_follows_the_selected_variant() {
+        let (_, hits) = client_voucher_exchange("v1/models/canonical-model", METERED_ANSWER).await;
+        assert_eq!(hits, 1, "the canonical variant reaches the upstream");
+        let (served, hits) =
+            client_voucher_exchange("v1/models/header-model", METERED_ANSWER).await;
+        let (status, _) = served.expect("an unobservable meter answers at once");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits, 0,
+            "the header-metered variant is refused before the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_voucher_request_priced_response_is_released() {
+        let served = client_voucher_first_bytes("v1/flat").await.unwrap();
+        assert!(served.starts_with(b"{\"text\":\"protected-content\""));
+    }
+
+    #[tokio::test]
+    async fn path_rewrite_secrets_never_reach_upstream_logs() {
+        // SAFETY: test-only variable read by this test alone.
+        unsafe { std::env::set_var("_TEST_PATH_REWRITE_SECRET", "user/p4ss") };
+        let mut api = make_api("test");
+        if let RoutingConfig::Proxy { path_rewrites, .. } = &mut api.routing {
+            path_rewrites.push(pay_types::metering::PathRewrite {
+                prefix: "live/{credentials}".to_string(),
+                env: "_TEST_PATH_REWRITE_SECRET".to_string(),
+            });
+        }
+        let prepared = prepare_upstream_with_identity(
+            &api,
+            &Method::GET,
+            &"/live/x/stream-1?page=2".parse().unwrap(),
+            &HeaderMap::new(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        let UpstreamPlan::Forward(prepared) = prepared else {
+            panic!("expected proxy forwarding");
+        };
+        assert!(prepared.url.path().contains("p4ss"), "{}", prepared.url);
+
+        let logged = prepared.url_for_logging();
+        assert_eq!(
+            logged,
+            "https://api.example.com/live/[REDACTED]/[REDACTED]/stream-1?page=%5BREDACTED%5D"
+        );
+        assert!(!format!("{prepared:?}").contains("p4ss"));
+        let quoted = format!("error sending request for url ({})", prepared.url);
+        assert!(!prepared.redact_for_logging(&quoted).contains("p4ss"));
+        // Positive control: an unrelated segment keeps its value.
+        assert!(logged.contains("stream-1"));
+    }
+
+    fn credentials(values: &[&str]) -> UrlCredentials {
+        let mut credentials = UrlCredentials::default();
+        for value in values {
+            credentials.push(value);
+        }
+        credentials
+    }
+
+    #[test]
+    fn url_credentials_are_scrubbed_from_relayed_urls() {
+        let credentials = credentials(&["s3cr3t", "a+b/c"]);
+        for (location, scrubbed) in [
+            (
+                "https://up.example/next?key=s3cr3t&page=2",
+                Some("https://up.example/next?page=2"),
+            ),
+            ("/next?sig=a%2Bb%2Fc", Some("/next")),
+            ("/next?sig=a%2Bb%2Fc#top", Some("/next#top")),
+            // A credential outside the query cannot be removed: drop it.
+            ("https://up.example/s3cr3t/next", None),
+            // Relative references keep their target: only the pair goes.
+            ("next?key=s3cr3t", Some("next")),
+            ("../v2/next?page=2&key=s3cr3t", Some("../v2/next?page=2")),
+            ("?key=s3cr3t&page=2", Some("?page=2")),
+            // Positive control: unrelated redirects are relayed untouched.
+            ("/next?page=2", Some("/next?page=2")),
+        ] {
+            assert_eq!(
+                credentials.scrub_url(location).as_deref(),
+                scrubbed,
+                "{location}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::LOCATION,
+            HeaderValue::from_static("/next?key=s3cr3t"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_LOCATION,
+            HeaderValue::from_static("/s3cr3t"),
+        );
+        headers.insert("x-other", HeaderValue::from_static("s3cr3t-unrelated"));
+        credentials.scrub_response_headers(&mut headers);
+        assert_eq!(headers.get(axum::http::header::LOCATION).unwrap(), "/next");
+        assert!(headers.get(axum::http::header::CONTENT_LOCATION).is_none());
+        assert!(headers.get("x-other").is_some());
+    }
+
+    #[test]
+    fn url_credentials_are_scrubbed_from_link_and_refresh_headers() {
+        let mut credentials = credentials(&["s3cr3t"]);
+        credentials.push_path("live-t0ken");
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::LINK,
+            HeaderValue::from_static(
+                "</next?key=s3cr3t&page=2>; rel=\"next\", \
+                 <https://up.example/live-t0ken/prev>; rel=\"prev\", \
+                 </docs?a=1,2>; rel=\"help\"; title=\"x, y\"",
+            ),
+        );
+        headers.append(
+            axum::http::header::LINK,
+            HeaderValue::from_static("<https://up.example/live-t0ken>; rel=\"self\""),
+        );
+        headers.append(
+            axum::http::HeaderName::from_static("refresh"),
+            HeaderValue::from_static("5; URL='/next?key=s3cr3t&page=2'"),
+        );
+        credentials.scrub_response_headers(&mut headers);
+        let links: Vec<_> = headers
+            .get_all(axum::http::header::LINK)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        // The credential pair goes, an irremovable link is dropped, and an
+        // unrelated link (commas inside its target and title) is kept whole.
+        assert_eq!(
+            links,
+            [r#"</next?page=2>; rel="next", </docs?a=1,2>; rel="help"; title="x, y""#]
+        );
+        assert_eq!(headers.get("refresh").unwrap(), "5; url=/next?page=2");
+
+        for (refresh, scrubbed) in [
+            ("0;url=https://up.example/live-t0ken/next", None),
+            (
+                "3, https://up.example/next?key=s3cr3t",
+                Some("3; url=https://up.example/next"),
+            ),
+            // Positive controls: nothing to remove is relayed as written.
+            ("5; url=/next?page=2", Some("5; url=/next?page=2")),
+            ("10", Some("10")),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("refresh", HeaderValue::from_str(refresh).unwrap());
+            credentials.scrub_response_headers(&mut headers);
+            assert_eq!(
+                headers.get("refresh").map(|value| value.to_str().unwrap()),
+                scrubbed,
+                "{refresh}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::LINK,
+            HeaderValue::from_static("</next?page=2>; rel=\"next\""),
+        );
+        credentials.scrub_response_headers(&mut headers);
+        assert_eq!(
+            headers.get(axum::http::header::LINK).unwrap(),
+            "</next?page=2>; rel=\"next\""
+        );
+    }
+
+    #[test]
+    fn path_rewrite_credentials_are_never_relayed_in_urls() {
+        let mut credentials = UrlCredentials::default();
+        credentials.push_path("live-t0ken");
+        for (location, scrubbed) in [
+            ("https://up.example/live/live-t0ken/next", None),
+            ("/live/live%2Dt0ken", None),
+            ("/next?from=live-t0ken", None),
+            // Positive control: a segment that merely contains it is kept.
+            ("/live/live-t0kens", Some("/live/live-t0kens")),
+            ("/next?page=2", Some("/next?page=2")),
+        ] {
+            assert_eq!(
+                credentials.scrub_url(location).as_deref(),
+                scrubbed,
+                "{location}"
+            );
+        }
+
+        // With no query credential at all, the URL headers are still checked.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::LOCATION,
+            HeaderValue::from_static("https://up.example/live/live-t0ken/next"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_LOCATION,
+            HeaderValue::from_static("/live/other"),
+        );
+        credentials.scrub_response_headers(&mut headers);
+        assert!(headers.get(axum::http::header::LOCATION).is_none());
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_LOCATION).unwrap(),
+            "/live/other"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_redirects_never_relay_the_query_api_key() {
+        let upstream = axum::Router::new().fallback(|uri: Uri| async move {
+            (
+                StatusCode::FOUND,
+                [(
+                    axum::http::header::LOCATION,
+                    format!("/landing?{}", uri.query().unwrap_or("")),
+                )],
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await });
+        let mut api = api_with_auth(Some(AuthConfig::QueryParam {
+            key: "key".to_string(),
+            // PATH is always set; its value stands in for the API key.
+            value_from_env: "PATH".to_string(),
+        }));
+        if let RoutingConfig::Proxy { url, .. } = &mut api.routing {
+            *url = format!("http://{addr}");
+        }
+        let uri: Uri = "/v1/data?page=2".parse().unwrap();
+
+        let response = forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/landing?page=2");
     }
 
     fn api_with_auth(auth: Option<AuthConfig>) -> ApiSpec {
@@ -2094,6 +3082,69 @@ mod tests {
         assert!(STRIP_HEADERS.contains(&"x-pay-verified-payer"));
         assert!(STRIP_HEADERS.contains(&"x-pay-verified-channel"));
         assert!(STRIP_HEADERS.contains(&"x-pay-original-host"));
+    }
+
+    #[test]
+    fn stripped_request_headers_match_any_case_and_family_variant() {
+        for name in [
+            "Host",
+            "X-Forwarded-Host",
+            "x-forwarded-anything-new",
+            "X-ORIGINAL-URL",
+            "X-Pay-Verified-Payer",
+        ] {
+            assert!(is_stripped_request_header(name), "{name}");
+        }
+        // Positive controls: ordinary and look-alike headers pass through.
+        for name in ["x-request-id", "x-forwarded", "x-originality", "accept"] {
+            assert!(!is_stripped_request_header(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_proxy_routing_headers_never_reach_the_upstream() {
+        let api = make_api("test");
+        let mut headers = HeaderMap::new();
+        for name in [
+            "forwarded",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-forwarded-for",
+            "x-real-ip",
+            // Variants outside the original list.
+            "x-forwarded-server",
+            "x-forwarded-uri",
+            "x-forwarded-scheme",
+            "x-original-host",
+            "x-original-url",
+            "x-rewrite-url",
+            "x-host",
+            "true-client-ip",
+        ] {
+            headers.insert(name, HeaderValue::from_static("other-tenant.example"));
+        }
+        // Positive control: ordinary caller headers still pass through.
+        headers.insert("x-request-id", HeaderValue::from_static("abc"));
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            None,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        for (name, _) in &headers {
+            if name.as_str() != "x-request-id" {
+                assert_eq!(prepared.header_value(name.as_str()), None, "{name}");
+            }
+        }
+        assert_eq!(prepared.header_value("x-request-id"), Some("abc"));
     }
 
     #[tokio::test]

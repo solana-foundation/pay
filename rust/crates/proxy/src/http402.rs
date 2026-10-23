@@ -26,20 +26,21 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    BatchForward, GateDecision, GateRequest, GateResponse, MAX_BATCH_CACHED_RESPONSE_BYTES,
-    PaidRequestTelemetry, PaymentGate, ReceiptAnnotation, SessionForward, UpstreamRoute,
-    UptoPaymentTelemetry, batch_cached_response, cache_batch_response, commit_batch, release_batch,
-    resolve_api, settle_batch, settle_delegated_session as settle_delegated_session_forward,
-    settle_upto, settle_upto_metered,
+    BatchForward, GateDecision, GateRequest, GateResponse, PaidRequestTelemetry, PaymentGate,
+    ReceiptAnnotation, SessionForward, UpstreamRoute, UptoPaymentTelemetry, commit_batch,
+    release_batch, resolve_api, settle_batch,
+    settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
 use pay_core::server::proxy::{
-    STRIP_HEADERS, UpstreamPlan, prepare_upstream_with_identity, redact_url_in_error,
-    routing_signs_request_body, upstream_error_for_logging, upstream_http_client,
-    upstream_url_for_logging,
+    ClientVoucherMeter, URL_RESPONSE_HEADERS, UpstreamPlan, UrlCredentials, collect_upstream_body,
+    is_stripped_request_header, prepare_upstream_with_identity, routing_signs_request_body,
+    upstream_http_client,
 };
-use pay_core::server::session_stream::DelegatedSessionStreamMeter;
+use pay_core::server::session_stream::{
+    BoxError, DelegatedSessionStreamMeter, SessionStreamContext,
+};
 use pay_core::server::telemetry;
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
@@ -51,6 +52,9 @@ const BUFFERED_REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
 
 /// Where a non-`Respond` request should be proxied.
+// One per request, and the API target is the common case: boxing it would
+// only add an allocation.
+#[allow(clippy::large_enum_variant)]
 enum Target {
     /// Real API upstream resolved from the endpoint spec via `prepare_upstream`.
     Api {
@@ -63,6 +67,9 @@ enum Target {
         upstream: String,
         /// Forwarded client headers (minus stripped) + injected auth headers.
         headers: Vec<(String, String)>,
+        /// Credentials injected into the upstream query, scrubbed from the
+        /// response before it reaches the caller.
+        url_credentials: UrlCredentials,
     },
     /// Internal axum service that serves the control plane.
     ControlPlane,
@@ -77,15 +84,13 @@ pub struct Ctx {
     /// responded). Taken when settled, so it's never double-settled.
     upto: Option<PendingUpto>,
     batch: Option<BatchForward>,
-    /// A successfully committed streaming response whose body is still being
-    /// captured for idempotent replay. Keeping the outcome until `logging`
-    /// lets pay-kit attach the complete representation after end-of-stream.
-    batch_cache: Option<BatchForward>,
-    batch_response: Option<BatchResponseCapture>,
     /// A delegated MPP session opened pre-serve. Observable streams authorize
     /// cumulative usage before each chunk is released; other responses are
     /// buffered and settled before the body is returned.
     session: Option<SessionForward>,
+    /// A client-voucher MPP session whose endpoint prices response usage:
+    /// the response is released only as the client's vouchers cover it.
+    client_meter: Option<ClientVoucherMeter>,
     /// Present only for payment-backed forwards. Consumed by `logging`, where
     /// Pingora exposes the final downstream status for every forwarding path.
     paid_request: Option<PaidRequestTelemetry>,
@@ -117,38 +122,6 @@ struct PendingUpto {
     settle_amount: u64,
     settlement: Option<UptoSettlementPlan>,
     telemetry: UptoPaymentTelemetry,
-}
-
-struct BatchResponseCapture {
-    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
-    complete: bool,
-}
-
-impl BatchResponseCapture {
-    fn start(status: StatusCode, headers: &HeaderMap) -> Option<Self> {
-        let declared = headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared.is_some_and(|length| length > MAX_BATCH_CACHED_RESPONSE_BYTES) {
-            return None;
-        }
-        Some(Self {
-            cached: Some(batch_cached_response(status, headers, &[])),
-            complete: declared == Some(0),
-        })
-    }
-
-    fn push(&mut self, chunk: &[u8], end_of_stream: bool) {
-        if let Some(cached) = &mut self.cached {
-            if cached.body.len().saturating_add(chunk.len()) <= MAX_BATCH_CACHED_RESPONSE_BYTES {
-                cached.body.extend_from_slice(chunk);
-            } else {
-                self.cached = None;
-            }
-        }
-        self.complete = end_of_stream;
-    }
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -307,9 +280,15 @@ impl<S: PaymentState> Http402Gate<S> {
         ctx: &mut Ctx,
         resp: axum::response::Response,
     ) -> pingora::Result<()> {
-        let served_ok = resp.status().is_success();
+        let status = resp.status();
         match self
-            .drain_payment_headers_with_response(ctx, served_ok, None, &HeaderMap::new(), None)
+            .drain_payment_headers_with_response(
+                ctx,
+                status.is_success(),
+                Some(status),
+                &HeaderMap::new(),
+                None,
+            )
             .await
         {
             Ok(extra) => write_axum_response(session, resp, extra).await,
@@ -370,17 +349,7 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         if let Some(pending) = ctx.batch.take() {
-            match settle_batch(
-                &self.state,
-                pending,
-                served_ok,
-                response_status
-                    .zip(response_body)
-                    .filter(|(_, body)| body.len() <= MAX_BATCH_CACHED_RESPONSE_BYTES)
-                    .map(|(status, body)| batch_cached_response(status, response_headers, body)),
-            )
-            .await
-            {
+            match settle_batch(&self.state, pending, response_status).await {
                 Ok(Some(header)) => extra.push(header),
                 Ok(None) => {}
                 Err(error) => {
@@ -508,6 +477,31 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
+        // Price the forward from the exact body it sends, as the axum adapter
+        // does: the body's model selects the variant the meter rates.
+        let mut forwarded_headers = headers.clone();
+        let body = match pay_core::server::payment::prepare_metered_forward_body(
+            path,
+            headers,
+            &body,
+            ctx.session.as_mut(),
+            ctx.upto
+                .as_mut()
+                .and_then(|pending| pending.settlement.as_mut()),
+        ) {
+            Ok(Some(prepared)) if prepared[..] != body[..] => {
+                forwarded_headers.insert(http::header::CONTENT_LENGTH, prepared.len().into());
+                Bytes::from(prepared)
+            }
+            Ok(_) => body,
+            Err(rejection) => {
+                self.finish_buffered_axum_response(session, ctx, rejection.into_response())
+                    .await?;
+                return Ok(true);
+            }
+        };
+        let headers = &forwarded_headers;
+
         let prepared = match self
             .prepare_buffered_request(
                 api,
@@ -533,20 +527,14 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
-        let response_limit = ctx
-            .upto
-            .as_ref()
-            .and_then(|pending| pending.settlement.as_ref())
-            .or_else(|| {
-                ctx.session
-                    .as_ref()
-                    .and_then(|pending| pending.metered_plan())
-            })
-            .map(|plan| metering::upto_response_body_limit(&plan.metering))
-            // Body-signing endpoints are buffered for request preparation, not
-            // response metering. Allow their normal API responses up to the same
-            // bounded size as their requests.
-            .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT);
+        let response_limit = buffered_response_limit(
+            ctx.upto
+                .as_ref()
+                .and_then(|pending| pending.settlement.as_ref()),
+            ctx.session
+                .as_ref()
+                .and_then(|pending| pending.metered_plan()),
+        );
 
         let client = upstream_http_client();
         let mut upstream_req = client.request(
@@ -570,8 +558,8 @@ impl<S: PaymentState> Http402Gate<S> {
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                let error = upstream_error_for_logging(&e);
-                let upstream = upstream_url_for_logging(&prepared.url);
+                let error = prepared.error_for_logging(&e);
+                let upstream = prepared.url_for_logging();
                 telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream, &error);
                 tracing::error!(%error, %upstream, "buffered upstream request failed");
                 let extra = self.drain_payment_headers(ctx, false).await;
@@ -593,11 +581,27 @@ impl<S: PaymentState> Http402Gate<S> {
             telemetry::record_upstream_error(
                 &api.subdomain,
                 uri.path(),
-                &upstream_url_for_logging(&prepared.url),
+                &prepared.url_for_logging(),
                 &format!("upstream returned {status}"),
             );
         }
-        let response_headers = filtered_response_headers(upstream.headers());
+        let mut response_headers = filtered_response_headers(upstream.headers());
+        prepared
+            .url_credentials
+            .scrub_response_headers(&mut response_headers);
+        // A client-voucher session pays as it reads: its whole response goes
+        // through the meter that waits on the client's commits.
+        let mut client_meter = ctx
+            .client_meter
+            .take()
+            .and_then(|meter| meter.for_status(status))
+            .map(|meter| meter.with_request_body_bytes(body.len() as u64));
+        let client_voucher = client_meter.is_some();
+        if let Some(meter) = client_meter.take_if(|_| !is_streamed_response(&response_headers)) {
+            return self
+                .serve_client_voucher_body(session, ctx, status, response_headers, upstream, meter)
+                .await;
+        }
         if is_streamed_response(&response_headers)
             && ctx
                 .session
@@ -615,10 +619,11 @@ impl<S: PaymentState> Http402Gate<S> {
             .session
             .as_ref()
             .is_some_and(DelegatedSessionStreamMeter::supports);
-        if is_streamed_response(&response_headers)
-            && ctx.upto.is_none()
-            && (ctx.session.is_none() || delegated_stream)
-            && ctx.batch.is_none()
+        if client_voucher
+            || (is_streamed_response(&response_headers)
+                && ctx.upto.is_none()
+                && (ctx.session.is_none() || delegated_stream)
+                && ctx.batch.is_none())
         {
             let extra = self
                 .drain_payment_headers_with_response(
@@ -638,6 +643,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 upstream,
                 extra,
                 body.len() as u64,
+                client_meter,
             )
             .await?;
             tracing::debug!(
@@ -646,14 +652,14 @@ impl<S: PaymentState> Http402Gate<S> {
             );
             return Ok(true);
         }
-        let body = match collect_reqwest_body(upstream, response_limit).await {
+        let body = match collect_upstream_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
-                let error = redact_url_in_error(&e.to_string(), &prepared.url);
+                let error = prepared.redact_for_logging(&e.to_string());
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    &upstream_url_for_logging(&prepared.url),
+                    &prepared.url_for_logging(),
                     &error,
                 );
                 tracing::warn!(%error, "failed to buffer upstream response body");
@@ -671,12 +677,7 @@ impl<S: PaymentState> Http402Gate<S> {
         };
 
         self.observe_buffered_metered_response(ctx, &response_headers, &body);
-        if pay_core::server::gate::session_response_served(
-            status,
-            ctx.session
-                .as_ref()
-                .is_some_and(|forward| forward.deadline().is_some()),
-        ) {
+        if pay_core::server::gate::handler_completed(status) {
             match self
                 .settle_delegated_session(ctx, &response_headers, &body)
                 .await
@@ -727,6 +728,7 @@ impl<S: PaymentState> Http402Gate<S> {
         upstream: reqwest::Response,
         extra: Vec<(HeaderName, HeaderValue)>,
         request_body_bytes: u64,
+        client_meter: Option<ClientVoucherMeter>,
     ) -> pingora::Result<()> {
         let is_sse = is_sse_response(&headers);
         let mut delegated_meter = match ctx.session.take() {
@@ -761,24 +763,36 @@ impl<S: PaymentState> Http402Gate<S> {
             .map(|log| log.start)
             .unwrap_or_else(std::time::Instant::now);
         let mut observer = crate::observer::StreamObserver::new(true);
-        let mut stream = upstream.bytes_stream();
+        let upstream = upstream.bytes_stream();
+        let mut stream: std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = Result<Bytes, BoxError>> + Send>,
+        > = match client_meter {
+            Some(meter) => Box::pin(meter.meter_stream(upstream, is_sse)),
+            None => Box::pin(upstream.map(|chunk| chunk.map_err(BoxError::from))),
+        };
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
                     observer.on_chunk(&chunk, request_start);
-                    if let Some(meter) = delegated_meter.as_mut() {
-                        meter
-                            .authorize_chunk(&chunk, is_sse)
-                            .await
-                            .map_err(|error| {
-                                pingora::Error::because(
-                                    pingora::ErrorType::ReadError,
-                                    "authorize delegated response stream chunk",
-                                    error,
-                                )
-                            })?;
+                    // A delegated meter releases only metered, complete records.
+                    let ready = match delegated_meter.as_mut() {
+                        Some(meter) => {
+                            meter
+                                .authorize_chunk(&chunk, is_sse)
+                                .await
+                                .map_err(|error| {
+                                    pingora::Error::because(
+                                        pingora::ErrorType::ReadError,
+                                        "authorize delegated response stream chunk",
+                                        error,
+                                    )
+                                })?
+                        }
+                        None => Some(chunk),
+                    };
+                    if let Some(ready) = ready {
+                        session.write_response_body(Some(ready), false).await?;
                     }
-                    session.write_response_body(Some(chunk), false).await?;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "streaming body-signing upstream response failed");
@@ -801,13 +815,16 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         if let Some(meter) = delegated_meter.as_mut() {
-            meter.finish_stream(is_sse).await.map_err(|error| {
+            let tail = meter.finish_stream(is_sse).await.map_err(|error| {
                 pingora::Error::because(
                     pingora::ErrorType::ReadError,
                     "finish delegated response stream metering",
                     error,
                 )
             })?;
+            if let Some(tail) = tail {
+                session.write_response_body(Some(tail), false).await?;
+            }
         }
         observer.finish();
         if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
@@ -816,6 +833,43 @@ impl<S: PaymentState> Http402Gate<S> {
         ctx.buffered_usage = Some(observer.usage);
         session.write_response_body(None, true).await?;
         Ok(())
+    }
+
+    /// Serve a complete client-voucher session response only once the
+    /// client's vouchers cover its usage.
+    async fn serve_client_voucher_body(
+        &self,
+        session: &mut Session,
+        ctx: &mut Ctx,
+        status: StatusCode,
+        headers: HeaderMap,
+        upstream: reqwest::Response,
+        meter: ClientVoucherMeter,
+    ) -> pingora::Result<bool> {
+        let body = match collect_upstream_body(upstream, meter.body_limit()).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(%error, "failed to buffer session-metered response");
+                let extra = self.drain_payment_headers(ctx, false).await;
+                write_buffered_response(
+                    session,
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::from_static(b"{\"error\":\"response_metering_failed\"}"),
+                    extra,
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
+        if let Err(response) = meter.settle_body(&body).await {
+            self.finish_buffered_axum_response(session, ctx, response)
+                .await?;
+            return Ok(true);
+        }
+        let extra = self.drain_payment_headers(ctx, status.is_success()).await;
+        write_buffered_response(session, status, headers, body, extra).await?;
+        Ok(true)
     }
 
     fn observe_buffered_metered_response(&self, ctx: &mut Ctx, headers: &HeaderMap, body: &[u8]) {
@@ -884,12 +938,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
             }
         };
-        if pay_core::server::gate::session_response_served(
-            status,
-            ctx.session
-                .as_ref()
-                .is_some_and(|forward| forward.deadline().is_some()),
-        ) {
+        if pay_core::server::gate::handler_completed(status) {
             match self.settle_delegated_session(ctx, &headers, &body).await {
                 Ok(Some(receipt)) => ctx.receipt = Some(receipt),
                 Ok(None) => {}
@@ -932,9 +981,8 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             receipt: None,
             upto: None,
             batch: None,
-            batch_cache: None,
-            batch_response: None,
             session: None,
+            client_meter: None,
             paid_request: None,
             log: None,
             observer: None,
@@ -1071,25 +1119,62 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 });
                 ctx.session = session_forward.map(|pending| *pending);
                 // Delegated sessions always settle before releasing a
-                // successful response, including fixed-price endpoints. x402
-                // `upto` only needs this path when pricing consumes response
-                // usage; its fixed-price path can settle in response_filter.
+                // successful response, including fixed-price endpoints, and a
+                // client-voucher session's response is withheld until the
+                // client's vouchers cover its usage; both need the metered
+                // adapter. x402 `upto` only needs this path when pricing
+                // consumes response usage; its fixed-price path can settle in
+                // response_filter.
                 let delegated_session = ctx
                     .session
                     .as_ref()
-                    .and_then(|pending| pending.settlement.as_ref())
-                    .is_some();
-                let response_metered_upto = ctx
-                    .upto
-                    .as_ref()
-                    .and_then(|pending| pending.settlement.as_ref())
-                    .is_some_and(|plan| {
-                        metering::upto_requires_response_body(
-                            &plan.metering,
-                            plan.variant_hint.as_deref(),
-                        )
-                    });
-                if delegated_session || response_metered_upto {
+                    .is_some_and(|pending| pending.settlement.is_some());
+                if let Some(forward) = ctx.session.take_if(|pending| pending.settlement.is_none()) {
+                    let Some(api) = self.resolve_api(host.as_deref().unwrap_or("")) else {
+                        return self
+                            .plan_upstream(
+                                ctx,
+                                &path,
+                                host.as_deref(),
+                                &method,
+                                &uri,
+                                &headers,
+                                session,
+                                Some(&route),
+                                false,
+                            )
+                            .await;
+                    };
+                    let context = SessionStreamContext::new(
+                        std::sync::Arc::clone(&forward.handle),
+                        forward.channel_id.clone(),
+                        forward.committed_base_units,
+                    );
+                    match ClientVoucherMeter::for_route(api, &route, &uri, &headers, context) {
+                        Ok(meter) => ctx.client_meter = meter,
+                        Err(error) => {
+                            tracing::error!(%error, path, "session response metering unavailable");
+                            write_buffered_response(
+                                session,
+                                StatusCode::BAD_GATEWAY,
+                                HeaderMap::new(),
+                                Bytes::from_static(b"{\"error\":\"session_metering_failed\"}"),
+                                Vec::new(),
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                    }
+                    // Request-only pricing: the admitting voucher covers it.
+                    if ctx.client_meter.is_none() {
+                        ctx.session = Some(forward);
+                    }
+                }
+                if settles_on_completed_body(
+                    delegated_session,
+                    ctx.client_meter.is_some(),
+                    ctx.upto.is_some(),
+                ) {
                     return self
                         .forward_buffered(
                             session,
@@ -1189,9 +1274,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             if let Ok(uri) = path_and_query.parse::<Uri>() {
                 let _ = upstream_request.set_uri(uri);
             }
-            for h in STRIP_HEADERS {
-                upstream_request.remove_header(*h);
-            }
+            strip_caller_headers(upstream_request);
             let _ = upstream_request.insert_header("host", host_header.clone());
             for (k, v) in headers {
                 let _ = upstream_request.insert_header(k.clone(), v.clone());
@@ -1206,6 +1289,12 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> pingora::Result<()> {
+        if let Some(Target::Api {
+            url_credentials, ..
+        }) = &ctx.target
+        {
+            scrub_url_credentials(url_credentials, upstream_response);
+        }
         if upstream_response.status.is_server_error()
             && let Some(Target::Api {
                 subdomain,
@@ -1233,9 +1322,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             }
         }
         // Start the inference telemetry observer for hosts that opted into
-        // in-flight tracking. Response-body-metered x402-upto requests never
-        // reach this path because they are buffered before downstream headers
-        // are written so the PAYMENT-RESPONSE receipt can be attached.
+        // in-flight tracking. x402-upto requests never reach this path: they
+        // are buffered so they settle on a completed body, before downstream
+        // headers carry the PAYMENT-RESPONSE receipt.
         let observe_inference = ctx.log.as_ref().is_some_and(|log| log.log_id.is_some());
         if observe_inference {
             ctx.observer = Some(crate::observer::StreamObserver::new(is_streamed_response(
@@ -1243,37 +1332,22 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             )));
         }
 
-        // x402 `upto`: the upstream responded. Settle the channel now (debit
-        // on a 2xx, refund otherwise) and attach the PAYMENT-RESPONSE receipt
-        // before the response streams downstream. Response-body-metered upto
-        // requests were handled by `forward_upto_buffered`, so this inline path
-        // only covers fixed-amount plans.
+        // x402 `upto` settles only once its body completed, on the buffered
+        // path. Charging here, at headers, would keep the payment of a
+        // response that then fails mid-body: refund and withhold instead.
         if let Some(pending) = ctx.upto.take() {
-            let served_ok = upstream_response.status.is_success();
-            match self
-                .settle_pending_upto(pending, served_ok, &upstream_response.headers, None)
-                .await
-            {
-                Ok(Some((name, value))) => {
-                    let _ = upstream_response.insert_header(name.clone(), value.clone());
-                    ctx.logged_payment_headers.push((name, value));
-                }
-                Ok(None) => {}
-                // Headers are not yet sent: fail the request instead of
-                // releasing a response whose charge did not settle.
-                Err(error) => {
-                    tracing::error!(%error, "x402 upto settlement failed; withholding response");
-                    return Err(batch_commit_failed_error());
-                }
-            }
+            tracing::error!("x402 upto reached the native response path; refunding");
+            let _ = self
+                .settle_pending_upto(pending, false, &upstream_response.headers, None)
+                .await;
+            return Err(batch_commit_failed_error());
         }
         // Batch authorization is also post-response. Unlike `upto`, its hot
         // path commits only Redis state; on-chain claim/distribution belongs
         // to pay-worker. This must happen here (before headers are sent) so a
         // successful proxied response cannot drop its reservation uncharged.
         if let Some(pending) = ctx.batch.take() {
-            let served_ok = upstream_response.status.is_success();
-            if served_ok {
+            if pay_core::server::gate::handler_completed(upstream_response.status) {
                 match commit_batch(&self.state, &pending).await {
                     Ok(Some((name, value))) => {
                         let _ = upstream_response.insert_header(name.clone(), value.clone());
@@ -1287,13 +1361,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         tracing::error!(%error, "x402 batch commit failed; withholding response");
                         return Err(batch_commit_failed_error());
                     }
-                }
-                if let Some(capture) = BatchResponseCapture::start(
-                    upstream_response.status,
-                    &upstream_response.headers,
-                ) {
-                    ctx.batch_cache = Some(pending);
-                    ctx.batch_response = Some(capture);
                 }
             } else {
                 release_batch(&self.state, pending).await;
@@ -1312,9 +1379,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         end_of_stream: bool,
         ctx: &mut Ctx,
     ) -> pingora::Result<Option<std::time::Duration>> {
-        if let Some(capture) = ctx.batch_response.as_mut() {
-            capture.push(body.as_deref().unwrap_or_default(), end_of_stream);
-        }
         let Some(observer) = ctx.observer.as_mut() else {
             return Ok(None);
         };
@@ -1350,17 +1414,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // An x402 `upto` channel still held here means a terminal hook did not
         // drain it (for example, response_filter never ran because upstream
         // connect/response failed). Refund rather than stranding funds. A
-        // successful response-body-metered channel is settled before headers
-        // are written in `forward_upto_buffered`, so its receipt reaches the
-        // client as a normal PAYMENT-RESPONSE header.
+        // successful channel is settled on the buffered path before headers
+        // are written, so its receipt reaches the client as a normal
+        // PAYMENT-RESPONSE header.
         let mut deferred_payment_headers = Vec::new();
-        if let Some(forward) = ctx.batch_cache.take()
-            && let Some(capture) = ctx.batch_response.take()
-            && capture.complete
-            && let Some(cached) = capture.cached
-        {
-            cache_batch_response(&self.state, &forward, cached).await;
-        }
         // Covers cancellation/disconnect paths that bypassed all explicit
         // drains. Dropping the session releases its capacity lease.
         ctx.session.take();
@@ -1514,6 +1571,35 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
 /// ASCII byte, which would silently drop a `WWW-Authenticate` whose challenge
 /// description carries a non-ASCII char (e.g. an em-dash). PDB's correlation
 /// engine keys on that header, so dropping it means the flow never appears.
+/// Whether a payment-backed forward must read its whole upstream body before
+/// it settles and releases the response: delegated sessions and metered
+/// client vouchers rate the body, and x402 `upto` (fixed price included)
+/// charges only for a response that was delivered complete.
+fn settles_on_completed_body(delegated_session: bool, client_metered: bool, upto: bool) -> bool {
+    delegated_session || client_metered || upto
+}
+
+/// Largest upstream body a buffered forward reads. An `upto` plan is
+/// bounded by what its pricing reads: a header-metered response is buffered
+/// only so the charge waits for a complete body, not to be parsed.
+fn buffered_response_limit(
+    upto: Option<&UptoSettlementPlan>,
+    session: Option<&UptoSettlementPlan>,
+) -> usize {
+    if let Some(plan) = upto {
+        return metering::upto_buffered_response_limit(
+            &plan.metering,
+            plan.variant_hint.as_deref(),
+        );
+    }
+    session
+        .map(|plan| metering::upto_response_body_limit(&plan.metering))
+        // Fixed-price upto and body-signing endpoints are buffered for
+        // completion or request preparation, not response metering. Allow
+        // their normal API responses up to the same bounded size as requests.
+        .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT)
+}
+
 fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
@@ -1568,13 +1654,45 @@ fn is_control_plane(path: &str) -> bool {
         || path.starts_with(".well-known/")
 }
 
+/// Remove every caller header the upstream must not see from Pingora's
+/// native request, which it forwards separately from the sanitized headers.
+fn strip_caller_headers(upstream_request: &mut RequestHeader) {
+    let stripped: Vec<HeaderName> = upstream_request
+        .headers
+        .keys()
+        .filter(|name| is_stripped_request_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in stripped {
+        upstream_request.remove_header(&name);
+    }
+}
+
+/// Remove gateway query credentials from a natively proxied response's
+/// URL-bearing headers before they are written downstream.
+fn scrub_url_credentials(credentials: &UrlCredentials, response: &mut ResponseHeader) {
+    let mut scrubbed = response.headers.clone();
+    credentials.scrub_response_headers(&mut scrubbed);
+    for (name, _) in URL_RESPONSE_HEADERS {
+        let before: Vec<HeaderValue> = response.headers.get_all(&name).iter().cloned().collect();
+        let after: Vec<HeaderValue> = scrubbed.get_all(&name).iter().cloned().collect();
+        if before == after {
+            continue;
+        }
+        response.remove_header(&name);
+        for value in after {
+            let _ = response.append_header(name.clone(), value);
+        }
+    }
+}
+
 /// Split a prepared upstream request into a connectable [`Target::Api`].
 fn target_from_prepared(
     prepared: pay_core::server::proxy::PreparedUpstreamRequest,
     subdomain: String,
 ) -> Target {
+    let upstream = prepared.url_for_logging();
     let url = prepared.url;
-    let upstream = upstream_url_for_logging(&url);
     let tls = url.scheme() == "https";
     let host = url.host_str().unwrap_or("").to_string();
     let port = url
@@ -1599,6 +1717,7 @@ fn target_from_prepared(
         subdomain,
         upstream,
         headers: prepared.headers,
+        url_credentials: prepared.url_credentials,
     }
 }
 
@@ -1622,25 +1741,6 @@ async fn read_downstream_body(session: &mut Session, limit: usize) -> pingora::R
                 pingora::ErrorType::HTTPStatus(413),
                 "buffered request body too large",
             ));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf.freeze())
-}
-
-async fn collect_reqwest_body(response: reqwest::Response, limit: usize) -> anyhow::Result<Bytes> {
-    if let Some(content_length) = response.content_length()
-        && content_length as usize > limit
-    {
-        anyhow::bail!("response body exceeds configured limit");
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut buf = BytesMut::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if buf.len().saturating_add(chunk.len()) > limit {
-            anyhow::bail!("response body exceeds configured limit");
         }
         buf.extend_from_slice(&chunk);
     }
@@ -1806,9 +1906,8 @@ mod batch_commit_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
-        buffered_upstream_headers, filtered_response_headers, gateway_host, header_pairs,
-        is_control_plane, is_streamed_response, request_host,
+        Http402Gate, buffered_upstream_headers, filtered_response_headers, gateway_host,
+        header_pairs, is_control_plane, is_streamed_response, request_host,
     };
     use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
     use pay_core::PaymentState;
@@ -2261,6 +2360,27 @@ mod tests {
     }
 
     #[test]
+    fn native_requests_drop_every_caller_routing_header_variant() {
+        let mut request = pingora::http::RequestHeader::build("GET", b"/v1", None).unwrap();
+        for name in [
+            "X-Forwarded-Host",
+            "x-forwarded-server",
+            "X-Original-URL",
+            "Forwarded",
+            "X-Pay-Verified-Payer",
+        ] {
+            request.append_header(name, "other-tenant.example").unwrap();
+        }
+        request.append_header("X-Forwarded-For", "1.2.3.4").unwrap();
+        request.append_header("x-forwarded-for", "5.6.7.8").unwrap();
+        // Positive control: an ordinary caller header is forwarded.
+        request.append_header("X-Request-Id", "abc").unwrap();
+        super::strip_caller_headers(&mut request);
+        let names: Vec<_> = request.headers.keys().map(|name| name.as_str()).collect();
+        assert_eq!(names, ["x-request-id"]);
+    }
+
+    #[test]
     fn request_host_ignores_caller_forwarded_host() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2407,40 +2527,6 @@ mod tests {
         for path in ["v1/messages", "v1/chat/completions", "api/chat"] {
             assert!(!is_control_plane(path), "{path} must be tracked");
         }
-    }
-
-    #[test]
-    fn batch_response_capture_requires_complete_bounded_body() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("6"));
-        let mut capture =
-            BatchResponseCapture::start(StatusCode::CREATED, &headers).expect("bounded");
-
-        capture.push(b"abc", false);
-        assert!(!capture.complete);
-        capture.push(b"def", true);
-
-        assert!(capture.complete);
-        assert_eq!(
-            capture.cached.as_ref().map(|cached| cached.body.as_slice()),
-            Some(b"abcdef".as_slice())
-        );
-    }
-
-    #[test]
-    fn batch_response_capture_rejects_or_drops_oversized_bodies() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_LENGTH,
-            HeaderValue::from_str(&(MAX_BATCH_CACHED_RESPONSE_BYTES + 1).to_string()).unwrap(),
-        );
-        assert!(BatchResponseCapture::start(StatusCode::OK, &headers).is_none());
-
-        let mut capture = BatchResponseCapture::start(StatusCode::OK, &HeaderMap::new())
-            .expect("unknown length starts bounded");
-        capture.push(&vec![0; MAX_BATCH_CACHED_RESPONSE_BYTES + 1], true);
-        assert!(capture.complete);
-        assert!(capture.cached.is_none());
     }
 
     #[test]
@@ -2671,6 +2757,329 @@ mod tests {
             panic!("the selected endpoint proxies; another endpoint's override must not apply");
         };
         assert_eq!(prepared.url.host_str(), Some("upstream.example"));
+    }
+
+    /// Serves one client-voucher session request on `path` through the
+    /// buffered adapter and returns what reached the client within `wait`.
+    async fn client_voucher_response(path: &str, wait: std::time::Duration) -> String {
+        client_voucher_response_from(
+            path,
+            wait,
+            (
+                StatusCode::OK,
+                "application/json",
+                r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
+            ),
+        )
+        .await
+    }
+
+    /// [`client_voucher_response`] from an upstream answering `upstream`.
+    async fn client_voucher_response_from(
+        path: &str,
+        wait: std::time::Duration,
+        (status, content_type, body): (StatusCode, &'static str, &'static str),
+    ) -> String {
+        use pay_types::metering::{
+            BillingUnit, Endpoint, HttpMethod, MeterDimension, MeterDirection, Metering, PriceTier,
+            Scheme, UsageMeter, UsageMeterSource,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = axum::Router::new().fallback(move || async move {
+            (status, [(http::header::CONTENT_TYPE, content_type)], body)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await });
+
+        let dimension = |direction, unit, meter| MeterDimension {
+            direction,
+            unit,
+            scale: 1,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.000001,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter,
+        };
+        let endpoint = |path: &str, metering| Endpoint {
+            method: HttpMethod::Post,
+            path: path.to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering,
+            subscription: None,
+        };
+        let mut api = body_signing_api();
+        api.routing = RoutingConfig::Proxy {
+            url: format!("http://{upstream_addr}"),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        api.endpoints = vec![endpoint("v1/metered", None), endpoint("v1/flat", None)];
+        // The gate only mints a route for an endpoint it admitted. Admit the
+        // free variant, then serve the same endpoint index with its metering.
+        let route = match pay_core::server::gate::PaymentGate::new(BodySigningState {
+            apis: vec![api.clone()],
+        })
+        .evaluate(&pay_core::server::gate::GateRequest {
+            method: &http::Method::POST,
+            path,
+            host: Some("signed.example"),
+            accept: None,
+            authorization: None,
+            content_length: None,
+            query: None,
+            x402_payment: None,
+        })
+        .await
+        {
+            pay_core::server::gate::GateDecision::Passthrough(route) => route,
+            _ => panic!("a free endpoint is a passthrough"),
+        };
+        let metering = |dimension| Metering {
+            dimensions: vec![dimension],
+            schemes: Some(vec![Scheme::MppSession]),
+            ..Default::default()
+        };
+        api.endpoints[0].metering = Some(metering(dimension(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            Some(UsageMeter {
+                source: UsageMeterSource::ResponseJson,
+                path: Some("/usage/completion_tokens".to_string()),
+                header: None,
+            }),
+        )));
+        api.endpoints[1].metering = Some(metering(dimension(
+            MeterDirection::Usage,
+            BillingUnit::Requests,
+            None,
+        )));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /{path} HTTP/1.1\r\nHost: signed.example\r\nContent-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let stream = pingora::protocols::l4::stream::Stream::from(server);
+        let mut session = pingora::proxy::Session::new_h1(Box::new(stream));
+        assert!(session.read_request().await.unwrap());
+
+        let key = || solana_pubkey::Pubkey::new_unique().to_string();
+        let handle = std::sync::Arc::new(pay_core::server::session::SessionMpp::new(
+            pay_kit::mpp::server::session::SessionConfig {
+                operator: key(),
+                recipient: key(),
+                currency: key(),
+                network: "localnet".to_string(),
+                ..Default::default()
+            },
+            "test-secret",
+        ));
+        let headers = session.req_header().headers.clone();
+        let uri = session.req_header().uri.clone();
+        // What request_filter installs for a client voucher admitted at 1_000.
+        let client_meter = super::ClientVoucherMeter::for_route(
+            &api,
+            &route,
+            &uri,
+            &headers,
+            super::SessionStreamContext::new(handle, key(), 1_000),
+        )
+        .unwrap();
+        let gate = Http402Gate::new(BodySigningState { apis: vec![api] }, "127.0.0.1:1");
+        let mut ctx = pingora::proxy::ProxyHttp::new_ctx(&gate);
+        ctx.client_meter = client_meter;
+        let serve = gate.forward_buffered(
+            &mut session,
+            &mut ctx,
+            path,
+            &route,
+            Some("signed.example"),
+            &http::Method::POST,
+            &uri,
+            &headers,
+        );
+        // The meter waits for a client commit that never comes; only what is
+        // released within `wait` reaches the client.
+        let _ = tokio::time::timeout(wait, serve).await;
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), client.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    #[tokio::test]
+    async fn client_voucher_response_usage_waits_for_the_client_voucher() {
+        let served =
+            client_voucher_response("v1/metered", std::time::Duration::from_millis(500)).await;
+        assert!(
+            !served.contains("protected-content"),
+            "usage beyond the admitting voucher must be withheld: {served}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_voucher_upstream_error_is_relayed_unmetered() {
+        let served = client_voucher_response_from(
+            "v1/metered",
+            std::time::Duration::from_secs(5),
+            (
+                StatusCode::BAD_GATEWAY,
+                "text/html",
+                "<html><body>upstream-down</body></html>",
+            ),
+        )
+        .await;
+        assert!(served.starts_with("HTTP/1.1 502"), "{served}");
+        assert!(served.contains("upstream-down"), "{served}");
+    }
+
+    #[tokio::test]
+    async fn client_voucher_unmeterable_answer_is_a_gateway_error() {
+        let served = client_voucher_response_from(
+            "v1/metered",
+            std::time::Duration::from_secs(5),
+            (
+                StatusCode::OK,
+                "text/html",
+                "<html>protected-content</html>",
+            ),
+        )
+        .await;
+        assert!(served.starts_with("HTTP/1.1 502"), "{served}");
+        assert!(!served.contains("protected-content"), "{served}");
+    }
+
+    #[tokio::test]
+    async fn client_voucher_request_priced_response_is_served() {
+        let served = client_voucher_response("v1/flat", std::time::Duration::from_secs(5)).await;
+        assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+        assert!(served.contains("protected-content"), "{served}");
+    }
+
+    #[tokio::test]
+    async fn native_responses_never_relay_url_credentials() {
+        let mut api = body_signing_api();
+        api.routing = RoutingConfig::Proxy {
+            url: "https://upstream.example".to_string(),
+            path_rewrites: vec![],
+            // PATH is always set; its value stands in for the API key.
+            auth: Some(Box::new(AuthConfig::QueryParam {
+                key: "key".to_string(),
+                value_from_env: "PATH".to_string(),
+            })),
+        };
+        let state = BodySigningState { apis: vec![api] };
+        let pay_core::server::gate::GateDecision::Passthrough(route) =
+            pay_core::server::gate::PaymentGate::new(state.clone())
+                .evaluate(&pay_core::server::gate::GateRequest {
+                    method: &http::Method::GET,
+                    path: "v1/data",
+                    host: Some("signed.example"),
+                    accept: None,
+                    authorization: None,
+                    content_length: None,
+                    query: None,
+                    x402_payment: None,
+                })
+                .await
+        else {
+            panic!("an endpoint-less API passes through");
+        };
+        let UpstreamPlan::Forward(prepared) = pay_core::server::proxy::prepare_upstream(
+            &state.apis[0],
+            &route,
+            &http::Method::GET,
+            &"/v1/data?page=2".parse().unwrap(),
+            &HeaderMap::new(),
+            b"",
+        )
+        .await
+        .expect("request prepares") else {
+            panic!("expected a proxied upstream");
+        };
+        let echoed = format!("/landing?{}", prepared.url.query().unwrap());
+        let super::Target::Api {
+            url_credentials, ..
+        } = super::target_from_prepared(prepared, "signed".to_string())
+        else {
+            panic!("expected an API target");
+        };
+
+        let mut response = super::ResponseHeader::build(302, None).unwrap();
+        response.insert_header("location", echoed.as_str()).unwrap();
+        response.insert_header("x-other", "kept").unwrap();
+        super::scrub_url_credentials(&url_credentials, &mut response);
+
+        assert_eq!(response.headers["location"], "/landing?page=2");
+        assert_eq!(response.headers["x-other"], "kept");
+    }
+
+    #[test]
+    fn header_metered_upto_responses_are_not_capped_at_the_metering_limit() {
+        let plan = |meter: serde_json::Value| pay_core::server::metering::UptoSettlementPlan {
+            metering: serde_json::from_value(serde_json::json!({
+                "dimensions": [{
+                    "direction": "usage", "unit": "tokens", "scale": 1000,
+                    "tiers": [{"price_usd": 0.02}], "meter": meter,
+                }],
+                "upto": {"max_usd": 1.0},
+            }))
+            .unwrap(),
+            variant_hint: None,
+            request_properties: Default::default(),
+            ceiling_usd: 1.0,
+            inferred_usage: None,
+        };
+        let header = plan(serde_json::json!({"source": "response_header", "header": "x-usage"}));
+        let body = plan(serde_json::json!({"source": "response_json", "path": "/usage"}));
+        // A header-metered body is buffered only so the charge waits for it.
+        assert!(super::buffered_response_limit(Some(&header), None) > 2 * 1024 * 1024);
+        // Positive control: a body-metered plan keeps its 1 MiB parse bound,
+        // and a fixed-price upto keeps the generic buffered bound.
+        assert_eq!(
+            super::buffered_response_limit(Some(&body), None),
+            1024 * 1024
+        );
+        assert_eq!(
+            super::buffered_response_limit(None, None),
+            super::BUFFERED_REQUEST_BODY_LIMIT
+        );
+    }
+
+    #[test]
+    fn every_upto_settles_on_a_completed_body() {
+        // Fixed-price upto included: charging at headers keeps the payment of
+        // a body that then fails.
+        assert!(super::settles_on_completed_body(false, false, true));
+        assert!(super::settles_on_completed_body(true, false, false));
+        assert!(super::settles_on_completed_body(false, true, false));
+        // Request-priced client vouchers, exact and batch stay native.
+        assert!(!super::settles_on_completed_body(false, false, false));
     }
 
     #[test]

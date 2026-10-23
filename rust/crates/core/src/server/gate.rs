@@ -48,11 +48,6 @@ const PAYMENT_PAGE_CSP: &str = "\
     connect-src 'self' http://localhost:* http://127.0.0.1:* https:; \
     worker-src 'self'";
 
-/// Match pay-kit's bounded representation cache. Larger or streaming bodies
-/// keep settlement-only replay semantics instead of growing channel state
-/// without bound.
-pub const MAX_BATCH_CACHED_RESPONSE_BYTES: usize = 1024 * 1024;
-
 /// Convert a wire path to the gate's static-route convention without collapsing
 /// distinct upstream paths. Reject ambiguous paths before policy resolution.
 pub fn gate_path(path: &str) -> Result<&str, GateResponse> {
@@ -143,11 +138,11 @@ pub struct PaidRequestTelemetry {
     pub payment: Option<telemetry::PaymentAmount>,
 }
 
-/// Whether a protected handler completed and its delegated session must be
-/// charged: any 2xx, and for static sessions any 3xx, since a redirect can
-/// follow a completed side effect. Deployment leases charge only 2xx.
-pub fn session_response_served(status: StatusCode, deployment: bool) -> bool {
-    status.is_success() || (!deployment && status.is_redirection())
+/// Whether a protected handler completed and its post-serve charge (an x402
+/// `batch-settlement` commit, a delegated session, static or deployment) must
+/// land: any 2xx or 3xx, since a redirect can follow a completed side effect.
+pub fn handler_completed(status: StatusCode) -> bool {
+    status.is_success() || status.is_redirection()
 }
 
 /// Streaming media types handled consistently by both HTTP adapters.
@@ -195,6 +190,10 @@ pub struct SessionForward {
     pub payment_policy: Option<String>,
     /// Releases the exclusive capacity reservation on every terminal path.
     pub(crate) _reservation: Option<DelegatedCapacityLease>,
+    /// The request's authentication under an operator-signed session; every
+    /// delegated charge takes it. `None` for a client-voucher forward, which
+    /// is never charged by the operator.
+    pub delegated: Option<Arc<crate::server::session::DelegatedUse>>,
 }
 
 impl SessionForward {
@@ -228,10 +227,42 @@ impl SessionForward {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn delegated(
+    /// A session admitted on the client's own voucher at `cumulative`. Its
+    /// response is metered by waiting on the client's further commits.
+    pub fn client_voucher(
         handle: Arc<SessionMpp>,
         channel_id: String,
+        cumulative: u64,
+        verified_payer: Option<String>,
+    ) -> Self {
+        Self {
+            handle,
+            channel_id,
+            committed_base_units: cumulative,
+            settlement: None,
+            available_base_units: 0,
+            authorized_base_units: cumulative,
+            verified_payer,
+            request_body_bytes: None,
+            payment_policy: None,
+            _reservation: None,
+            delegated: None,
+        }
+    }
+
+    /// The authenticated request a delegated charge takes, or an error for a
+    /// forward that no `use` proof admitted.
+    pub fn delegated_use(&self) -> Result<&Arc<crate::server::session::DelegatedUse>, String> {
+        self.delegated
+            .as_ref()
+            .ok_or_else(|| "delegated charge requires an authenticated request".to_string())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn delegated(
+        handle: Arc<SessionMpp>,
+        delegated: Arc<crate::server::session::DelegatedUse>,
         committed_base_units: u64,
         settlement: metering::UptoSettlementPlan,
         capacity_base_units: (u64, u64),
@@ -240,7 +271,7 @@ impl SessionForward {
     ) -> Self {
         Self {
             handle,
-            channel_id,
+            channel_id: delegated.channel_id().to_string(),
             committed_base_units,
             settlement: Some(SessionSettlementPlan::Metered(Box::new(settlement))),
             available_base_units: capacity_base_units.0,
@@ -249,6 +280,7 @@ impl SessionForward {
             request_body_bytes: None,
             payment_policy: None,
             _reservation: Some(reservation),
+            delegated: Some(delegated),
         }
     }
 }
@@ -358,7 +390,7 @@ pub async fn settle_delegated_session(
     let acceptance = pending
         .handle
         .authorize_reserved_usage(
-            &pending.channel_id,
+            pending.delegated_use()?,
             base_units,
             pending._reservation.as_ref(),
         )
@@ -488,10 +520,14 @@ impl UpstreamRoute {
     /// Routing of the endpoint the gate selected, else the API default, so
     /// forwarding can never use a different endpoint than billing did.
     pub(crate) fn routing<'a>(&self, api: &'a ApiSpec) -> &'a RoutingConfig {
-        self.endpoint
-            .and_then(|i| api.endpoints.get(i))
+        self.endpoint(api)
             .and_then(|ep| ep.routing.as_ref())
             .unwrap_or(&api.routing)
+    }
+
+    /// The endpoint the gate selected (and billed) for this request.
+    pub(crate) fn endpoint<'a>(&self, api: &'a ApiSpec) -> Option<&'a Endpoint> {
+        self.endpoint.and_then(|i| api.endpoints.get(i))
     }
 
     /// Whether this admission covers `method` on the wire path `path` of `api`.
@@ -673,7 +709,10 @@ impl<S: PaymentState> PaymentGate<S> {
         }
         if let Some(resolver) = self.deployment_policy_resolver.as_deref() {
             match req.host.map(|host| resolver.classify_host(host)) {
-                Some(Ok(PolicyHost::Apex)) => {}
+                // The apex is the control plane only. Static API routing
+                // (single-API fallback, endpoint-less passthrough) would admit
+                // unpaid traffic that no deployment policy priced.
+                Some(Ok(PolicyHost::Apex)) => return GateDecision::Local,
                 Some(Ok(PolicyHost::Deployment(hostname))) => {
                     return self.evaluate_deployment(resolver, &hostname, req).await;
                 }
@@ -1072,8 +1111,11 @@ impl<S: PaymentState> PaymentGate<S> {
             let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             // Parity with MPP charge external_id: resource plus per-challenge
             // suffix, so repeated same-route payments are distinct on-chain.
+            // The method is part of the binding: GET and POST may share one
+            // resource but are different operations.
+            let binding = x402_exact_binding(req, resource);
             let memo = crate::server::payment::resource_memo_with_nonce(
-                resource,
+                binding.as_deref(),
                 pay_kit::x402::exact::MAX_MEMO_BYTES,
             );
             match x402.payment_required_header(
@@ -1112,7 +1154,10 @@ impl<S: PaymentState> PaymentGate<S> {
             // debits actual usage and refunds the rest.
             let amount = metering::upto_max_usd(meter, price.as_ref())
                 .map(|usd| format!("{usd}"))
-                .ok_or_else(|| "x402-upto with several dimensions requires upto.max_usd".into());
+                .ok_or_else(|| {
+                    "x402-upto with several or usage-metered dimensions requires upto.max_usd"
+                        .into()
+                });
             let route = upto_route(req, path);
             match amount.and_then(|amount| {
                 upto.payment_required_header_for_route(&amount, Some(&route))
@@ -1249,7 +1294,8 @@ impl<S: PaymentState> PaymentGate<S> {
                     .unwrap_or_default(),
             ))
         };
-        let memo = match x402_exact_payment_memo(x402, pay_header, resource) {
+        let binding = x402_exact_binding(req, resource);
+        let memo = match x402_exact_payment_memo(x402, pay_header, binding.as_deref()) {
             Ok(memo) => memo,
             Err(e) => return reject(e),
         };
@@ -1339,7 +1385,7 @@ impl<S: PaymentState> PaymentGate<S> {
             return GateDecision::Respond(GateResponse::json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Bytes::from_static(
-                    br#"{"error":"payment_configuration_error","message":"x402-upto with several dimensions requires upto.max_usd"}"#,
+                    br#"{"error":"payment_configuration_error","message":"x402-upto with several or usage-metered dimensions requires upto.max_usd"}"#,
                 ),
             ));
         };
@@ -1476,12 +1522,8 @@ impl<S: PaymentState> PaymentGate<S> {
             // rather than a conflict — the scheme requires the recorded
             // response for this commitment, and refusing it would leave a paid
             // request unrecoverable.
-            BatchAccess::Replay(settlement, cached) => {
-                return GateDecision::Respond(batch_replay_response(
-                    batch,
-                    &settlement,
-                    cached.as_ref(),
-                ));
+            BatchAccess::Replay(settlement, _) => {
+                return GateDecision::Respond(batch_replay_response(batch, &settlement));
             }
             // Another in-flight request owns this authorization. This is the
             // one case that is genuinely a conflict, and it is retryable.
@@ -1506,7 +1548,7 @@ impl<S: PaymentState> PaymentGate<S> {
             BatchAccess::Resume(outcome) => {
                 return match batch.finish_commit(&outcome).await {
                     Ok(settlement) => {
-                        GateDecision::Respond(batch_replay_response(batch, &settlement, None))
+                        GateDecision::Respond(batch_replay_response(batch, &settlement))
                     }
                     Err(e) => {
                         telemetry::record_settlement_error(
@@ -2068,34 +2110,15 @@ fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -
 fn batch_replay_response(
     batch: &X402BatchSettlement,
     settlement: &pay_kit::x402::batch_settlement::BatchSettlementResponse,
-    cached: Option<&pay_kit::core::store::CachedUpstreamResponse>,
 ) -> GateResponse {
-    let mut resp = if let Some(cached) = cached {
-        let mut response =
-            GateResponse::new(StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK))
-                .body(cached.body.clone());
-        if let Some(content_type) = &cached.content_type {
-            response = response.header(header::CONTENT_TYPE, content_type);
-        }
-        for (name, value) in &cached.headers {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                response.headers.push((name, value));
-            }
-        }
-        response
-    } else {
-        GateResponse::json(
-            StatusCode::OK,
-            serde_json::to_vec(&json!({
-                "status": "already_settled",
-                "message": "this authorization was already charged; its payment result is attached",
-            }))
-            .unwrap_or_default(),
-        )
-    };
+    let mut resp = GateResponse::json(
+        StatusCode::OK,
+        serde_json::to_vec(&json!({
+            "status": "already_settled",
+            "message": "this authorization was already charged; its payment result is attached",
+        }))
+        .unwrap_or_default(),
+    );
     if let Ok(v) = HeaderValue::from_str("true") {
         resp.headers
             .push((HeaderName::from_static("payment-replay"), v));
@@ -2111,71 +2134,12 @@ fn batch_replay_response(
     resp
 }
 
-/// Build the bounded, end-to-end portion of an upstream response that is safe
-/// to reproduce for an idempotent batch authorization replay.
-pub fn batch_cached_response(
-    status: StatusCode,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> pay_kit::core::store::CachedUpstreamResponse {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let headers = headers
-        .iter()
-        .filter(|(name, _)| is_replayable_batch_response_header(name))
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
-    pay_kit::core::store::CachedUpstreamResponse {
-        status: status.as_u16(),
-        content_type,
-        headers,
-        body: body.to_vec(),
-    }
-}
-
-fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "accept-ranges"
-            | "cache-control"
-            | "content-security-policy"
-            | "content-security-policy-report-only"
-            | "content-disposition"
-            | "content-encoding"
-            | "content-language"
-            | "content-location"
-            | "content-range"
-            | "cross-origin-embedder-policy"
-            | "cross-origin-opener-policy"
-            | "cross-origin-resource-policy"
-            | "etag"
-            | "expires"
-            | "last-modified"
-            | "location"
-            | "permissions-policy"
-            | "referrer-policy"
-            | "reporting-endpoints"
-            | "strict-transport-security"
-            | "vary"
-            | "x-content-type-options"
-            | "x-frame-options"
-            | "x-permitted-cross-domain-policies"
-            | "x-xss-protection"
-    )
-}
-
 /// Commit an x402 `batch-settlement` voucher after the resource was served
 /// (the adapter's post-response hook).
 ///
-/// This is the step that charges the client, so it runs only on a successful
-/// serve. On failure the outcome is dropped instead: the watermark never
+/// This is the step that charges the client, so it runs only for a response
+/// whose handler completed ([`handler_completed`], redirects included);
+/// `None` means nothing was served. On failure the outcome is dropped instead: the watermark never
 /// advances, the channel's in-flight guard is released, and the client may
 /// retry the identical voucher.
 ///
@@ -2188,37 +2152,22 @@ fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
 pub async fn settle_batch<S: PaymentState>(
     state: &S,
     forward: BatchForward,
-    served_ok: bool,
-    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
+    response_status: Option<StatusCode>,
 ) -> Result<Option<(HeaderName, HeaderValue)>, String> {
-    if !served_ok {
+    if !response_status.is_some_and(handler_completed) {
         release_batch(state, forward).await;
         return Ok(None);
     }
-    settle_batch_confirmed(state, forward, cached).await
+    commit_batch_result(state, &forward).await
 }
 
-/// Commit a successfully served batch authorization while retaining its
-/// outcome long enough for a streaming adapter to cache the completed body.
-/// `Err` means the charge is unconfirmed and the response must not be released.
+/// Commit a batch authorization whose handler already completed, for an
+/// adapter that checked the response status itself. `Err` means the charge is unconfirmed and the response must not be released.
 pub async fn commit_batch<S: PaymentState>(
     state: &S,
     forward: &BatchForward,
 ) -> Result<Option<(HeaderName, HeaderValue)>, String> {
     commit_batch_result(state, forward).await
-}
-
-/// Keep confirmed charging distinct from optional receipt encoding.
-pub(super) async fn settle_batch_confirmed<S: PaymentState>(
-    state: &S,
-    forward: BatchForward,
-    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
-) -> Result<Option<(HeaderName, HeaderValue)>, String> {
-    let receipt = commit_batch_result(state, &forward).await?;
-    if let Some(cached) = cached {
-        cache_batch_response(state, &forward, cached).await;
-    }
-    Ok(receipt)
 }
 
 async fn commit_batch_result<S: PaymentState>(
@@ -2351,25 +2300,6 @@ pub async fn release_batch<S: PaymentState>(state: &S, forward: BatchForward) {
             &forward.telemetry.path,
             &e.to_string(),
             false,
-        );
-    }
-}
-
-/// Persist a completed upstream representation after its payment commitment.
-/// This is best effort: the client already received the original response.
-pub async fn cache_batch_response<S: PaymentState>(
-    state: &S,
-    forward: &BatchForward,
-    cached: pay_kit::core::store::CachedUpstreamResponse,
-) {
-    let Some(batch) = state.x402_batch() else {
-        return;
-    };
-    if let Err(error) = batch.cache_response(&forward.outcome, cached).await {
-        tracing::warn!(
-            %error,
-            channel_id = %forward.outcome.channel_id,
-            "failed to cache x402 batch response"
         );
     }
 }
@@ -2534,16 +2464,36 @@ fn upto_collected_amount_usd(
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.
-/// The protected route an MPP charge challenge is bound to: method, API and
-/// path with query, so a credential for one route never runs another's
-/// handler even when their payment terms are equal.
+/// The protected route an MPP charge challenge is bound to: method, full
+/// request authority and path with query, so a credential for one route never
+/// runs another's handler even when their payment terms are equal. The API is
+/// selected by the first host label alone, so the whole authority is bound:
+/// two hosts sharing that label may front different upstream operations.
 fn charge_route(req: &GateRequest<'_>, subdomain: &str, path: &str) -> String {
     let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    let authority = req
+        .host
+        .map(canonical_authority)
+        .filter(|authority| !authority.is_empty())
+        .unwrap_or_else(|| subdomain.to_string());
     format!(
-        "{} {subdomain}/{}{query}",
+        "{} {authority}/{}{query}",
         req.method,
         path.trim_start_matches('/')
     )
+}
+
+/// One spelling per authority: hostnames are case-insensitive and may carry
+/// a trailing root dot. The port is kept as presented, so `host` and
+/// `host:8443` are distinct routes.
+fn canonical_authority(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{}:{port}", name.trim_end_matches('.'))
+        }
+        _ => host.trim_end_matches('.').to_string(),
+    }
 }
 
 /// The request identity an x402 `upto` authorization is bound to: method,
@@ -2563,6 +2513,13 @@ fn reconstruct_uri(path: &str, query: Option<&str>) -> http::Uri {
     .unwrap_or_default()
 }
 
+/// The endpoint identity an x402 `exact` memo binds: request method plus the
+/// configured resource. `None` when the endpoint names no resource.
+fn x402_exact_binding(req: &GateRequest<'_>, resource: Option<&str>) -> Option<String> {
+    let resource = resource.map(str::trim).filter(|r| !r.is_empty())?;
+    Some(format!("{} {resource}", req.method))
+}
+
 fn x402_exact_payment_memo(
     x402: &X402,
     pay_header: &str,
@@ -2575,14 +2532,17 @@ fn x402_exact_payment_memo(
         Ok(envelope) => envelope,
         Err(_) => return Ok(None),
     };
-    let Some(memo) = envelope
-        .accepted
-        .as_ref()
-        .and_then(|accepted| accepted.get("extra"))
+    let Some(accepted) = envelope.accepted.as_ref() else {
+        return Ok(None);
+    };
+    // A resource-bound endpoint always advertises a memo; an offer echoed
+    // without one would verify unbound, so it never names this endpoint.
+    let Some(memo) = accepted
+        .get("extra")
         .and_then(|extra| extra.get("memo"))
         .and_then(|memo| memo.as_str())
     else {
-        return Ok(None);
+        return Err("x402 exact payment is missing the endpoint resource memo".to_string());
     };
     if crate::server::payment::resource_memo_matches(
         memo,
@@ -2731,7 +2691,11 @@ async fn session_authorized(
         .process_credential_for_route(credential, route_amount)
         .await
     {
-        Ok(SessionOutcome::Active { state, signature }) => {
+        Ok(SessionOutcome::Active {
+            state,
+            signature,
+            delegated,
+        }) => {
             if sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Client {
                 let mut response = GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
@@ -2754,6 +2718,25 @@ async fn session_authorized(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Bytes::from_static(br#"{"error":"session_backend_unavailable"}"#),
                 ));
+            };
+            // A `topUp` raises the deposit but authenticates no request; only a
+            // `use` proof (or the proof an `open` binds) does.
+            let Some(delegated) = delegated else {
+                let mut response = GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "session_use_required",
+                        "message": "The channel is funded; authenticate the request with the session's use proof.",
+                        "channelId": state.channel_id,
+                    }))
+                    .unwrap_or_default(),
+                );
+                if let Some(reference) = signature {
+                    response
+                        .headers
+                        .extend(session_receipt_annotation(sm.network(), reference).headers);
+                }
+                return GateDecision::Respond(response);
             };
             let available_base_units = state.deposit.saturating_sub(state.cumulative);
             let indivisible_price = match pricing {
@@ -2838,6 +2821,7 @@ async fn session_authorized(
                     request_body_bytes: None,
                     payment_policy: None,
                     _reservation: Some(reservation),
+                    delegated: Some(delegated),
                 })),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
@@ -2857,18 +2841,12 @@ async fn session_authorized(
         }) => GateDecision::Forward {
             route: upstream,
             session: handle.map(|h| {
-                Box::new(SessionForward {
-                    handle: h,
+                Box::new(SessionForward::client_voucher(
+                    h,
                     channel_id,
-                    committed_base_units: cumulative,
-                    settlement: None,
-                    available_base_units: 0,
-                    authorized_base_units: cumulative,
+                    cumulative,
                     verified_payer,
-                    request_body_bytes: None,
-                    payment_policy: None,
-                    _reservation: None,
-                })
+                ))
             }),
             receipt: None,
             upto: None,
@@ -2942,6 +2920,39 @@ mod tests {
     }
 
     #[test]
+    fn charge_route_binds_the_full_request_authority() {
+        let get = Method::GET;
+        let route = |host: Option<&'static str>| {
+            let mut request = req(&get, "reports");
+            request.host = host;
+            charge_route(&request, "api", "reports")
+        };
+        assert_eq!(
+            route(Some("api.example.com")),
+            "GET api.example.com/reports"
+        );
+        // Hosts sharing the API label are different routes.
+        assert_ne!(
+            route(Some("api.example.com")),
+            route(Some("api.attacker.net"))
+        );
+        assert_ne!(
+            route(Some("api.example.com")),
+            route(Some("api.example.com:8443"))
+        );
+        // Spellings of one authority are one route.
+        assert_eq!(
+            route(Some("API.Example.com.")),
+            route(Some("api.example.com"))
+        );
+        assert_eq!(
+            route(Some("api.example.com.:8443")),
+            route(Some("api.example.com:8443"))
+        );
+        assert_eq!(route(None), "GET api/reports");
+    }
+
+    #[test]
     fn upto_route_binds_method_path_and_query() {
         let get = Method::GET;
         let post = Method::POST;
@@ -3000,21 +3011,13 @@ mod tests {
     }
 
     #[test]
-    fn delegated_sessions_charge_completed_redirects_only_with_successes() {
+    fn completed_handlers_include_redirects_but_not_errors() {
         for status in [200, 201, 204, 301, 302, 303, 307, 308] {
-            assert!(session_response_served(
-                StatusCode::from_u16(status).unwrap(),
-                false
-            ));
+            assert!(handler_completed(StatusCode::from_u16(status).unwrap()));
         }
         for status in [400, 402, 404, 429, 500, 502, 504] {
-            assert!(!session_response_served(
-                StatusCode::from_u16(status).unwrap(),
-                false
-            ));
+            assert!(!handler_completed(StatusCode::from_u16(status).unwrap()));
         }
-        assert!(session_response_served(StatusCode::OK, true));
-        assert!(!session_response_served(StatusCode::FOUND, true));
     }
 
     #[test]
@@ -3065,7 +3068,7 @@ mod tests {
             None => return,
         };
 
-        let resp = batch_replay_response(&batch, &settlement, None);
+        let resp = batch_replay_response(&batch, &settlement);
 
         assert_eq!(
             resp.status,
@@ -3091,77 +3094,6 @@ mod tests {
         assert_eq!(parsed["extra"]["commitmentId"], "chan:5000");
         // And the client is told the body is not the resource.
         assert_eq!(header("payment-replay").as_deref(), Some("true"));
-    }
-
-    #[test]
-    fn a_replayed_batch_authorization_restores_the_cached_resource() {
-        use pay_kit::core::store::CachedUpstreamResponse;
-        use pay_kit::x402::batch_settlement::BatchSettlementResponse;
-
-        let Some(batch) = test_batch_handler() else {
-            return;
-        };
-        let settlement = BatchSettlementResponse {
-            success: true,
-            error_reason: None,
-            payer: None,
-            transaction: String::new(),
-            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
-            amount: "1".to_string(),
-            extra: None,
-        };
-        let cached = CachedUpstreamResponse {
-            status: 201,
-            content_type: Some("application/json".to_string()),
-            headers: vec![
-                (
-                    "content-security-policy".to_string(),
-                    "default-src 'none'".to_string(),
-                ),
-                ("etag".to_string(), "\"result-42\"".to_string()),
-            ],
-            body: br#"{"result":42}"#.to_vec(),
-        };
-
-        let resp = batch_replay_response(&batch, &settlement, Some(&cached));
-
-        assert_eq!(resp.status, StatusCode::CREATED);
-        assert_eq!(resp.body, Bytes::from_static(br#"{"result":42}"#));
-        assert!(resp.headers.iter().any(|(name, value)| {
-            name == header::CONTENT_TYPE && value == HeaderValue::from_static("application/json")
-        }));
-        assert!(resp.headers.iter().any(|(name, value)| {
-            name == header::CONTENT_SECURITY_POLICY
-                && value == HeaderValue::from_static("default-src 'none'")
-        }));
-        assert!(resp.headers.iter().any(|(name, value)| {
-            name == header::ETAG && value == HeaderValue::from_static("\"result-42\"")
-        }));
-    }
-
-    #[test]
-    fn cached_batch_response_keeps_end_to_end_headers_only() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        headers.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
-        headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
-        headers.insert(
-            HeaderName::from_static("payment-response"),
-            HeaderValue::from_static("attempt-specific"),
-        );
-
-        let cached = batch_cached_response(StatusCode::CREATED, &headers, b"resource");
-
-        assert_eq!(cached.status, StatusCode::CREATED.as_u16());
-        assert_eq!(cached.content_type.as_deref(), Some("application/json"));
-        assert_eq!(
-            cached.headers,
-            vec![("etag".to_string(), "\"v1\"".to_string())]
-        );
-        assert_eq!(cached.body, b"resource");
     }
 
     /// A batch handler over an in-memory store, or `None` when this build
@@ -3307,14 +3239,43 @@ mod tests {
     }
 
     #[test]
-    fn x402_exact_payment_memo_falls_back_when_accepted_memo_is_absent() {
+    fn x402_exact_payment_memo_rejects_an_offer_echoed_without_memo() {
         let x402 = x402_test_server();
         let accepted = x402_accepted_with_memo(&x402, None);
         let header = x402_signature_header(Some(accepted));
 
+        assert!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune"))
+                .unwrap_err()
+                .contains("missing the endpoint resource memo")
+        );
+        // Endpoints without a resource keep accepting memo-less offers.
+        assert_eq!(x402_exact_payment_memo(&x402, &header, None).unwrap(), None);
+    }
+
+    #[test]
+    fn x402_exact_binding_separates_methods_on_one_resource() {
+        let (get, post) = (Method::GET, Method::POST);
+        let binding = |method| x402_exact_binding(&req(method, "orders"), Some("orders"));
+        assert_eq!(binding(&get).as_deref(), Some("GET orders"));
+        assert_ne!(binding(&get), binding(&post));
+        assert_eq!(x402_exact_binding(&req(&get, "orders"), Some("  ")), None);
+
+        // A memo minted for GET does not verify at POST on the same resource.
+        let x402 = x402_test_server();
+        let memo = crate::server::payment::resource_memo_with_nonce(
+            binding(&get).as_deref(),
+            pay_kit::x402::exact::MAX_MEMO_BYTES,
+        )
+        .unwrap();
+        let header =
+            x402_signature_header(Some(x402_accepted_with_memo(&x402, Some(memo.as_str()))));
+        assert!(x402_exact_payment_memo(&x402, &header, binding(&post).as_deref()).is_err());
         assert_eq!(
-            x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
-            None
+            x402_exact_payment_memo(&x402, &header, binding(&get).as_deref())
+                .unwrap()
+                .as_deref(),
+            Some(memo.as_str())
         );
     }
 
@@ -3326,6 +3287,81 @@ mod tests {
         assert_eq!(
             x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
             None
+        );
+    }
+
+    /// Pay's own client against pay's resource-bound exact route: the
+    /// credential it builds names the route's resource and carries the
+    /// endpoint memo, so the kit's fail-closed binding accepts it, and the
+    /// same credential stripped of its resource is refused.
+    #[test]
+    fn pay_clients_satisfy_the_exact_resource_binding() {
+        let rpc = crate::test_rpc::install_blockhash_rpc();
+        let x402 = X402::new(pay_kit::x402::server::Config {
+            rpc_url: Some(rpc.to_string()),
+            ..x402_test_config()
+        })
+        .unwrap();
+        let binding = x402_exact_binding(&req(&Method::GET, "fortune"), Some("fortune"));
+        let memo = crate::server::payment::resource_memo_with_nonce(
+            binding.as_deref(),
+            pay_kit::x402::exact::MAX_MEMO_BYTES,
+        );
+        let (name, required) = x402
+            .payment_required_header(
+                "0.01",
+                ExactOptions {
+                    memo: memo.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let challenge =
+            crate::client::x402::parse(&[(name.to_string(), required)], None).expect("x402 offer");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let built = crate::client::x402::build_payment_with_override(
+            &challenge,
+            &store,
+            Some("devnet"),
+            None,
+            Some("https://api.example.com/fortune"),
+            None,
+        )
+        .unwrap();
+        let credential = built.headers[0].1.clone();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let verify = |header: &str| {
+            let memo = x402_exact_payment_memo(&x402, header, binding.as_deref()).unwrap();
+            runtime.block_on(x402.process_payment(
+                header,
+                "0.01",
+                ExactOptions {
+                    memo: memo.as_deref(),
+                    ..Default::default()
+                },
+            ))
+        };
+        verify(&credential).expect("pay's credential satisfies the binding");
+
+        let mut envelope: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &credential)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope["resource"]["url"], "fortune");
+        envelope.as_object_mut().unwrap().remove("resource");
+        let unbound = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&envelope).unwrap(),
+        );
+        let error = verify(&unbound).unwrap_err();
+        assert!(
+            error.to_string().contains("Resource binding missing"),
+            "{error}"
         );
     }
 
@@ -3385,7 +3421,11 @@ mod tests {
     }
 
     fn x402_test_server() -> X402 {
-        X402::new(pay_kit::x402::server::Config {
+        X402::new(x402_test_config()).unwrap()
+    }
+
+    fn x402_test_config() -> pay_kit::x402::server::Config {
+        pay_kit::x402::server::Config {
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             currencies: vec![pay_kit::x402::server::CurrencyConfig {
                 currency: "USDC".to_string(),
@@ -3398,8 +3438,8 @@ mod tests {
             description: Some("Fortune".to_string()),
             max_age: Some(60),
             fee_payer_key: None,
-        })
-        .unwrap()
+            payment_identifier: pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
+        }
     }
 
     fn x402_accepted_with_memo(x402: &X402, memo: Option<&str>) -> serde_json::Value {
@@ -3530,6 +3570,60 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct SingleProxyApi(Vec<pay_types::metering::ApiSpec>);
+    impl PaymentState for SingleProxyApi {
+        fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+            &self.0
+        }
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_apex_never_reaches_static_api_routing() {
+        // One endpoint-less proxy API: on its own host every path passes
+        // through, which is what the apex must never inherit.
+        let api: pay_types::metering::ApiSpec = serde_json::from_value(json!({
+            "name": "compute", "subdomain": "compute", "title": "Compute",
+            "description": "", "category": "ai_ml", "version": "v1",
+            "routing": {"type": "proxy", "url": "https://upstream.example"},
+            "endpoints": []
+        }))
+        .unwrap();
+        let state = SingleProxyApi(vec![api]);
+        let request = |host| GateRequest {
+            method: &Method::POST,
+            path: "v1/run",
+            host: Some(host),
+            accept: None,
+            authorization: None,
+            content_length: None,
+            query: None,
+            x402_payment: None,
+        };
+
+        let static_gate = PaymentGate::new(state.clone());
+        assert!(matches!(
+            static_gate.evaluate(&request("compute.example")).await,
+            GateDecision::Passthrough(_)
+        ));
+
+        let resolver = DeploymentPolicyResolver::new(
+            "https://compute.example/__402/payment-policy",
+            "https://compute.example",
+            "compute.example",
+        )
+        .unwrap();
+        let gate =
+            PaymentGate::new(state).with_deployment_policy_resolver(Some(Arc::new(resolver)));
+        assert!(matches!(
+            gate.evaluate(&request("compute.example")).await,
+            GateDecision::Local
+        ));
     }
 
     #[test]

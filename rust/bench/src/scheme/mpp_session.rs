@@ -20,10 +20,11 @@ use async_trait::async_trait;
 use crossbeam_queue::ArrayQueue;
 use pay_core::client::session::{RawSession, SessionHandle, voucher_header_sync};
 use pay_kit::mpp::client::{
-    PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
+    OpenBlockhash, PaymentChannelSessionOpenOptions, SessionOpenAuthorization,
     create_payment_channel_session_opener,
 };
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
+use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::mpp::{PaymentCredential, format_authorization};
 use reqwest::StatusCode;
 use solana_pubkey::Pubkey;
@@ -357,18 +358,16 @@ impl BenchScheme for MppSession {
         );
         let payer_signer = MemorySigner::from_bytes(&ctx.wallet.keypair)
             .map_err(|e| anyhow::anyhow!("payer signer: {e}"))?;
+        let blockhash = OpenBlockhash::verify(&RpcClient::new(ctx.rpc_url.clone()), &request)
+            .await
+            .map_err(|e| anyhow::anyhow!("check challenged blockhash: {e}"))?;
         let opened = create_payment_channel_session_opener(
             &request,
             &payer_signer,
             session_signer,
-            None,
-            PaymentChannelSessionOpenOptions {
-                open: PaymentChannelOpenOptions {
-                    deposit: Some(self.deposit_base),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            blockhash,
+            &SessionOpenAuthorization::client_signed(self.deposit_base),
+            PaymentChannelSessionOpenOptions::default(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("build payment-channel open: {e}"))?;

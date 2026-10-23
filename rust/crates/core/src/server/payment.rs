@@ -13,11 +13,16 @@ use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
 use crate::server::completion_stream::{self, DeliveryTask, MeteredSettlement, StreamCompletion};
+pub use crate::server::metered_body::{
+    MeteredBodyRejection, prepare_metered_forward_body, require_identity_encoding,
+};
+use crate::server::metered_body::{
+    prepare_metered_request_body, prepare_upto_request_body, require_readable_body,
+    session_body_preparation,
+};
 use crate::server::metering::{self, RequestProperties};
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
-
-const MAX_METERED_MODEL_HINT_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Identity minted by the payment gate after caller-supplied internal headers
 /// have been discarded. Keeping it in request extensions prevents the generic
@@ -164,11 +169,10 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
-                    if sf
-                        .metered_plan()
-                        .is_some_and(|plan| plan.variant_hint.is_none())
-                    {
-                        let force_stream_usage = path.ends_with("chat/completions");
+                    if let Err(rejection) = require_readable_body(req.headers(), Some(&sf), None) {
+                        return rejection.into_response();
+                    }
+                    if let Some(force_stream_usage) = session_body_preparation(&path, &sf) {
                         let (restored, body_variant) =
                             match prepare_metered_request_body(req, force_stream_usage).await {
                                 Ok(result) => result,
@@ -306,45 +310,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             // for a response that actually served. A failure drops the outcome,
             // leaving the client uncharged and free to retry it.
             if let Some(bf) = batch {
-                let mut served_ok = response.status().is_success();
-                let mut cached = None;
+                let served_ok = crate::server::gate::handler_completed(response.status());
                 let completion = response.extensions().get::<StreamCompletion>().cloned();
                 if served_ok && let Some(completion) = completion {
-                    response = completion_stream::response(response, completion, bf, true);
+                    response = completion_stream::response(response, completion, bf);
                 } else {
-                    if served_ok {
-                        let cacheable = response.body().size_hint().upper().is_some_and(|length| {
-                            length <= crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES as u64
-                        });
-                        if cacheable {
-                            let (mut parts, body) = response.into_parts();
-                            match axum::body::to_bytes(
-                                body,
-                                crate::server::gate::MAX_BATCH_CACHED_RESPONSE_BYTES,
-                            )
-                            .await
-                            {
-                                Ok(bytes) => {
-                                    cached = Some(crate::server::gate::batch_cached_response(
-                                        parts.status,
-                                        &parts.headers,
-                                        &bytes,
-                                    ));
-                                    parts.headers.remove(header::CONTENT_LENGTH);
-                                    response = Response::from_parts(parts, Body::from(bytes));
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        "failed to buffer x402 batch response; releasing authorization"
-                                    );
-                                    served_ok = false;
-                                    response = StatusCode::BAD_GATEWAY.into_response();
-                                }
-                            }
-                        }
-                    }
-                    match bf.finish(served_ok, cached).await {
+                    match bf.finish(served_ok).await {
                         Ok(Some((n, v))) => {
                             response.headers_mut().append(n, v);
                         }
@@ -435,131 +406,11 @@ pub fn inject_original_host_header(headers: &mut HeaderMap, original_host: Optio
     }
 }
 
-/// Only inference requests need body preparation; unrelated upto uploads keep
-/// their original streaming bodies and limits.
-#[allow(clippy::result_large_err)]
-async fn prepare_upto_request_body(
-    request: Request<Body>,
-    path: &str,
-    plan: &metering::UptoSettlementPlan,
-) -> Result<(Request<Body>, Option<String>), Response> {
-    let chat = path == "chat/completions" || path.ends_with("/chat/completions");
-    let json = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|mime| {
-            let mime = mime.trim().to_ascii_lowercase();
-            mime == "application/json"
-                || (mime.starts_with("application/") && mime.ends_with("+json"))
-        });
-    let needs_model = plan.variant_hint.is_none()
-        && json
-        && plan
-            .metering
-            .variants
-            .iter()
-            .any(|variant| variant.param == "model");
-    // Non-model uploads must retain their streaming body and original limits.
-    // Outside the known chat API, require an explicit JSON content type rather
-    // than sniffing (and therefore consuming) an arbitrary request body.
-    if !chat && !needs_model {
-        return Ok((request, plan.variant_hint.clone()));
-    }
-    let (request, model) = prepare_metered_request_body(request, chat).await?;
-    Ok((request, plan.variant_hint.clone().or(model)))
-}
-
-// A direct `Response` error lets the middleware short-circuit without losing
-// status, headers, or body content produced while reading the request body.
-#[allow(clippy::result_large_err)]
-async fn prepare_metered_request_body(
-    request: Request<Body>,
-    force_stream_usage: bool,
-) -> Result<(Request<Body>, Option<String>), Response> {
-    let (mut parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_METERED_MODEL_HINT_BODY_BYTES)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "failed to read metered request model");
-            Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"request_body_too_large"}"#))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        })?;
-    if has_padded_model(&bytes) {
-        // Pricing, the upstream, and seller accounting must all see one model
-        // identity; reject rather than normalize it for pricing only.
-        return Err(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"invalid_model","message":"model must not have leading or trailing whitespace"}"#,
-            ))
-            .unwrap_or_else(|_| StatusCode::BAD_REQUEST.into_response()));
-    }
-    let (variant, bytes) = prepare_metered_json_body(&bytes, force_stream_usage);
-    if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
-        parts.headers.insert(header::CONTENT_LENGTH, content_length);
-    }
-    Ok((Request::from_parts(parts, Body::from(bytes)), variant))
-}
-
-fn has_padded_model(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| json.get("model")?.as_str().map(|m| m.trim() != m))
-        .unwrap_or(false)
-}
-
-fn prepare_metered_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
-    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return (None, body.to_vec());
-    };
-    let variant = json
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_string);
-
-    let is_stream = json
-        .get("stream")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !force_stream_usage || !is_stream {
-        return (variant, body.to_vec());
-    }
-
-    let Some(object) = json.as_object_mut() else {
-        return (variant, body.to_vec());
-    };
-    let stream_options = object
-        .entry("stream_options")
-        .or_insert_with(|| serde_json::json!({}));
-    if !stream_options.is_object() {
-        *stream_options = serde_json::json!({});
-    }
-    if let Some(stream_options) = stream_options.as_object_mut() {
-        stream_options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
-    }
-
-    (
-        variant,
-        serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec()),
-    )
-}
-
 pub(super) async fn settle_axum_delegated_response(
     forward: crate::server::gate::SessionForward,
     response: Response,
 ) -> Response {
-    let served = crate::server::gate::session_response_served(
-        response.status(),
-        forward.deadline().is_some(),
-    );
+    let served = crate::server::gate::handler_completed(response.status());
     if !served && forward.deadline().is_none() {
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
@@ -573,7 +424,7 @@ pub(super) async fn settle_axum_delegated_response(
         && let Some(completion) = response.extensions().get::<StreamCompletion>().cloned()
     {
         let delivery = DeliveryTask::session(forward, response.headers().clone());
-        return completion_stream::response(response, completion, delivery, false);
+        return completion_stream::response(response, completion, delivery);
     }
 
     let (mut parts, body) = response.into_parts();
@@ -1282,267 +1133,6 @@ apis:
     fn extract_variant_hint_models_at_end() {
         // "models" is the last segment — no next segment
         assert_eq!(extract_variant_hint("v1/models"), None);
-    }
-
-    #[tokio::test]
-    async fn upto_unrelated_uploads_are_not_polled_or_capped_by_model_preparation() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-
-        for (content_type, model_variant) in [
-            (Some("application/octet-stream"), false),
-            (Some("application/octet-stream"), true),
-            (Some("application/json"), false),
-            (None, true),
-        ] {
-            let mut plan = request_preparation_plan();
-            if model_variant {
-                plan.metering
-                    .variants
-                    .push(pay_types::metering::MeterVariant {
-                        param: "model".into(),
-                        value: "premium".into(),
-                        description: None,
-                        dimensions: plan.metering.dimensions.clone(),
-                    });
-            }
-            let polled = Arc::new(AtomicBool::new(false));
-            let observed = polled.clone();
-            let length = MAX_METERED_MODEL_HINT_BODY_BYTES + 1;
-            let body = Body::from_stream(futures_util::stream::once(async move {
-                observed.store(true, Ordering::SeqCst);
-                Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![0xff; length]))
-            }));
-            let mut request = Request::builder()
-                .uri("/v1/uploads")
-                .header(header::CONTENT_LENGTH, length);
-            if let Some(content_type) = content_type {
-                request = request.header(header::CONTENT_TYPE, content_type);
-            }
-            let request = request.body(body).unwrap();
-            let (request, variant) = prepare_upto_request_body(request, "v1/uploads", &plan)
-                .await
-                .unwrap();
-            assert!(
-                !polled.load(Ordering::SeqCst),
-                "{content_type:?} model_variant={model_variant}"
-            );
-            assert_eq!(variant, None);
-            assert_eq!(
-                request.headers()[header::CONTENT_LENGTH],
-                length.to_string()
-            );
-            let bytes = axum::body::to_bytes(request.into_body(), length)
-                .await
-                .unwrap();
-            assert_eq!(bytes.len(), length);
-            assert!(bytes.iter().all(|byte| *byte == 0xff));
-        }
-    }
-
-    fn request_preparation_plan() -> metering::UptoSettlementPlan {
-        metering::UptoSettlementPlan {
-            metering: serde_json::from_value(serde_json::json!({
-                "dimensions": [{
-                    "direction": "output", "unit": "bytes", "scale": 1,
-                    "tiers": [{"price_usd": 0.000001}],
-                    "meter": {"source": "response_header", "header": "x-usage-bytes"}
-                }],
-                "upto": {"max_usd": 1.0}
-            }))
-            .unwrap(),
-            variant_hint: None,
-            request_properties: RequestProperties::default(),
-            ceiling_usd: 1.0,
-            inferred_usage: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn upto_prepares_only_chat_or_declared_json_model_variants() {
-        let body = br#"{ "model": "premium", "stream": true }"#;
-        let mut plan = request_preparation_plan();
-        let request = || {
-            Request::builder()
-                .header(
-                    header::CONTENT_TYPE,
-                    "Application/Vnd.api+Json; charset=utf-8",
-                )
-                .body(Body::from(body.as_slice()))
-                .unwrap()
-        };
-        // JSON with no model variants must not be rewritten, even with stream=true.
-        let (untouched, model) = prepare_upto_request_body(request(), "v1/uploads", &plan)
-            .await
-            .unwrap();
-        assert_eq!(model, None);
-        assert_eq!(
-            axum::body::to_bytes(untouched.into_body(), 1024)
-                .await
-                .unwrap()
-                .as_ref(),
-            body
-        );
-
-        plan.metering
-            .variants
-            .push(pay_types::metering::MeterVariant {
-                param: "model".into(),
-                value: "premium".into(),
-                description: None,
-                dimensions: plan.metering.dimensions.clone(),
-            });
-        let (restored, model) = prepare_upto_request_body(request(), "v1/responses", &plan)
-            .await
-            .unwrap();
-        assert_eq!(model.as_deref(), Some("premium"));
-        assert_eq!(
-            axum::body::to_bytes(restored.into_body(), 1024)
-                .await
-                .unwrap()
-                .as_ref(),
-            body
-        );
-
-        // Chat must request usage even when the route already selected a model.
-        plan.variant_hint = Some("path-model".into());
-        let (restored, model) = prepare_upto_request_body(request(), "v1/chat/completions", &plan)
-            .await
-            .unwrap();
-        assert_eq!(model.as_deref(), Some("path-model"));
-        let body = axum::body::to_bytes(restored.into_body(), 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["stream_options"]["include_usage"], true);
-    }
-
-    #[tokio::test]
-    async fn metered_body_reports_its_forwarded_size_without_content_length() {
-        // A chunked request carries no Content-Length; the buffered body the
-        // gateway forwards is what bounds unreported input usage.
-        let original = br#"{"model":"premium","stream":true,"messages":[{"role":"user","content":"long prompt"}]}"#;
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from_stream(futures_util::stream::iter([Ok::<
-                _,
-                std::io::Error,
-            >(
-                bytes::Bytes::from_static(original),
-            )])))
-            .unwrap();
-        assert_eq!(request.body().size_hint().exact(), None);
-        let (request, _) = prepare_metered_request_body(request, true).await.unwrap();
-        let forwarded = request.body().size_hint().exact().unwrap();
-        let body = axum::body::to_bytes(request.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(forwarded, body.len() as u64);
-        assert!(
-            forwarded > original.len() as u64,
-            "stream usage was injected"
-        );
-    }
-
-    #[tokio::test]
-    async fn metered_body_preserves_model_and_updates_length_for_stream_usage() {
-        let original = br#"{"model":"premium","stream":true,"messages":[]}"#;
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_LENGTH, original.len())
-            .body(Body::from(original.as_slice()))
-            .unwrap();
-        let (request, variant) = prepare_metered_request_body(request, true).await.unwrap();
-        assert_eq!(variant.as_deref(), Some("premium"));
-        assert_eq!(request.uri().path(), "/v1/chat/completions");
-        let expected_length = request.headers()[header::CONTENT_LENGTH].clone();
-        let body = axum::body::to_bytes(request.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(expected_length, body.len().to_string());
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["model"], "premium");
-        assert_eq!(json["messages"], serde_json::json!([]));
-        assert_eq!(json["stream_options"]["include_usage"], true);
-    }
-
-    #[tokio::test]
-    async fn metered_body_rejects_whitespace_padded_model() {
-        let request = |body: &'static str| {
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
-                .unwrap()
-        };
-        for padded in [
-            r#"{"model":" fast ","messages":[]}"#,
-            r#"{"model":"fast\n","messages":[]}"#,
-            r#"{"model":"\tfast","messages":[]}"#,
-        ] {
-            let response = prepare_metered_request_body(request(padded), false)
-                .await
-                .expect_err("padded model must be rejected");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-        let (_, variant) = prepare_metered_request_body(request(r#"{"model":"fast"}"#), false)
-            .await
-            .unwrap();
-        assert_eq!(variant.as_deref(), Some("fast"));
-        let (_, variant) = prepare_metered_request_body(request(r#"{"messages":[]}"#), false)
-            .await
-            .unwrap();
-        assert_eq!(variant, None);
-    }
-
-    #[test]
-    fn delegated_json_body_reads_openai_compatible_model() {
-        assert_eq!(
-            prepare_metered_json_body(br#"{"model":"qwen3.7-max","stream":true}"#, false).0,
-            Some("qwen3.7-max".to_string())
-        );
-    }
-
-    #[test]
-    fn delegated_json_body_rejects_missing_or_invalid_models() {
-        assert_eq!(
-            prepare_metered_json_body(br#"{"stream":true}"#, false).0,
-            None
-        );
-        assert_eq!(
-            prepare_metered_json_body(br#"{"model":"  "}"#, false).0,
-            None
-        );
-        assert_eq!(prepare_metered_json_body(b"not json", false).0, None);
-    }
-
-    #[test]
-    fn delegated_chat_stream_forces_provider_usage_frames() {
-        let (variant, body) = prepare_metered_json_body(
-            br#"{"model":"qwen3.7-plus","stream":true,"stream_options":{"include_usage":false}}"#,
-            true,
-        );
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(variant.as_deref(), Some("qwen3.7-plus"));
-        assert_eq!(
-            json.pointer("/stream_options/include_usage"),
-            Some(&serde_json::Value::Bool(true))
-        );
-    }
-
-    #[test]
-    fn delegated_non_stream_request_body_is_unchanged() {
-        let body = br#"{"model":"qwen3.7-plus","stream":false}"#;
-        let (_, prepared) = prepare_metered_json_body(body, true);
-        assert_eq!(prepared, body);
     }
 
     #[test]

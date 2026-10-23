@@ -302,11 +302,16 @@ pub fn effective_dimensions<'a>(
 }
 
 /// The authorized `x402-upto` ceiling: `upto.max_usd`, or the legacy
-/// single-dimension unit price. `None` when several dimensions are priced
-/// without an explicit ceiling, since no one unit price bounds their sum.
+/// single-dimension unit price. `None` without an explicit ceiling when
+/// several dimensions are priced (no one unit price bounds their sum) or a
+/// dimension is usage-metered (its price covers `scale` units, so one unit's
+/// share would cap a multi-unit response far below its measured cost).
 pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> Option<f64> {
     if let Some(max_usd) = metering.upto.as_ref().and_then(|upto| upto.max_usd) {
         return Some(max_usd);
+    }
+    if metering.has_aggregate_dimensions() {
+        return None;
     }
     match resolved_price.map(|p| p.dimensions.as_slice()) {
         Some([d]) => Some(d.price_usd / d.scale.max(1) as f64),
@@ -360,6 +365,28 @@ pub fn upto_response_body_limit(metering: &Metering) -> usize {
         .and_then(|upto| upto.response_body.as_ref())
         .and_then(|body| body.max_bytes)
         .unwrap_or(DEFAULT_LIMIT)
+}
+
+/// Largest upstream body buffered for an x402 `upto` response whose price
+/// does not read it: the buffer only holds the charge until the body
+/// completed, so it is bounded like other buffered forwards, not by the
+/// metering parser's limit.
+pub const UPTO_BUFFERED_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Largest upstream body an x402 `upto` forward buffers before it settles.
+/// A body-metered plan keeps the metering limit; a header-metered or
+/// fixed-price plan only waits for completion, so it takes the operator's
+/// configured `response_body.max_bytes` or [`UPTO_BUFFERED_RESPONSE_LIMIT`].
+pub fn upto_buffered_response_limit(metering: &Metering, variant_hint: Option<&str>) -> usize {
+    if upto_requires_response_body(metering, variant_hint) {
+        return upto_response_body_limit(metering);
+    }
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.response_body.as_ref())
+        .and_then(|body| body.max_bytes)
+        .unwrap_or(UPTO_BUFFERED_RESPONSE_LIMIT)
 }
 
 /// A request-only meter has an indivisible price, unlike consumable tokens.
@@ -567,7 +594,10 @@ fn inferred_quantity_for_dim(
 ) -> Option<u64> {
     let tokens = match dim.direction {
         MeterDirection::Input => usage.tokens_prompt,
-        MeterDirection::Output => usage.tokens_completion,
+        // A stream-event approximation can undercount a multi-token delta.
+        MeterDirection::Output => usage
+            .tokens_completion
+            .filter(|_| !usage.tokens_completion_estimated),
         _ => None,
     }?;
     match dim.unit {
@@ -1970,8 +2000,8 @@ mod tests {
     fn upto_max_usd_keeps_legacy_first_dimension_fallback() {
         let metering = upto_metering(
             vec![usage_dim(
-                MeterDirection::Input,
-                BillingUnit::Tokens,
+                MeterDirection::Usage,
+                BillingUnit::Requests,
                 1_000,
                 0.02,
                 None,
@@ -1981,6 +2011,33 @@ mod tests {
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
 
         assert_eq!(upto_max_usd(&metering, price.as_ref()), Some(0.00002));
+    }
+
+    #[test]
+    fn upto_max_usd_never_derives_a_ceiling_for_usage_metered_dimensions() {
+        // $1 per 1M tokens: one token's share would cap a 100k-token
+        // response worth $0.10 at $0.000001.
+        let tokens = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                1.0,
+                None,
+            )],
+            None,
+        );
+        let price = resolve_price(&tokens, &RequestProperties::default(), None, None);
+        assert_eq!(upto_max_usd(&tokens, price.as_ref()), None);
+
+        let explicit = Metering {
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+            ..tokens
+        };
+        assert_eq!(upto_max_usd(&explicit, price.as_ref()), Some(0.50));
     }
 
     #[test]
@@ -2713,6 +2770,56 @@ mod tests {
     }
 
     #[test]
+    fn header_metered_upto_buffers_beyond_the_body_metering_limit() {
+        let header_dim = || {
+            usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_header("x-usage-tokens")),
+            )
+        };
+        let header = upto_metering(
+            vec![header_dim()],
+            Some(pay_types::metering::UptoMetering::default()),
+        );
+        assert_eq!(
+            upto_buffered_response_limit(&header, None),
+            UPTO_BUFFERED_RESPONSE_LIMIT
+        );
+        assert!(UPTO_BUFFERED_RESPONSE_LIMIT > upto_response_body_limit(&header));
+        // An operator-configured bound still applies.
+        let bounded = upto_metering(
+            vec![header_dim()],
+            Some(pay_types::metering::UptoMetering {
+                response_body: Some(pay_types::metering::UptoResponseBody {
+                    mode: pay_types::metering::UptoResponseBodyMode::Buffer,
+                    max_bytes: Some(4096),
+                }),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(upto_buffered_response_limit(&bounded, None), 4096);
+
+        // Positive control: a body-metered plan keeps the metering limit.
+        let json = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering::default()),
+        );
+        assert_eq!(
+            upto_buffered_response_limit(&json, None),
+            upto_response_body_limit(&json)
+        );
+    }
+
+    #[test]
     fn upto_actual_amount_supports_request_units_without_meter() {
         let metering = upto_metering(
             vec![usage_dim(
@@ -2948,6 +3055,64 @@ mod tests {
             (actual.usd - gemma_wrong).abs() > 1e-9,
             "must not fall back to the first variant's rate"
         );
+    }
+
+    #[test]
+    fn upto_never_settles_an_estimated_completion_count() {
+        // Output $1/1M tokens, read from the response JSON.
+        let metering = Metering {
+            dimensions: vec![usage_dim(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                1.0,
+                Some(response_json("/usage/completion_tokens")),
+            )],
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = |estimated| UptoSettlementPlan {
+            metering: metering.clone(),
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.50,
+            // Three content deltas, however many tokens each carried.
+            inferred_usage: Some(crate::InferenceUsage {
+                tokens_completion: Some(3),
+                tokens_completion_estimated: estimated,
+                ..Default::default()
+            }),
+        };
+        let body = br#"{"usage":{"completion_tokens":400}}"#;
+
+        // The provider's count in the body is what settles.
+        let actual =
+            upto_actual_amount_from_response(&plan(true), 500_000, &HeaderMap::new(), Some(body))
+                .unwrap();
+        assert_eq!(actual.base_units, 400);
+        // Without it the missing-usage policy applies, not the estimate.
+        let actual = upto_actual_amount_from_response(
+            &plan(true),
+            500_000,
+            &HeaderMap::new(),
+            Some(br#"{"text":"no usage"}"#),
+        );
+        assert!(
+            actual
+                .as_ref()
+                .map_or(true, |actual| actual.base_units != 3),
+            "{actual:?}"
+        );
+
+        // Positive control: an authoritative observer count still supersedes
+        // the body.
+        let actual =
+            upto_actual_amount_from_response(&plan(false), 500_000, &HeaderMap::new(), Some(body))
+                .unwrap();
+        assert_eq!(actual.base_units, 3);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Thin wrapper around `pay_kit::mpp` for challenge detection and credential building.
 
 use pay_kit::mpp::client::{
-    BuildChargeTransactionOptions, build_channel_charge_credential_with_options,
-    build_credential_header_with_options,
+    BuildChargeTransactionOptions, PayerFundedAtaCreation,
+    build_channel_charge_credential_with_options, build_credential_header_with_options,
 };
 use pay_kit::mpp::protocol::solana::default_rpc_url;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
@@ -71,7 +71,7 @@ pub fn challenge_network(challenge: &Challenge, network_override: Option<&str>) 
     if blockhash.is_some_and(|value| value.starts_with(SURFPOOL_BLOCKHASH_PREFIX)) {
         Ok("localnet".to_string())
     } else {
-        Ok(normalize_network(network).to_string())
+        Ok(crate::accounts::canonical_network(network).to_string())
     }
 }
 
@@ -122,23 +122,53 @@ pub fn build_credential_with_override(
     // Reject untrusted hook descriptors before loading a wallet or asking it
     // to sign. The SDK checks the same exact descriptor again when building.
     let channel_hooks = crate::mpp_channel_profile::validate_charge_challenge(&request)?;
+    let decimals = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("decimals"))
+        .map(|decimals| {
+            decimals
+                .as_u64()
+                .ok_or_else(|| {
+                    Error::InvalidChallenge("asset decimals must be an integer".to_string())
+                })
+                .and_then(crate::client::prompt::Decimals::new)
+        })
+        .transpose()?;
     let amount = crate::client::prompt::payment_display_amount(
         &request.amount,
         &request.currency,
-        request
-            .method_details
-            .as_ref()
-            .and_then(|details| details.get("decimals"))
-            .map(|decimals| {
-                decimals
-                    .as_u64()
-                    .ok_or_else(|| {
-                        Error::InvalidChallenge("asset decimals must be an integer".to_string())
-                    })
-                    .and_then(crate::client::prompt::Decimals::new)
-            })
-            .transpose()?,
+        decimals,
     )?;
+    // The approval names every destination the transaction pays, so a
+    // challenge cannot redirect an approved amount without the prompt
+    // showing it.
+    let recipient = request.recipient.as_deref().ok_or_else(|| {
+        Error::InvalidChallenge("charge challenge is missing a recipient".to_string())
+    })?;
+    let splits: Vec<pay_kit::mpp::protocol::solana::Split> = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("splits"))
+        .map(|splits| serde_json::from_value(splits.clone()))
+        .transpose()
+        .map_err(|e| Error::InvalidChallenge(format!("invalid charge splits: {e}")))?
+        .unwrap_or_default();
+    let split_amounts = splits
+        .iter()
+        .map(|split| {
+            crate::client::prompt::payment_display_amount(
+                &split.amount,
+                &request.currency,
+                decimals,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let destinations: Vec<(&str, &str)> = splits
+        .iter()
+        .zip(&split_amounts)
+        .map(|(split, amount)| (split.recipient.as_str(), amount.as_str()))
+        .collect();
     let prompt_context = crate::client::prompt::payment_prompt_context(
         charge_prompt_reason(
             request.description.as_deref(),
@@ -150,7 +180,8 @@ pub fn build_credential_with_override(
         &amount,
         &prompt_context.reason,
         &prompt_context.operator,
-    );
+    )
+    .with_payment_destinations(recipient, &destinations);
 
     let challenge_network = request
         .method_details
@@ -159,7 +190,7 @@ pub fn build_credential_with_override(
         .and_then(|v| v.as_str())
         .unwrap_or("mainnet")
         .to_string();
-    let challenge_network = normalize_network(&challenge_network).to_string();
+    let challenge_network = crate::accounts::canonical_network(&challenge_network).to_string();
     let embedded_blockhash = request
         .method_details
         .as_ref()
@@ -262,6 +293,92 @@ pub fn build_credential_with_override(
     Ok((header, ephemeral_notice))
 }
 
+const CHARGE_CREDENTIAL_KIND: &str = "mpp-charge-credential";
+/// How long an unresolved charge credential is resent: no longer than a
+/// challenge stays verifiable, after which the server would refuse it anyway.
+const CHARGE_CREDENTIAL_TTL_SECS: u64 = 300;
+
+/// [`build_credential_with_override`] for one logical request. While
+/// `attempt` is unresolved (the paid retry got a transport error, a timeout or
+/// a server error), a retry of the same request for the same charge terms
+/// resends the exact credential already signed instead of signing a second
+/// transfer. The server then recognises the transaction it may already have
+/// settled rather than being handed another one.
+///
+/// The cache key is the payer, network and the charge terms (realm, method,
+/// intent, digest and the decoded request minus the blockhash and slot hints
+/// every fresh challenge refreshes), never the challenge id, which changes on
+/// each 402.
+pub fn build_credential_for_attempt(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    attempt: &crate::client::attempt::PaymentAttempt,
+) -> Result<(String, Option<ResolvedEphemeral>)> {
+    let build = |auth_override| {
+        build_credential_with_override(
+            challenge,
+            store,
+            network_override,
+            account_override,
+            resource_url,
+            auth_override,
+        )
+    };
+    let network = challenge_network(challenge, network_override)?;
+    // Signed material is reusable only by the wallet that signed it; with no
+    // payer known up front, sign afresh.
+    let Some(payer) = account_pubkey_for_network(store, &network, account_override)?
+        .and_then(|pubkey| pubkey.parse::<solana_pubkey::Pubkey>().ok())
+    else {
+        return build(auth_override);
+    };
+    let key = crate::client::attempt::PaymentCacheKey::new(
+        attempt,
+        &payer,
+        &network,
+        CHARGE_CREDENTIAL_KIND,
+        &[&charge_offer_terms(challenge)?],
+    );
+    let mut ephemeral_notice = None;
+    let header = key.reuse_or_insert(
+        std::time::Duration::from_secs(CHARGE_CREDENTIAL_TTL_SECS),
+        || {
+            let (header, notice) = build(auth_override)?;
+            ephemeral_notice = notice;
+            Ok(header)
+        },
+    )?;
+    Ok((header, ephemeral_notice))
+}
+
+/// The terms that identify a charge offer across challenges.
+fn charge_offer_terms(challenge: &Challenge) -> Result<String> {
+    let mut request: serde_json::Value = challenge
+        .request
+        .decode()
+        .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
+    if let Some(details) = request
+        .get_mut("methodDetails")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for hint in ["recentBlockhash", "lastValidBlockHeight", "recentSlot"] {
+            details.remove(hint);
+        }
+    }
+    Ok(serde_json::json!({
+        "realm": challenge.realm,
+        "method": challenge.method.as_str(),
+        "intent": challenge.intent.as_str(),
+        "digest": challenge.digest,
+        "request": request,
+    })
+    .to_string())
+}
+
 /// The kit re-checks the challenge against the network the wallet was loaded
 /// for, so a challenge cannot be signed for a cluster other than the selected one.
 fn charge_build_options(
@@ -272,7 +389,7 @@ fn charge_build_options(
         max_tx_version,
         expected_network: Some(network.to_string()),
         // Split ATA rent would be spent outside the approved amount.
-        allow_payer_funded_ata_creation: false,
+        payer_funded_ata_creation: PayerFundedAtaCreation::Decline,
         ..Default::default()
     }
 }
@@ -293,11 +410,15 @@ pub fn select_challenge_by_balance<'a>(
     let Some(first) = candidates.first() else {
         return Ok(None);
     };
+    // Without balances to go on, still take the cheapest offer, never just
+    // the one the server listed first.
+    let cheapest = &challenges
+        [candidates[cheapest_candidate_index(candidates.iter().enumerate()).unwrap_or(0)].index];
 
-    let network = normalize_network(&first.network);
+    let network = crate::accounts::canonical_network(&first.network);
     let pubkey = match account_pubkey_for_network(store, network, account_override)? {
         Some(pubkey) => pubkey,
-        None => return Ok(Some(&challenges[first.index])),
+        None => return Ok(Some(cheapest)),
     };
 
     let rpc_url = resolve_rpc_url(&first.network, first.embedded_blockhash.as_deref());
@@ -318,7 +439,7 @@ pub fn select_challenge_by_balance<'a>(
         Ok(balances) => balances,
         Err(e) => {
             warn!(error = %e, %rpc_url, %pubkey, "Could not fetch balances for MPP challenge selection");
-            return Ok(Some(&challenges[first.index]));
+            return Ok(Some(cheapest));
         }
     };
 
@@ -390,10 +511,14 @@ pub fn choose_payment(
         return Err(Error::Mpp("No usable payment challenge".to_string()));
     };
 
-    let legacy_first_mpp =
-        || ChosenPayment::Mpp(Box::new(mpp_challenges[candidates[0].index].clone()));
+    // Without balances to go on, take the cheapest MPP offer rather than the
+    // one the server listed first.
+    let legacy_first_mpp = || {
+        let index = cheapest_candidate_index(candidates.iter().enumerate()).unwrap_or(0);
+        ChosenPayment::Mpp(Box::new(mpp_challenges[candidates[index].index].clone()))
+    };
 
-    let network = normalize_network(&first.network);
+    let network = crate::accounts::canonical_network(&first.network);
     let pubkey = match account_pubkey_for_network(store, network, account_override)? {
         Some(pubkey) => pubkey,
         None => return Ok(legacy_first_mpp()),
@@ -502,7 +627,7 @@ fn decoded_charge_candidates(
             .network
             .clone()
             .unwrap_or_else(|| "mainnet".to_string());
-        let challenge_network = normalize_network(&challenge_network).to_string();
+        let challenge_network = crate::accounts::canonical_network(&challenge_network).to_string();
         if let Some(forced) = network_override {
             if forced != challenge_network {
                 continue;
@@ -555,13 +680,34 @@ fn resolve_challenge_mint(currency: &str, network: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The cheapest candidate the wallet can fund. Server order only breaks ties,
+/// so a 402 cannot steer the wallet into a dearer offer by listing it first.
 fn select_candidate_index_for_balances(
     candidates: &[DecodedChargeCandidate],
     balances: &crate::client::balance::AccountBalances,
 ) -> Option<usize> {
+    cheapest_candidate_index(
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| has_sufficient_balance(candidate, balances)),
+    )
+}
+
+/// The cheapest of `candidates` in stablecoin value, first on ties. Every
+/// candidate is a USD stablecoin (see [`resolve_challenge_mint`]), so amounts
+/// compare once scaled to a common number of decimals.
+fn cheapest_candidate_index<'a>(
+    candidates: impl Iterator<Item = (usize, &'a DecodedChargeCandidate)>,
+) -> Option<usize> {
+    const SCALE_DECIMALS: u32 = 18;
     candidates
-        .iter()
-        .position(|candidate| has_sufficient_balance(candidate, balances))
+        .min_by_key(|(_, candidate)| {
+            let decimals = Stablecoin::decimals_for_mint(&candidate.mint).unwrap_or(6) as u32;
+            u128::from(candidate.amount)
+                .saturating_mul(10u128.pow(SCALE_DECIMALS.saturating_sub(decimals)))
+        })
+        .map(|(index, _)| index)
 }
 
 fn has_sufficient_balance(
@@ -593,7 +739,7 @@ fn account_pubkey_for_network(
 }
 
 fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
-    std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+    crate::config::payment_rpc_url().unwrap_or_else(|| {
         if network == "localnet"
             && embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX))
         {
@@ -602,13 +748,6 @@ fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
             default_rpc_url(network).to_string()
         }
     })
-}
-
-fn normalize_network(network: &str) -> &str {
-    match network {
-        "mainnet-beta" => "mainnet",
-        other => other,
-    }
 }
 
 pub(crate) fn should_auto_fund_surfpool(
@@ -620,7 +759,10 @@ pub(crate) fn should_auto_fund_surfpool(
 }
 
 fn is_sandbox_network(network: &str) -> bool {
-    matches!(normalize_network(network), "localnet" | "sandbox")
+    matches!(
+        crate::accounts::canonical_network(network),
+        "localnet" | "sandbox"
+    )
 }
 
 fn charge_prompt_reason<'a>(
@@ -757,10 +899,77 @@ mod tests {
     }
 
     #[test]
+    fn the_charge_approval_names_its_recipient_and_splits() {
+        use std::sync::{Arc, Mutex};
+        struct Recording(Arc<Mutex<Vec<crate::keystore::AuthIntent>>>);
+        impl crate::keystore::AuthGate for Recording {
+            fn authenticate(
+                &self,
+                intent: &crate::keystore::AuthIntent,
+            ) -> std::result::Result<(), crate::keystore::Error> {
+                self.0.lock().unwrap().push(intent.clone());
+                // Stop before any RPC: only the prompt is under test.
+                Err(crate::keystore::Error::AuthDenied("recorded".to_string()))
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let keypair = solana_keypair::Keypair::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some(solana_signer::Signer::pubkey(&keypair).to_string()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = crate::accounts::MemoryAccountsStore::with_file(file);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _ = build_credential_with_override(
+            &split_charge(false),
+            &store,
+            Some("mainnet"),
+            None,
+            Some("https://merchant.example/paid"),
+            Some(Box::new(Recording(seen.clone()))),
+        );
+        let seen = seen.lock().unwrap();
+        let Some(crate::keystore::AuthIntent::AuthorizePayment { message, .. }) = seen.first()
+        else {
+            panic!("the payment was never put to the approval gate");
+        };
+        assert!(message.contains("to: CXhr...6MPY"), "{message}");
+        assert!(message.contains("splits (8)"), "{message}");
+        assert!(message.contains("+5 more"), "{message}");
+    }
+
+    #[test]
     fn charge_options_pin_the_selected_network() {
         let options = charge_build_options("devnet", None);
         assert_eq!(options.expected_network.as_deref(), Some("devnet"));
-        assert!(!options.allow_payer_funded_ata_creation);
+        assert_eq!(
+            options.payer_funded_ata_creation,
+            PayerFundedAtaCreation::Decline
+        );
     }
 
     #[test]
@@ -816,10 +1025,7 @@ mod tests {
             None,
         )
         .expect_err("payer-funded split ATA rent must be refused");
-        assert!(
-            err.to_string().contains("allow_payer_funded_ata_creation"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("ataCreationRequired"), "{err}");
         // Control: with a server fee payer funding the rent, the guard
         // does not apply (any remaining failure is unrelated, e.g. RPC).
         let result = build_credential_with_override(
@@ -928,6 +1134,111 @@ mod tests {
         parse(&header).unwrap()
     }
 
+    const CHARGE_PAYER: &str = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
+
+    /// A mainnet account whose pubkey is known but which cannot sign, so a
+    /// test passes only if the credential is resent rather than rebuilt.
+    fn unsignable_payer_store(pubkey: &str) -> crate::accounts::MemoryAccountsStore {
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(pubkey.to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        crate::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    /// A fresh 402 for the same charge: new id and blockhash.
+    fn charge_challenge(id: &str, blockhash: &str, amount: &str) -> Challenge {
+        let request = serde_json::json!({
+            "amount": amount,
+            "currency": "USDC",
+            "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "methodDetails": { "network": "mainnet", "recentBlockhash": blockhash }
+        });
+        Challenge::new(
+            id,
+            "merchant",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_ambiguous_charge_retry_resends_the_original_credential() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://merchant.example/charge",
+            Some(b"{}"),
+        );
+        let build = |store: &crate::accounts::MemoryAccountsStore, challenge: &Challenge| {
+            build_credential_for_attempt(
+                challenge,
+                store,
+                None,
+                None,
+                Some("https://merchant.example/charge"),
+                None,
+                &attempt,
+            )
+            .map(|(header, _)| header)
+        };
+        let first = charge_challenge("first", "11111111111111111111111111111111", "1000000");
+        // The first try signed this credential; its response was lost.
+        crate::client::attempt::PaymentCacheKey::new(
+            &attempt,
+            &CHARGE_PAYER.parse().unwrap(),
+            "mainnet",
+            CHARGE_CREDENTIAL_KIND,
+            &[&charge_offer_terms(&first).unwrap()],
+        )
+        .reuse_or_insert(std::time::Duration::from_secs(300), || {
+            Ok("Payment original-credential".to_string())
+        })
+        .unwrap();
+
+        // The retry's challenge has a new id and blockhash; the wallet
+        // cannot sign, so anything but a resend fails.
+        let store = unsignable_payer_store(CHARGE_PAYER);
+        let retry = charge_challenge(
+            "retry",
+            "SysvarRent111111111111111111111111111111111",
+            "1000000",
+        );
+        assert_eq!(
+            build(&store, &retry).unwrap(),
+            "Payment original-credential"
+        );
+
+        // A different price is a different charge, and another wallet never
+        // receives this one's credential.
+        let repriced = charge_challenge(
+            "repriced",
+            "SysvarRent111111111111111111111111111111111",
+            "2000000",
+        );
+        assert!(build(&store, &repriced).is_err());
+        let other_wallet = unsignable_payer_store("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY");
+        assert!(build(&other_wallet, &retry).is_err());
+
+        // A definitive answer ends the attempt: the next call signs anew.
+        attempt.resolved();
+        assert!(build(&store, &retry).is_err());
+    }
+
     #[test]
     fn parse_all_extracts_repeated_stablecoin_payment_challenges() {
         let usdc =
@@ -1004,6 +1315,78 @@ mod tests {
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
         assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    fn funded(tokens: &[(&str, u64)]) -> crate::client::balance::AccountBalances {
+        crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: tokens
+                .iter()
+                .map(|(mint, amount)| token_balance(mint, *amount, "TOKEN"))
+                .collect(),
+            credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
+            credits_unavailable: false,
+            tokens_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn balance_selector_picks_the_cheapest_funded_offer_not_the_first() {
+        use pay_kit::mpp::protocol::solana::mints::{USDC_MAINNET, USDT_MAINNET};
+        let challenges = vec![
+            challenge_for_currency("USDC", "100000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let both = funded(&[(USDC_MAINNET, 100_000_000), (USDT_MAINNET, 1_000_000)]);
+        let selected = select_candidate_index_for_balances(&candidates, &both).unwrap();
+        assert_eq!(candidates[selected].currency, "USDT");
+
+        // Control: when only the dearer offer is funded, it is still payable.
+        let usdc_only = funded(&[(USDC_MAINNET, 100_000_000)]);
+        let selected = select_candidate_index_for_balances(&candidates, &usdc_only).unwrap();
+        assert_eq!(candidates[selected].currency, "USDC");
+    }
+
+    #[test]
+    fn equally_priced_offers_keep_server_order() {
+        use pay_kit::mpp::protocol::solana::mints::{USDC_MAINNET, USDT_MAINNET};
+        let challenges = vec![
+            challenge_for_currency("USDT", "1000000"),
+            challenge_for_currency("USDC", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let both = funded(&[(USDC_MAINNET, 1_000_000), (USDT_MAINNET, 1_000_000)]);
+        let selected = select_candidate_index_for_balances(&candidates, &both).unwrap();
+        assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    #[test]
+    fn without_balances_the_cheapest_offer_is_chosen() {
+        // No account on the network: the selector cannot read balances.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let challenges = vec![
+            challenge_for_currency("USDC", "100000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let selected = select_challenge_by_balance(&challenges, &store, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.request.decode::<ChargeRequest>().unwrap().currency,
+            "USDT"
+        );
+        let ChosenPayment::Mpp(chosen) =
+            choose_payment(&challenges, None, &[], &store, None, None).unwrap()
+        else {
+            panic!("expected an MPP charge");
+        };
+        assert_eq!(
+            chosen.request.decode::<ChargeRequest>().unwrap().currency,
+            "USDT"
+        );
     }
 
     #[test]

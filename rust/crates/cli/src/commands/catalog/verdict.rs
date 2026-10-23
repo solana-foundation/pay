@@ -193,6 +193,10 @@ fn verdict_for_endpoint(ep: &EndpointProbeResult) -> EndpointVerdictRow {
             EndpointVerdict::Indeterminate,
             "405 — method/path mismatch in spec".into(),
         ),
+        "redirected" => (
+            EndpointVerdict::Indeterminate,
+            "3xx — probes do not follow redirects; list the final URL in the spec".into(),
+        ),
         "error" => (
             EndpointVerdict::Error,
             "probe failed (network/timeout)".into(),

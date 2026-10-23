@@ -22,13 +22,15 @@ use crate::server::session::{DelegatedUsageAuthorization, SessionMpp};
 use crate::server::session_metering::{
     GateMode, Result as MeteringResult, SessionGateDecision, SessionMeterDimension,
     SessionMeterSpec, SessionMeteringContext, SessionUsageGate, StablecoinSettlement,
-    UsageObservation, spec_from_metering,
+    UsageObservation, is_response_measured, spec_from_metering,
 };
 
 const COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LIFECYCLE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
+/// Generous enough for streamed base64 image events.
+const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -172,13 +174,17 @@ pub struct DelegatedSessionStreamMeter {
     accumulator: StreamUsageAccumulator,
     current: UsageObservation,
     priced_context_length: Option<u64>,
-    clamp_reprice_to_authorized: bool,
+    /// The next charge settles at most the authorization instead of
+    /// failing: a usage-only reprice, or the stream's final charge.
+    clamp_charge_to_authorized: bool,
     authorization_exhausted: bool,
     next_lifecycle_touch: Instant,
     observer: Option<MeteredSettlement>,
     /// This stream's charge in progress. It runs detached, so a cancelled
     /// stream still learns whether it landed before charging again.
     in_flight: Option<InFlightCharge>,
+    /// Released bytes stop at the last complete record; see [`RecordHold`].
+    record_hold: RecordHold,
 }
 
 /// One delegated charge for this stream, running to completion on its own
@@ -195,6 +201,11 @@ impl DelegatedSessionStreamMeter {
                 "delegated stream forward is missing its settlement plan",
             ))
         })?;
+        if !stream_honors_meters(&plan.metering) {
+            return Err(box_error(std::io::Error::other(
+                "delegated stream cannot observe a configured usage meter; settle it buffered",
+            )));
+        }
         let spec = spec_from_metering(
             &plan.metering,
             SessionMeteringContext::new()
@@ -214,6 +225,7 @@ impl DelegatedSessionStreamMeter {
         let gate = SessionUsageGate::new(spec.clone(), settlement, forward.committed_base_units, 1)
             .map_err(box_error)?;
         let current = zero_observation(&spec);
+        let record_hold = RecordHold::for_spec(&spec);
         let priced_context_length = plan.request_properties.context_length;
         Ok(Self {
             forward,
@@ -221,11 +233,12 @@ impl DelegatedSessionStreamMeter {
             accumulator: StreamUsageAccumulator::new(spec, hints),
             current,
             priced_context_length,
-            clamp_reprice_to_authorized: false,
+            clamp_charge_to_authorized: false,
             authorization_exhausted: false,
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
             observer: None,
             in_flight: None,
+            record_hold,
         })
     }
 
@@ -245,6 +258,9 @@ impl DelegatedSessionStreamMeter {
         let Some(plan) = forward.metered_plan() else {
             return false;
         };
+        if !stream_honors_meters(&plan.metering) {
+            return false;
+        }
         spec_from_metering(
             &plan.metering,
             SessionMeteringContext::new()
@@ -254,7 +270,56 @@ impl DelegatedSessionStreamMeter {
         .is_ok_and(|spec| has_stream_observable_dimension(&spec))
     }
 
+    /// Observe one chunk and refuse it unless its live usage fits the
+    /// request's authorization. Live usage is a lower bound (provider usage,
+    /// else whitespace words); missing usage settles at its upper bounds once
+    /// the stream ends, capped at the authorization (see [`Self::settle`]).
+    /// Withholding on the upper bound instead would cut ordinary answers whose
+    /// provider usage only arrives in the final chunk. A refused chunk is not
+    /// counted toward the stream's usage.
     fn observe_chunk(
+        &mut self,
+        chunk: &[u8],
+        is_sse: bool,
+    ) -> Result<Option<SessionGateDecision>, BoxError> {
+        let released = (
+            self.accumulator.clone(),
+            self.gate.clone(),
+            self.current.clone(),
+            self.priced_context_length,
+            self.clamp_charge_to_authorized,
+        );
+        let decision = self.observe_unreleased_chunk(chunk, is_sse)?;
+        let authorized = self.authorized_base_units();
+        // A clamped reprice already settles for everything authorized.
+        if let Some(target) = decision
+            .as_ref()
+            .map(SessionGateDecision::target_cumulative_base_units)
+            && !self.clamp_charge_to_authorized
+            && target > authorized
+        {
+            (
+                self.accumulator,
+                self.gate,
+                self.current,
+                self.priced_context_length,
+                self.clamp_charge_to_authorized,
+            ) = released;
+            return Err(box_error(std::io::Error::other(format!(
+                "delegated session {} requires cumulative {target}, above authorized {authorized}",
+                self.forward.channel_id
+            ))));
+        }
+        Ok(decision)
+    }
+
+    fn authorized_base_units(&self) -> u64 {
+        self.forward
+            .committed_base_units
+            .saturating_add(self.forward.available_base_units)
+    }
+
+    fn observe_unreleased_chunk(
         &mut self,
         chunk: &[u8],
         is_sse: bool,
@@ -289,33 +354,34 @@ impl DelegatedSessionStreamMeter {
         self.final_decision()
     }
 
+    /// The stream's final charge. Its output is already released, so the
+    /// charge is capped at the request's authorization rather than refused:
+    /// missing provider usage rates at upper bounds that can exceed what the
+    /// live lower bounds admitted, and the buyer never authorized more.
     fn final_decision(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
         if !self.accumulator.has_observation() || self.authorization_exhausted {
             return Ok(None);
         }
-        self.gate
-            .observe(self.current.clone(), GateMode::Final)
-            .map(Some)
+        let decision = self.gate.observe(self.current.clone(), GateMode::Final)?;
+        self.clamp_charge_to_authorized = true;
+        Ok(Some(decision))
     }
 
     async fn settle(&mut self, decision: SessionGateDecision) -> Result<(), BoxError> {
         self.resolve_in_flight().await?;
-        let clamp_reprice_to_authorized = std::mem::take(&mut self.clamp_reprice_to_authorized);
+        let clamp_charge_to_authorized = std::mem::take(&mut self.clamp_charge_to_authorized);
         if !decision.requires_voucher() {
             return Ok(());
         }
         let requested_target = decision.target_cumulative_base_units();
         let committed = self.gate.committed_base_units();
-        let authorized = self
-            .forward
-            .committed_base_units
-            .saturating_add(self.forward.available_base_units);
-        let target = if clamp_reprice_to_authorized {
+        let authorized = self.authorized_base_units();
+        let target = if clamp_charge_to_authorized {
             requested_target.min(authorized)
         } else {
             requested_target
         };
-        let exhausted_by_reprice = clamp_reprice_to_authorized && requested_target > authorized;
+        let exhausted_by_clamp = clamp_charge_to_authorized && requested_target > authorized;
         if target > authorized {
             return Err(box_error(std::io::Error::other(format!(
                 "delegated session {} requires cumulative {target}, above authorized {authorized}",
@@ -324,19 +390,23 @@ impl DelegatedSessionStreamMeter {
         }
         let amount = target.saturating_sub(committed);
         if amount == 0 {
-            self.authorization_exhausted |= exhausted_by_reprice;
+            self.authorization_exhausted |= exhausted_by_clamp;
             return Ok(());
         }
         let handle = Arc::clone(&self.forward.handle);
-        let channel_id = self.forward.channel_id.clone();
+        let delegated = Arc::clone(
+            self.forward
+                .delegated_use()
+                .map_err(|error| box_error(std::io::Error::other(error)))?,
+        );
         self.in_flight = Some(InFlightCharge {
             amount,
-            commit: tokio::spawn(async move {
-                handle.commit_delegated_usage(&channel_id, amount).await
-            }),
+            commit: tokio::spawn(
+                async move { handle.commit_delegated_usage(&delegated, amount).await },
+            ),
         });
         self.resolve_in_flight().await?;
-        self.authorization_exhausted |= exhausted_by_reprice;
+        self.authorization_exhausted |= exhausted_by_clamp;
         self.forward
             .handle
             .touch_after_delegated_usage(&self.forward.channel_id)
@@ -401,7 +471,7 @@ impl DelegatedSessionStreamMeter {
         self.accumulator.reconfigure(spec, hints);
         self.gate = gate;
         self.priced_context_length = Some(context_length);
-        self.clamp_reprice_to_authorized = usage_only_chunk;
+        self.clamp_charge_to_authorized = usage_only_chunk;
         Ok(())
     }
 
@@ -416,21 +486,29 @@ impl DelegatedSessionStreamMeter {
         self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
 
-    /// Meter and durably authorize one response chunk before it is released.
-    pub async fn authorize_chunk(&mut self, chunk: &[u8], is_sse: bool) -> Result<(), BoxError> {
+    /// Meter and durably authorize one response chunk, returning the bytes
+    /// now safe to release: those up to the last complete record. The tail
+    /// of a partial record is held until it is parsed and metered.
+    pub async fn authorize_chunk(
+        &mut self,
+        chunk: &[u8],
+        is_sse: bool,
+    ) -> Result<Option<Bytes>, BoxError> {
         self.touch_channel_if_due();
+        let ready = self.record_hold.push(chunk, is_sse).map_err(box_error)?;
         if let Some(decision) = self.observe_chunk(chunk, is_sse)? {
             self.settle(decision).await?;
         }
-        Ok(())
+        Ok(ready)
     }
 
-    /// Persist any final cumulative usage before the response stream closes.
-    pub async fn finish_stream(&mut self, is_sse: bool) -> Result<(), BoxError> {
+    /// Persist any final cumulative usage before the response stream closes,
+    /// returning the final record's held bytes now that they are metered.
+    pub async fn finish_stream(&mut self, is_sse: bool) -> Result<Option<Bytes>, BoxError> {
         if let Some(decision) = self.finish(is_sse)? {
             self.settle(decision).await?;
         }
-        Ok(())
+        Ok(self.record_hold.finish())
     }
 
     /// Persist the usage a stream that ended early implies.
@@ -461,10 +539,10 @@ impl DelegatedStreamFinalizer {
             .expect("the meter is held until the stream completes")
     }
 
-    async fn finish(&mut self, is_sse: bool) -> Result<(), BoxError> {
-        self.meter().finish_stream(is_sse).await?;
+    async fn finish(&mut self, is_sse: bool) -> Result<Option<Bytes>, BoxError> {
+        let tail = self.meter().finish_stream(is_sse).await?;
         self.meter = None;
-        Ok(())
+        Ok(tail)
     }
 }
 
@@ -522,10 +600,17 @@ impl SessionStreamMeter {
         chunk: &[u8],
         is_sse: bool,
     ) -> MeteringResult<Option<SessionGateDecision>> {
-        if !self.accumulator.observe_chunk(chunk, is_sse)? {
+        let changed = self.accumulator.observe_chunk(chunk, is_sse)?;
+        self.observe_usage_change(changed)
+    }
+
+    fn observe_usage_change(
+        &mut self,
+        changed: bool,
+    ) -> MeteringResult<Option<SessionGateDecision>> {
+        if !changed {
             return Ok(None);
         }
-
         self.current = self.accumulator.observation();
         self.gate
             .observe(self.current.clone(), GateMode::Streaming)
@@ -548,6 +633,39 @@ impl SessionStreamMeter {
         self.gate.record_commit(committed_base_units);
     }
 
+    /// Meter a complete (unstreamed) response body and wait until the
+    /// client's vouchers cover all of it. Its usage is only known once the
+    /// whole body is parsed, so the body must not be released before this
+    /// returns.
+    pub async fn settle_complete_body(
+        mut self,
+        body: &[u8],
+        is_sse: bool,
+    ) -> Result<(), CompleteBodyError> {
+        self.touch_channel_if_due();
+        let changed = self
+            .accumulator
+            .observe_complete_body(body, is_sse)
+            .map_err(CompleteBodyError::Unmeterable)?;
+        if let Some(decision) = self
+            .observe_usage_change(changed)
+            .map_err(CompleteBodyError::Unmeterable)?
+        {
+            settle_decision(&mut self, decision)
+                .await
+                .map_err(CompleteBodyError::Uncovered)?;
+        }
+        if let Some(decision) = self
+            .finish(is_sse)
+            .map_err(CompleteBodyError::Unmeterable)?
+        {
+            settle_decision(&mut self, decision)
+                .await
+                .map_err(CompleteBodyError::Uncovered)?;
+        }
+        Ok(())
+    }
+
     fn touch_channel_if_due(&mut self) {
         let now = Instant::now();
         if now < self.next_lifecycle_touch {
@@ -556,6 +674,18 @@ impl SessionStreamMeter {
         self.context.touch_channel_unconfirmed();
         self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
+}
+
+/// Why a complete response body was not settled. Either way it must not be
+/// released.
+#[derive(Debug, thiserror::Error)]
+pub enum CompleteBodyError {
+    /// The body does not carry the endpoint's usage in a readable form.
+    #[error("response cannot be metered: {0}")]
+    Unmeterable(crate::server::session_metering::SessionMeteringError),
+    /// The client's vouchers did not cover the body's usage.
+    #[error("response usage not covered: {0}")]
+    Uncovered(BoxError),
 }
 
 /// Wrap an upstream byte stream with session metering backpressure.
@@ -574,11 +704,15 @@ where
         // must never leave delivered usage unpaid.
         let mut held: Vec<Bytes> = Vec::new();
         let mut held_target = 0;
+        // A partial record's bytes wait for its boundary: its usage is only
+        // counted once the record parses.
+        let mut record_hold = RecordHold::for_spec(&meter.accumulator.spec);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
             meter.touch_channel_if_due();
+            let ready = record_hold.push(&chunk, is_sse).map_err(box_error)?;
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
-            held.push(chunk);
+            held.extend(ready);
             match decision {
                 Some(decision) if decision.requires_voucher() => {
                     // Do not release the bytes that crossed the voucher
@@ -603,10 +737,115 @@ where
         if let Some(decision) = meter.finish(is_sse).map_err(box_error)? {
             settle_decision(&mut meter, decision).await?;
         }
+        held.extend(record_hold.finish());
         for chunk in held.drain(..) {
             yield chunk;
         }
     }
+}
+
+/// Wire bytes withheld until the stream record they belong to is complete.
+///
+/// The meter counts a record's text and usage only once the record parses,
+/// so releasing its first half early would deliver output that an abort
+/// leaves uncounted. Records end at a blank line for SSE and at a newline
+/// for NDJSON. A partial record longer than the decoders accept fails the
+/// stream before it is metered, so the hold never grows without bound and
+/// never releases bytes it could not meter.
+struct RecordHold {
+    held: Vec<u8>,
+    /// Whether SSE / NDJSON record contents feed the meter. Wire-measured
+    /// quantities (bytes, NDJSON characters) are counted on arrival.
+    sse_contents_metered: bool,
+    ndjson_contents_metered: bool,
+}
+
+impl RecordHold {
+    fn for_spec(spec: &SessionMeterSpec) -> Self {
+        let metered = |units: &[BillingUnit]| {
+            spec.dimensions
+                .iter()
+                .any(|dimension| units.contains(&dimension.unit))
+        };
+        Self {
+            held: Vec::new(),
+            sse_contents_metered: metered(&[
+                BillingUnit::Tokens,
+                BillingUnit::QuotaUnits,
+                BillingUnit::Characters,
+            ]),
+            ndjson_contents_metered: metered(&[BillingUnit::Tokens, BillingUnit::QuotaUnits]),
+        }
+    }
+
+    /// Add `chunk`; return the bytes through the last complete record.
+    fn push(&mut self, chunk: &[u8], is_sse: bool) -> MeteringResult<Option<Bytes>> {
+        let contents_metered = if is_sse {
+            self.sse_contents_metered
+        } else {
+            self.ndjson_contents_metered
+        };
+        if !contents_metered && self.held.is_empty() {
+            return Ok((!chunk.is_empty()).then(|| Bytes::copy_from_slice(chunk)));
+        }
+        self.held.extend_from_slice(chunk);
+        if !contents_metered {
+            return Ok(self.finish());
+        }
+        let (end, limit, kind) = if is_sse {
+            (sse_record_end(&self.held), MAX_SSE_EVENT_BYTES, "SSE event")
+        } else {
+            let end = self
+                .held
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            (end, MAX_NDJSON_RECORD_BYTES, "NDJSON record")
+        };
+        if self.held.len() - end > limit {
+            return Err(record_too_large(kind, limit));
+        }
+        Ok((end > 0).then(|| Bytes::from(self.held.drain(..end).collect::<Vec<u8>>())))
+    }
+
+    /// The final record, once the stream has ended and it has been metered.
+    fn finish(&mut self) -> Option<Bytes> {
+        (!self.held.is_empty()).then(|| Bytes::from(std::mem::take(&mut self.held)))
+    }
+}
+
+fn record_too_large(
+    kind: &str,
+    limit: usize,
+) -> crate::server::session_metering::SessionMeteringError {
+    crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
+        "{kind} exceeds {limit} bytes"
+    ))
+}
+
+/// Offset just past the last blank line (an SSE event terminator) in
+/// `bytes`, accepting `\n`, `\r\n` and `\r` line endings. A trailing `\r` may
+/// be half of a `\r\n`, so it is not yet a terminator.
+fn sse_record_end(bytes: &[u8]) -> usize {
+    let (mut end, mut line_empty, mut index) = (0, true, 0);
+    while index < bytes.len() {
+        let next = match bytes[index] {
+            b'\r' if index + 1 == bytes.len() => break,
+            b'\r' if bytes[index + 1] == b'\n' => index + 2,
+            b'\r' | b'\n' => index + 1,
+            _ => {
+                line_empty = false;
+                index += 1;
+                continue;
+            }
+        };
+        if line_empty {
+            end = next;
+        }
+        line_empty = true;
+        index = next;
+    }
+    end
 }
 
 /// Wrap a delegated-session response stream without buffering it.
@@ -629,11 +868,14 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.meter().authorize_chunk(&chunk, is_sse).await?;
-            yield chunk;
+            if let Some(ready) = meter.meter().authorize_chunk(&chunk, is_sse).await? {
+                yield ready;
+            }
         }
 
-        meter.finish(is_sse).await?;
+        if let Some(tail) = meter.finish(is_sse).await? {
+            yield tail;
+        }
     }
 }
 
@@ -676,6 +918,14 @@ async fn wait_for_commit(context: &SessionStreamContext, target: u64) -> Result<
         })?
 }
 
+/// How the bytes handed to [`StreamUsageAccumulator`] split into records.
+enum BodyRecords<'a> {
+    Sse,
+    Ndjson,
+    /// A complete body already parsed as one JSON document.
+    Document(&'a Value),
+}
+
 #[derive(Debug, Clone)]
 struct StreamUsageAccumulator {
     spec: SessionMeterSpec,
@@ -700,10 +950,10 @@ struct StreamUsageAccumulator {
 impl StreamUsageAccumulator {
     fn new(spec: SessionMeterSpec, hints: SessionUsageHints) -> Self {
         Self {
+            ndjson: NdjsonUsageDecoder::for_spec(&spec),
             spec,
             hints,
             sse: SseUsageDecoder::default(),
-            ndjson: NdjsonUsageDecoder::default(),
             ndjson_utf8_tail: Vec::new(),
             output_bytes: 0,
             output_chars: 0,
@@ -720,6 +970,28 @@ impl StreamUsageAccumulator {
     }
 
     fn observe_chunk(&mut self, chunk: &[u8], is_sse: bool) -> MeteringResult<bool> {
+        let records = if is_sse {
+            BodyRecords::Sse
+        } else {
+            BodyRecords::Ndjson
+        };
+        self.observe_records(chunk, records)
+    }
+
+    /// Observe a complete, unstreamed response body. A body that is one JSON
+    /// document is one record, whatever its line breaks; any other body is
+    /// read as NDJSON records.
+    fn observe_complete_body(&mut self, body: &[u8], is_sse: bool) -> MeteringResult<bool> {
+        if is_sse {
+            return self.observe_records(body, BodyRecords::Sse);
+        }
+        match serde_json::from_slice::<Value>(body) {
+            Ok(document) => self.observe_records(body, BodyRecords::Document(&document)),
+            Err(_) => self.observe_records(body, BodyRecords::Ndjson),
+        }
+    }
+
+    fn observe_records(&mut self, chunk: &[u8], records: BodyRecords<'_>) -> MeteringResult<bool> {
         self.output_bytes = self.output_bytes.saturating_add(chunk.len() as u64);
         self.request_seen = true;
 
@@ -728,10 +1000,13 @@ impl StreamUsageAccumulator {
             changed = true;
         }
 
-        if is_sse {
+        if let BodyRecords::Sse = records {
             changed |= self.observe_sse_chunk(chunk)?;
         } else {
-            changed |= self.observe_ndjson_chunk(chunk)?;
+            changed |= match records {
+                BodyRecords::Document(document) => self.observe_stream_value(document, false),
+                _ => self.observe_ndjson_chunk(chunk)?,
+            };
             if observes_unit(&self.spec, BillingUnit::Characters) {
                 self.output_chars = self
                     .output_chars
@@ -961,36 +1236,50 @@ struct SseUsageEvent {
 #[derive(Debug, Clone, Default)]
 struct NdjsonUsageDecoder {
     buffer: Vec<u8>,
+    /// Usage is read from record contents (tokens, quota units), so a
+    /// malformed record would release output the meter never counted.
+    records_carry_usage: bool,
 }
 
 impl NdjsonUsageDecoder {
+    fn for_spec(spec: &SessionMeterSpec) -> Self {
+        Self {
+            buffer: Vec::new(),
+            records_carry_usage: spec.dimensions.iter().any(|dimension| {
+                matches!(
+                    dimension.unit,
+                    BillingUnit::Tokens | BillingUnit::QuotaUnits
+                )
+            }),
+        }
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) -> MeteringResult<Vec<Value>> {
         self.buffer.extend_from_slice(chunk);
         let mut values = Vec::new();
         while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
             let line = self.buffer[..index].to_vec();
             self.buffer.drain(..=index);
-            if let Some(value) = parse_ndjson_record(&line)? {
+            if let Some(value) = parse_ndjson_record(&line, self.records_carry_usage)? {
                 values.push(value);
             }
         }
         if self.buffer.len() > MAX_NDJSON_RECORD_BYTES {
-            return Err(
-                crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
-                    "NDJSON record exceeds {MAX_NDJSON_RECORD_BYTES} bytes"
-                )),
-            );
+            return Err(record_too_large("NDJSON record", MAX_NDJSON_RECORD_BYTES));
         }
         Ok(values)
     }
 
     fn finish(&mut self) -> MeteringResult<Option<Value>> {
         let line = std::mem::take(&mut self.buffer);
-        parse_ndjson_record(&line)
+        parse_ndjson_record(&line, self.records_carry_usage)
     }
 }
 
-fn parse_ndjson_record(line: &[u8]) -> MeteringResult<Option<Value>> {
+/// `None` for a blank line, or a malformed record when usage is measured from
+/// the wire alone. When records carry usage, a malformed one is an error:
+/// skipping it would release output to the client unmetered.
+fn parse_ndjson_record(line: &[u8], records_carry_usage: bool) -> MeteringResult<Option<Value>> {
     let line = std::str::from_utf8(line).map_err(|error| {
         crate::server::session_metering::SessionMeteringError::InvalidStream(error.to_string())
     })?;
@@ -998,7 +1287,15 @@ fn parse_ndjson_record(line: &[u8]) -> MeteringResult<Option<Value>> {
     if line.is_empty() {
         return Ok(None);
     }
-    Ok(serde_json::from_str(line).ok())
+    match serde_json::from_str(line) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if !records_carry_usage => Ok(None),
+        Err(error) => Err(
+            crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
+                "malformed NDJSON record: {error}"
+            )),
+        ),
+    }
 }
 
 fn count_stream_utf8_chars(tail: &mut Vec<u8>, chunk: &[u8]) -> MeteringResult<u64> {
@@ -1049,6 +1346,9 @@ impl SseUsageDecoder {
             let block = self.buffer[..index].to_string();
             self.buffer.drain(..index + 2);
             events.push(parse_sse_event(&block));
+        }
+        if self.buffer.len() + self.pending.len() > MAX_SSE_EVENT_BYTES {
+            return Err(record_too_large("SSE event", MAX_SSE_EVENT_BYTES));
         }
         Ok(events)
     }
@@ -1117,14 +1417,60 @@ fn zero_observation(spec: &SessionMeterSpec) -> UsageObservation {
 }
 
 fn has_stream_observable_dimension(spec: &SessionMeterSpec) -> bool {
-    spec.dimensions.iter().any(|dimension| {
-        matches!(
-            (dimension.direction, dimension.unit),
-            (MeterDirection::Output, BillingUnit::Bytes)
-                | (MeterDirection::Output, BillingUnit::Characters)
-                | (MeterDirection::Output, BillingUnit::Tokens)
-                | (MeterDirection::Output, BillingUnit::QuotaUnits)
-        )
+    spec.dimensions
+        .iter()
+        .any(|dimension| is_response_measured(dimension.direction, dimension.unit))
+}
+
+/// Whether the stream meter observes every configured `meter` the way
+/// buffered settlement would. It reads provider token usage from canonical
+/// fields only, so a header meter, a custom JSON path, or a meter on any
+/// other unit must settle from the buffered response instead of being
+/// silently replaced by the stream's own heuristics.
+pub(crate) fn stream_honors_meters(metering: &Metering) -> bool {
+    dimensions_honor_meters(
+        metering
+            .dimensions
+            .iter()
+            .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter())),
+    )
+}
+
+/// [`stream_honors_meters`] for the given dimensions only, such as the ones a
+/// request's variant selects.
+pub(crate) fn dimensions_honor_meters<'a>(
+    dimensions: impl IntoIterator<Item = &'a pay_types::metering::MeterDimension>,
+) -> bool {
+    dimensions.into_iter().all(|dimension| {
+        let Some(meter) = &dimension.meter else {
+            return true;
+        };
+        if meter.source != pay_types::metering::UsageMeterSource::ResponseJson
+            || dimension.unit != BillingUnit::Tokens
+        {
+            return false;
+        }
+        let canonical: &[&str] = match dimension.direction {
+            MeterDirection::Input => &[
+                "/usage/prompt_tokens",
+                "/usage/input_tokens",
+                "/response/usage/input_tokens",
+                "/message/usage/input_tokens",
+                "/usageMetadata/promptTokenCount",
+            ],
+            MeterDirection::Output => &[
+                "/usage/completion_tokens",
+                "/usage/output_tokens",
+                "/response/usage/output_tokens",
+                "/message/usage/output_tokens",
+                "/usageMetadata/candidatesTokenCount",
+            ],
+            _ => &[],
+        };
+        meter
+            .path
+            .as_deref()
+            .is_some_and(|path| canonical.contains(&path))
     })
 }
 
@@ -1504,6 +1850,47 @@ mod tests {
     }
 
     #[test]
+    fn a_complete_json_body_is_one_record_whatever_its_line_breaks() {
+        let spec = || {
+            SessionMeterSpec::new([SessionMeterDimension::required(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1,
+                1,
+            )])
+        };
+        let tokens = |body: &[u8]| {
+            let mut accumulator = StreamUsageAccumulator::new(spec(), SessionUsageHints::default());
+            assert!(accumulator.observe_complete_body(body, false).unwrap());
+            assert!(!accumulator.finish_ndjson().unwrap());
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens)
+        };
+
+        assert_eq!(
+            tokens(b"{\n\"usage\":{\"completion_tokens\":50}\n}"),
+            Some(50)
+        );
+        // Control: the same document on one line meters the same.
+        assert_eq!(tokens(br#"{"usage":{"completion_tokens":50}}"#), Some(50));
+        // A body of several records is still read record by record.
+        assert_eq!(
+            tokens(
+                b"{\"usage\":{\"completion_tokens\":5}}\n{\"usage\":{\"completion_tokens\":7}}\n"
+            ),
+            Some(7)
+        );
+        // Streamed line by line, the multiline document is refused.
+        let mut streamed = StreamUsageAccumulator::new(spec(), SessionUsageHints::default());
+        assert!(
+            streamed
+                .observe_chunk(b"{\n\"usage\":{\"completion_tokens\":50}\n}", false)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn ndjson_decoder_flushes_final_record_without_newline() {
         let spec = SessionMeterSpec::new([SessionMeterDimension::required(
             MeterDirection::Output,
@@ -1524,6 +1911,56 @@ mod tests {
                 .observation()
                 .get(MeterDirection::Output, BillingUnit::Tokens),
             Some(5)
+        );
+    }
+
+    #[test]
+    fn ndjson_decoder_rejects_malformed_records_and_skips_blank_lines() {
+        let accumulator = || {
+            StreamUsageAccumulator::new(
+                SessionMeterSpec::new([SessionMeterDimension::required(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1,
+                    1,
+                )]),
+                SessionUsageHints::default(),
+            )
+        };
+
+        let mut blank = accumulator();
+        assert!(
+            blank
+                .observe_chunk(b"\n  \n{\"usage\":{\"completion_tokens\":5}}\n", false)
+                .unwrap()
+        );
+
+        let error = accumulator()
+            .observe_chunk(b"{\"choices\":[{\"text\":\"unmetered\"}\n", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed NDJSON"), "{error}");
+
+        // A malformed final record without a newline fails closed too.
+        let mut tail = accumulator();
+        tail.observe_chunk(b"{\"choices\":", false).unwrap();
+        assert!(tail.finish_ndjson().is_err());
+
+        // Wire-measured pricing counts the record's bytes either way.
+        let mut bytes = StreamUsageAccumulator::new(
+            SessionMeterSpec::new([SessionMeterDimension::required(
+                MeterDirection::Output,
+                BillingUnit::Bytes,
+                1,
+                1,
+            )]),
+            SessionUsageHints::default(),
+        );
+        assert!(bytes.observe_chunk(b"not json\n", false).unwrap());
+        assert_eq!(
+            bytes
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Bytes),
+            Some(9)
         );
     }
 
@@ -1851,7 +2288,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .expect("session capacity should be available");
         let forward = SessionForward::delegated(
             session.clone(),
-            channel_id.clone(),
+            crate::server::session::DelegatedUse::for_test(&session, &channel_id).await,
             0,
             crate::server::metering::UptoSettlementPlan {
                 metering: metering(vec![MeterDimension {
@@ -1897,7 +2334,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         let upstream_release = Arc::clone(&release_second);
         let upstream = async_stream::stream! {
             yield Ok::<_, std::io::Error>(Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n"
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"a b c\"}}]}\n\n"
             ));
             upstream_release.notified().await;
             yield Ok::<_, std::io::Error>(Bytes::from_static(
@@ -1914,9 +2351,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .expect("first chunk should remain successful");
         assert_eq!(
             first,
-            Bytes::from_static(
-                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three\"}}]}\n\n"
-            )
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"a b c\"}}]}\n\n")
         );
         assert_eq!(session.committed_watermark(&channel_id), Some(3));
 
@@ -1947,6 +2382,16 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             metered.next().await.is_none(),
             "a clamped usage-only reprice must complete cleanly"
         );
+        // Each charge advanced the request's running total under one key:
+        // the channel holds one record for the request, not one per charge.
+        let record = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(
+            record.processed_uses.len(),
+            1,
+            "{:?}",
+            record.processed_uses
+        );
+        assert_eq!(record.processed_uses[0].amount, Some(10));
     }
 
     /// A delegated (operator-signed) stream meter over a funded test channel.
@@ -2040,27 +2485,128 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         channel_id: &str,
         dimensions: Vec<MeterDimension>,
     ) -> DelegatedSessionStreamMeter {
+        delegated_meter_with_capacity(session, channel_id, dimensions, 100_000).await
+    }
+
+    /// A stream admitted with `capacity` base units authorized for it.
+    async fn delegated_meter_with_capacity(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+        capacity: u64,
+    ) -> DelegatedSessionStreamMeter {
+        DelegatedSessionStreamMeter::from_forward(
+            delegated_forward_with_capacity(session, channel_id, dimensions, capacity).await,
+        )
+        .unwrap()
+    }
+
+    async fn delegated_forward(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+    ) -> SessionForward {
+        delegated_forward_with_capacity(session, channel_id, dimensions, 100_000).await
+    }
+
+    async fn delegated_forward_with_capacity(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+        capacity: u64,
+    ) -> SessionForward {
         let reservation = session
-            .reserve_delegated_capacity(channel_id, 100_000)
+            .reserve_delegated_capacity(channel_id, capacity)
             .await
             .unwrap()
             .expect("session capacity should be available");
-        let forward = SessionForward::delegated(
+        SessionForward::delegated(
             session.clone(),
-            channel_id.to_string(),
+            crate::server::session::DelegatedUse::for_test(session, channel_id).await,
             0,
             crate::server::metering::UptoSettlementPlan {
                 metering: metering(dimensions),
                 variant_hint: None,
                 request_properties: RequestProperties::default(),
-                ceiling_usd: 0.1,
+                ceiling_usd: capacity as f64 / 1_000_000.0,
                 inferred_usage: None,
             },
-            (100_000, 1_000_000),
+            (capacity, 1_000_000),
             solana_pubkey::Pubkey::new_unique().to_string(),
             reservation,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_meter_the_stream_cannot_observe_settles_from_the_buffered_response() {
+        let metered = |meter| MeterDimension {
+            direction: MeterDirection::Output,
+            unit: BillingUnit::Bytes,
+            scale: 1,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.000001,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: Some(meter),
+        };
+        let header_meter = pay_types::metering::UsageMeter {
+            source: pay_types::metering::UsageMeterSource::ResponseHeader,
+            path: None,
+            header: Some("x-billable-bytes".into()),
+        };
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let channel = delegated_channel("header-meter", &store).await;
+        let forward = delegated_forward(
+            &channel.session,
+            &channel.channel_id,
+            vec![metered(header_meter)],
+        )
+        .await;
+        assert!(!DelegatedSessionStreamMeter::supports(&forward));
+
+        let body = "data: {\"payload\":\"ok\"}\n\n";
+        let response = axum::response::Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .header("x-billable-bytes", "5000")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response =
+            crate::server::payment::settle_axum_delegated_response(forward, response).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let served = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(served, body.as_bytes());
+        // The configured header quantity is charged, not the wire bytes.
+        assert_eq!(
+            channel.session.committed_watermark(&channel.channel_id),
+            Some(5000)
         );
-        DelegatedSessionStreamMeter::from_forward(forward).unwrap()
+
+        // Canonical provider token paths stay on the streaming path.
+        let canonical = delegated_forward(
+            &channel.session,
+            &channel.channel_id,
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+        )
+        .await;
+        assert!(DelegatedSessionStreamMeter::supports(&canonical));
+        drop(canonical);
+        let custom = delegated_forward(
+            &channel.session,
+            &channel.channel_id,
+            vec![token_dimension(MeterDirection::Output, "/billing/tokens")],
+        )
+        .await;
+        assert!(!DelegatedSessionStreamMeter::supports(&custom));
     }
 
     fn token_dimension(direction: MeterDirection, path: &str) -> MeterDimension {
@@ -2111,6 +2657,58 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             served.extend_from_slice(&chunk?);
         }
         Ok(served)
+    }
+
+    #[test]
+    fn sse_record_end_finds_the_last_blank_line_in_any_line_ending() {
+        assert_eq!(sse_record_end(b"data: a"), 0);
+        assert_eq!(sse_record_end(b"data: a\n"), 0);
+        assert_eq!(sse_record_end(b"data: a\n\ndata: b"), 9);
+        assert_eq!(sse_record_end(b"data: a\r\n\r\ndata: b\r\n"), 11);
+        assert_eq!(
+            sse_record_end(b"data: a\r\r"),
+            0,
+            "a trailing CR may be CRLF"
+        );
+        assert_eq!(sse_record_end(b"data: a\r\rx"), 9);
+    }
+
+    #[tokio::test]
+    async fn delegated_streams_hold_a_partial_record_until_it_is_metered() {
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "partial-record",
+        )
+        .await;
+        let event = usage_event(5);
+        let (head, tail) = event.split_at(event.len() / 2);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|chunk| (Ok::<_, std::io::Error>(chunk), receiver))
+        });
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+
+        // Half an event is not released: its text and usage are not counted.
+        sender.send(Bytes::copy_from_slice(head)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err(),
+            "a partial record must not reach the client"
+        );
+        sender.send(Bytes::copy_from_slice(tail)).unwrap();
+        let released = metered.next().await.unwrap().unwrap();
+        assert_eq!(released.as_ref(), event.as_ref());
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+        drop(sender);
+        assert!(metered.next().await.is_none());
     }
 
     #[tokio::test]
@@ -2286,6 +2884,192 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(session.committed_watermark(&channel_id), Some(300));
     }
 
+    /// Streams one text event under `capacity`, returning what reached the
+    /// client and how the stream ended.
+    async fn capacity_bound_stream(
+        label: &str,
+        capacity: u64,
+    ) -> (Arc<SessionMpp>, String, Vec<u8>, Result<(), BoxError>) {
+        // One whitespace word, 512 UTF-8 bytes: the live lower bound is far
+        // below what the stream settles if the provider never reports usage.
+        capacity_bound_chunks(
+            label,
+            capacity,
+            vec![
+                sse_text_event(&"!?".repeat(256)),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+        )
+        .await
+    }
+
+    /// Streams `chunks` under `capacity`, returning what reached the client
+    /// and how the stream ended.
+    async fn capacity_bound_chunks(
+        label: &str,
+        capacity: u64,
+        chunks: Vec<Vec<u8>>,
+    ) -> (Arc<SessionMpp>, String, Vec<u8>, Result<(), BoxError>) {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let channel = delegated_channel(label, &store).await;
+        let meter = delegated_meter_with_capacity(
+            &channel.session,
+            &channel.channel_id,
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            capacity,
+        )
+        .await;
+        let upstream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+        let mut served = Vec::new();
+        let mut outcome = Ok(());
+        while let Some(chunk) = metered.next().await {
+            match chunk {
+                Ok(chunk) => served.extend_from_slice(&chunk),
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+        }
+        (channel.session, channel.channel_id, served, outcome)
+    }
+
+    #[tokio::test]
+    async fn delegated_stream_missing_usage_settles_its_whole_authorization() {
+        // SOLA1-274: the text is released at its one-word lower bound and
+        // the provider never reports usage. The 512-byte bound exceeds the
+        // authorization, so the charge is the whole authorization, never the
+        // provisional lower bound, and the stream does not fail after the
+        // output is out.
+        let (session, channel_id, served, outcome) =
+            capacity_bound_stream("bound-above-capacity", 100).await;
+
+        outcome.expect("a capped final charge does not fail the stream");
+        assert!(served.ends_with(b"data: [DONE]\n\n"));
+        assert_eq!(session.committed_watermark(&channel_id), Some(100));
+        assert!(
+            session
+                .reserve_delegated_capacity(&channel_id, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "the finished stream releases its capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_stream_releases_output_its_authorization_covers() {
+        let (session, channel_id, served, outcome) =
+            capacity_bound_stream("bound-within-capacity", 512).await;
+
+        outcome.unwrap();
+        assert!(served.ends_with(b"data: [DONE]\n\n"));
+        assert_eq!(session.committed_watermark(&channel_id), Some(512));
+    }
+
+    /// 60 events of 4 words and 20 bytes, then the usage `include_usage`
+    /// delivers in the final chunk.
+    fn answer_with_trailing_usage() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let event = sse_text_event("The quick brown fox ");
+        let mut chunks = vec![event.clone(); 60];
+        chunks.push(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":300}}\n\n".to_vec());
+        chunks.push(b"data: [DONE]\n\n".to_vec());
+        (chunks, event)
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_usage_arrives_last_is_not_cut_at_its_byte_bound() {
+        let (chunks, event) = answer_with_trailing_usage();
+        let expected: Vec<u8> = chunks.concat();
+        let (session, channel_id, served, outcome) =
+            capacity_bound_chunks("usage-arrives-last", 1_000, chunks).await;
+
+        outcome.expect("the answer fits its authorization");
+        assert_eq!(
+            served
+                .windows(event.len())
+                .filter(|window| *window == event)
+                .count(),
+            60,
+            "every event is delivered"
+        );
+        assert!(served == expected, "the whole stream is relayed");
+        assert_eq!(
+            session.committed_watermark(&channel_id),
+            Some(300),
+            "the provider's usage is the charge, not the byte bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_live_usage_exceeds_its_authorization_is_cut() {
+        let (chunks, event) = answer_with_trailing_usage();
+        // 4 words per event: the 26th crosses 100.
+        let (session, channel_id, served, outcome) =
+            capacity_bound_chunks("live-usage-exceeds", 100, chunks).await;
+
+        assert!(
+            outcome.is_err(),
+            "output beyond the authorization is withheld"
+        );
+        assert!(
+            served == event.repeat(25),
+            "25 events fit, the 26th is withheld"
+        );
+        assert_eq!(
+            settled_watermark(&session, &channel_id, 100).await,
+            Some(100),
+            "the cut stream settles no more than its authorization"
+        );
+    }
+
+    /// One SSE text event of `text_bytes` bytes, sent in 1 MiB pieces.
+    fn event_in_pieces(text_bytes: usize) -> Vec<Vec<u8>> {
+        in_pieces(&sse_text_event(&"x".repeat(text_bytes)))
+    }
+
+    fn in_pieces(bytes: &[u8]) -> Vec<Vec<u8>> {
+        bytes.chunks(1024 * 1024).map(<[u8]>::to_vec).collect()
+    }
+
+    #[tokio::test]
+    async fn a_delegated_stream_refuses_an_sse_record_too_large_to_hold() {
+        // An upstream that never ends its event.
+        let event = sse_text_event(&"x".repeat(MAX_SSE_EVENT_BYTES));
+        let unterminated = &event[..event.len() - 2];
+        let (session, channel_id, served, outcome) =
+            capacity_bound_chunks("record-too-large", 100_000, in_pieces(unterminated)).await;
+
+        let error = outcome.expect_err("an unbounded record must not be buffered");
+        assert!(
+            error.to_string().contains("SSE event exceeds"),
+            "unexpected error: {error}"
+        );
+        assert!(served.is_empty(), "the unmetered record is never released");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.committed_watermark(&channel_id).unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn a_delegated_stream_holds_a_large_sse_record_within_the_bound() {
+        let chunks = event_in_pieces(MAX_SSE_EVENT_BYTES - 1024);
+        let expected = chunks.concat();
+        let (_, _, served, outcome) =
+            capacity_bound_chunks("record-within-bound", 100_000, chunks).await;
+
+        outcome.expect("a record within the bound is metered and released");
+        assert!(served == expected, "the whole record is released");
+    }
+
     async fn interrupted_meter(
         label: &str,
     ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
@@ -2360,11 +3144,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     /// read never answers (cancelling an attempt in the lifecycle touch after
     /// its voucher saved), or with `slow_write`, the write that saved it is
     /// slow to return (cancelling the attempt inside the commit itself).
+    /// Once armed with [`Self::hold_reads_in_lockstep`], its next reads also
+    /// wait for each other, so two replicas observe the same watermark.
     struct StallingStore {
         inner: MemoryChannelStore,
         stall_at: u64,
         slow_write: bool,
         stalled: std::sync::atomic::AtomicBool,
+        lockstep: std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, usize)>>,
     }
 
     impl StallingStore {
@@ -2374,7 +3161,25 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 stall_at,
                 slow_write,
                 stalled: std::sync::atomic::AtomicBool::new(false),
+                lockstep: std::sync::Mutex::new(None),
             })
+        }
+
+        /// Make the next `readers` reads wait until all of them have arrived.
+        fn hold_reads_in_lockstep(&self, readers: usize) {
+            *self.lockstep.lock().unwrap() =
+                Some((Arc::new(tokio::sync::Barrier::new(readers)), readers));
+        }
+
+        fn lockstep_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+            let mut lockstep = self.lockstep.lock().unwrap();
+            let (barrier, remaining) = lockstep.as_mut()?;
+            let barrier = Arc::clone(barrier);
+            *remaining -= 1;
+            if *remaining == 0 {
+                *lockstep = None;
+            }
+            Some(barrier)
         }
 
         async fn after_write(&self, channel_id: &str) {
@@ -2416,8 +3221,13 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             channel_id: &str,
         ) -> StoreFuture<'_, Option<pay_kit::mpp::store::ChannelState>> {
             let channel_id = channel_id.to_string();
+            let lockstep = self.lockstep_barrier();
             Box::pin(async move {
                 let state = self.inner.get_channel(&channel_id).await?;
+                // Return the snapshot only once every lockstep reader holds one.
+                if let Some(barrier) = lockstep {
+                    barrier.wait().await;
+                }
                 if !self.slow_write
                     && state
                         .as_ref()
@@ -2440,6 +3250,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
 
         fn delete_channel(&self, channel_id: &str) -> StoreFuture<'_, ()> {
             self.inner.delete_channel(channel_id)
+        }
+
+        fn delete_channel_if(
+            &self,
+            channel_id: &str,
+            approve: pay_kit::mpp::store::ChannelPredicate,
+        ) -> StoreFuture<'_, bool> {
+            self.inner.delete_channel_if(channel_id, approve)
         }
 
         fn update_channel(
@@ -2619,6 +3437,38 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
 
         let state = store.get_channel(&channel_id).await.unwrap().unwrap();
         assert_eq!(state.cumulative, 12, "each stream pays its own usage");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replicas_racing_one_watermark_each_pay_their_own_request() {
+        let store = StallingStore::new(u64::MAX, false);
+        let shared: Arc<dyn ChannelStore> = store.clone();
+        let channel = delegated_channel("racing-replicas", &shared).await;
+        let channel_id = channel.channel_id.clone();
+        let second = delegated_replica(
+            &channel.config,
+            &channel.operator,
+            "racing-replicas",
+            &shared,
+        );
+        let first_request =
+            crate::server::session::DelegatedUse::for_test(&channel.session, &channel_id).await;
+        let second_request =
+            crate::server::session::DelegatedUse::for_test(&second, &channel_id).await;
+        // Both replicas read the channel at cumulative 0 and sign the same
+        // deterministic voucher for 25; only one of them may land it.
+        store.hold_reads_in_lockstep(2);
+        let (first, second) = tokio::join!(
+            channel
+                .session
+                .authorize_delegated_usage(&first_request, 25),
+            second.authorize_delegated_usage(&second_request, 25),
+        );
+        let mut cumulatives = [first.unwrap().cumulative, second.unwrap().cumulative];
+        cumulatives.sort_unstable();
+        assert_eq!(cumulatives, [25, 50], "each request is charged once");
+        let state = store.inner.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 50);
     }
 
     #[tokio::test]

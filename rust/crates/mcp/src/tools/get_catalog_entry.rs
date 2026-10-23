@@ -44,7 +44,10 @@ struct EndpointEntry {
     pricing: Option<serde_json::Value>,
 }
 
-pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
+pub async fn run(
+    params: Params,
+    outbound_policy: pay_core::client::fetch::OutboundPolicy,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let fqn = params.fqn.clone();
     let mut catalog = match pay_core::skills::load_skills_for(pay_core::ClientApp::Mcp).await {
         Ok(catalog) => catalog,
@@ -54,8 +57,13 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             )));
         }
     };
-    if let Err(err) =
-        pay_core::skills::ensure_endpoints_for(&mut catalog, &fqn, pay_core::ClientApp::Mcp).await
+    if let Err(err) = pay_core::skills::ensure_endpoints_with_policy(
+        &mut catalog,
+        &fqn,
+        pay_core::ClientApp::Mcp,
+        outbound_policy,
+    )
+    .await
     {
         return Ok(super::tool_error(format!(
             "Failed to load catalog entry `{fqn}`: {err}"

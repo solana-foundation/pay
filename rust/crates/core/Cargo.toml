@@ -50,6 +50,7 @@ base64 = { workspace = true }
 # 3339 timestamps as `DateTime<Utc>` fields that round-trip through JSONL.
 chrono = { workspace = true, features = ["serde"] }
 percent-encoding = { workspace = true }
+url = "2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 opentelemetry = { workspace = true, optional = true }

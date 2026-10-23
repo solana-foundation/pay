@@ -155,23 +155,45 @@ pub enum RunOutcome {
 ///
 /// Appends `-D <tempfile>` after user args to capture response headers.
 /// stdout/stderr/stdin are inherited so the user sees normal curl output.
-pub fn run_curl(user_args: &[String]) -> Result<RunOutcome> {
+///
+/// `network_override` and `account_override` are the signing context the
+/// caller selected; a cached subscription bearer is only pre-attached when
+/// it belongs to that context.
+pub fn run_curl(
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
     if is_passthrough_metadata_request(user_args) {
         return run_plain_command("curl", user_args);
     }
 
     validate_curl_args_against_catalog(user_args)?;
-    let pre = pre_attach_cached_auth(user_args, ToolKind::Curl);
-    run_curl_inner(user_args, &pre)
+    run_initial(
+        ToolKind::Curl,
+        user_args,
+        network_override,
+        account_override,
+    )
 }
 
 /// Run `curl` with extra headers injected (used for retry after payment).
-pub fn run_curl_with_headers(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
-    run_curl_inner(user_args, extra_headers)
+///
+/// `resource_url` is the URL of the 402 the headers answer (the outcome's
+/// `resource_url`); the request goes straight there. See [`run_paid`].
+pub fn run_curl_with_headers(
+    user_args: &[String],
+    resource_url: &str,
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    run_paid(ToolKind::Curl, user_args, resource_url, extra_headers)
 }
 
-/// Validate a curl invocation against cached Pay catalog OpenAPI metadata.
+/// Validate a curl invocation before Pay attaches or signs anything for it:
+/// it must name a single transfer (see [`ensure_single_transfer`]) and match
+/// cached Pay catalog OpenAPI metadata.
 pub fn validate_curl_args_against_catalog(user_args: &[String]) -> Result<()> {
+    ensure_single_transfer(user_args, ToolKind::Curl)?;
     let request = ParsedCurlRequest::from_args(user_args);
     if let Some(url) = request.url.as_deref() {
         crate::skills::validate_cached_catalog_request(
@@ -183,8 +205,17 @@ pub fn validate_curl_args_against_catalog(user_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+    let named = resolve_request_url(user_args, ToolKind::Curl).unwrap_or_default();
+    run_with_headers(ToolKind::Curl, user_args, extra_headers, &named)
+}
+
+fn curl_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
     check_command_exists("curl")?;
+    if !extra_headers.is_empty() {
+        ensure_single_transfer(user_args, ToolKind::Curl)?;
+    }
 
     let header_file = NamedTempFile::new()?;
     let header_path = header_file.path();
@@ -193,7 +224,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 
     let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Curl);
 
-    debug!(args = ?user_args, extra = ?headers, "Running curl");
+    log_invocation(ToolKind::Curl, user_args, &headers);
 
     // Body goes to `-o body_file` so we can swallow it on 402; stdout is piped
     // so curl's `-w` writeout (which it emits to stdout after the transfer) is
@@ -204,6 +235,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     for h in &headers {
         cmd.arg("-H").arg(h);
     }
+    cmd.args(credential_redirect_guard(ToolKind::Curl, extra_headers));
     cmd.arg("-D").arg(header_path);
     cmd.arg("-o").arg(body_path);
     cmd.stdin(Stdio::inherit())
@@ -217,8 +249,9 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     // would silently mangle binary responses (images, PDFs, …) before we
     // ever print them.
     let body = std::fs::read(body_path).unwrap_or_default();
-    let (status_code, headers) = parse_http_headers(&headers_raw);
-    let url = find_url_in_args(user_args).unwrap_or_default();
+    let chain = parse_http_header_blocks(&headers_raw);
+    let last = chain.last().cloned().unwrap_or_default();
+    let status_code = last.status;
 
     debug!(?status_code, exit_code, "curl finished");
 
@@ -226,8 +259,19 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         // Swallow stderr/stdout/body on 402 — CLI handles display.
         // 402 challenge bodies are JSON per spec; lossy decode is fine.
         let body_text = String::from_utf8_lossy(&body);
-        return Ok(classify_402(&headers, Some(&body_text), &url));
+        let url = payment_url(user_args, ToolKind::Curl, &chain, named)?;
+        return Ok(Hop::Done(classify_402(
+            &last.headers,
+            Some(&body_text),
+            &url,
+        )));
     }
+    if !extra_headers.is_empty()
+        && let Some(next) = credential_free_redirect(user_args, ToolKind::Curl, &last)
+    {
+        return Ok(Hop::Redirect(next));
+    }
+    let headers = last.headers;
 
     // Not 402 — re-emit stderr (progress bar etc.), body, then any -w writeout.
     // `write_all(&body)` so binary bytes pass through untouched; print!
@@ -241,36 +285,56 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     if !writeout.is_empty() {
         print!("{writeout}");
     }
-    Ok(RunOutcome::Completed {
+    Ok(Hop::Done(RunOutcome::Completed {
         exit_code,
         body: None,
         content_type: None,
         response_headers: headers,
-    })
+    }))
 }
 
 /// Run `wget` with the given user args, detecting 402 + MPP challenges.
-pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
+///
+/// See [`run_curl`] for the signing-context arguments.
+pub fn run_wget(
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
     if is_passthrough_metadata_request(user_args) {
         return run_plain_command("wget", user_args);
     }
 
     validate_wget_args_against_catalog(user_args)?;
-    let pre = pre_attach_cached_auth(user_args, ToolKind::Wget);
-    run_wget_inner(user_args, &pre)
+    run_initial(
+        ToolKind::Wget,
+        user_args,
+        network_override,
+        account_override,
+    )
 }
 
 /// Run `http` (HTTPie) with the given user args, detecting 402 + MPP challenges.
 ///
 /// HTTPie uses positional `Header:Value` request items rather than `-H` flags,
 /// so `extra_headers` for retry are appended as positional args.
-pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
+///
+/// See [`run_curl`] for the signing-context arguments.
+pub fn run_httpie(
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
     if is_passthrough_metadata_request(user_args) {
         return run_plain_command("http", user_args);
     }
 
-    let pre = pre_attach_cached_auth(user_args, ToolKind::Httpie);
-    run_httpie_inner(user_args, &pre)
+    run_initial(
+        ToolKind::Httpie,
+        user_args,
+        network_override,
+        account_override,
+    )
 }
 
 /// Run `http` with extra headers injected (used for retry after payment).
@@ -279,18 +343,110 @@ pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
 /// (e.g. `"Authorization:Bearer …"`), already formatted by the caller.
 pub fn run_httpie_with_headers(
     user_args: &[String],
+    resource_url: &str,
     extra_headers: &[String],
 ) -> Result<RunOutcome> {
-    run_httpie_inner(user_args, extra_headers)
+    run_paid(ToolKind::Httpie, user_args, resource_url, extra_headers)
 }
 
 /// Run `wget` with extra headers injected (used for retry after payment).
-pub fn run_wget_with_headers(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
-    run_wget_inner(user_args, extra_headers)
+/// See [`run_curl_with_headers`].
+pub fn run_wget_with_headers(
+    user_args: &[String],
+    resource_url: &str,
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    run_paid(ToolKind::Wget, user_args, resource_url, extra_headers)
 }
 
-/// Validate a wget invocation against cached Pay catalog OpenAPI metadata.
+/// Redirect hops Pay steps itself for a credential-bearing request before
+/// giving up, matching the built-in fetch's limit.
+const MAX_CREDENTIAL_REDIRECTS: usize = 10;
+
+/// One run of a wrapped tool.
+enum Hop {
+    Done(RunOutcome),
+    /// The tool ran with Pay headers and redirects off, and the response
+    /// is a redirect the caller asked to follow: these are the args for the
+    /// next hop. Nothing of this response was shown to the caller.
+    Redirect(Vec<String>),
+}
+
+fn run_hop(tool: ToolKind, args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
+    match tool {
+        ToolKind::Curl => curl_hop(args, extra_headers, named),
+        ToolKind::Wget => wget_hop(args, extra_headers, named),
+        ToolKind::Httpie => httpie_hop(args, extra_headers, named),
+    }
+}
+
+/// The first request of a `pay curl|wget|http` command.
+///
+/// A cached subscription bearer is attached per destination: each redirect
+/// hop the caller asked to follow is a new request, and it carries only the
+/// bearer cached for its own URL (if any). Hops without one run with the
+/// tool's own redirect handling.
+fn run_initial(
+    tool: ToolKind,
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
+    let named = resolve_request_url(user_args, tool).unwrap_or_default();
+    let mut args = user_args.to_vec();
+    for _ in 0..=MAX_CREDENTIAL_REDIRECTS {
+        let pre = pre_attach_cached_auth(&args, tool, network_override, account_override);
+        match run_hop(tool, &args, &pre, &named)? {
+            Hop::Done(outcome) => return Ok(outcome),
+            Hop::Redirect(next) => args = next,
+        }
+    }
+    Err(too_many_redirects(&named))
+}
+
+/// The paid retry: the request with Pay's headers, sent to `resource_url`.
+///
+/// The headers go to `resource_url` only. If it answers with a redirect the
+/// caller asked to follow (`curl -L`, wget's default, `http --follow`) and
+/// the request is a bodyless read, the next hop runs without any Pay header,
+/// with the tool's own redirect handling from there on.
+fn run_paid(
+    tool: ToolKind,
+    user_args: &[String],
+    resource_url: &str,
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    let args = paid_request_args(user_args, tool, resource_url);
+    let named = resolve_request_url(&args, tool).unwrap_or_default();
+    run_with_headers(tool, &args, extra_headers, &named)
+}
+
+fn run_with_headers(
+    tool: ToolKind,
+    args: &[String],
+    extra_headers: &[String],
+    named: &str,
+) -> Result<RunOutcome> {
+    match run_hop(tool, args, extra_headers, named)? {
+        Hop::Done(outcome) => Ok(outcome),
+        Hop::Redirect(next) => match run_hop(tool, &next, &[], named)? {
+            Hop::Done(outcome) => Ok(outcome),
+            // A hop without Pay headers runs with the tool's own redirect
+            // handling and never stops at a redirect.
+            Hop::Redirect(_) => Err(too_many_redirects(named)),
+        },
+    }
+}
+
+fn too_many_redirects(url: &str) -> Error {
+    Error::RequestValidation(format!("{url} redirected too many times"))
+}
+
+/// Validate a wget invocation before Pay attaches or signs anything for it:
+/// it must name a single transfer (see [`ensure_single_transfer`]) and match
+/// cached Pay catalog OpenAPI metadata.
 pub fn validate_wget_args_against_catalog(user_args: &[String]) -> Result<()> {
+    ensure_single_transfer(user_args, ToolKind::Wget)?;
     let request = ParsedWgetRequest::from_args(user_args);
     if let Some(url) = request.url.as_deref() {
         crate::skills::validate_cached_catalog_request(
@@ -302,8 +458,17 @@ pub fn validate_wget_args_against_catalog(user_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+    let named = resolve_request_url(user_args, ToolKind::Wget).unwrap_or_default();
+    run_with_headers(ToolKind::Wget, user_args, extra_headers, &named)
+}
+
+fn wget_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
     check_command_exists("wget")?;
+    if !extra_headers.is_empty() {
+        ensure_single_transfer(user_args, ToolKind::Wget)?;
+    }
 
     let has_server_response = user_args
         .iter()
@@ -319,18 +484,20 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     for h in &headers {
         cmd.arg("--header").arg(h);
     }
+    cmd.args(credential_redirect_guard(ToolKind::Wget, extra_headers));
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::piped());
 
-    debug!(args = ?user_args, extra = ?headers, "Running wget");
+    log_invocation(ToolKind::Wget, user_args, &headers);
 
     let output = cmd.output()?;
     let exit_code = output.status.code().unwrap_or(1);
     let stderr_text = String::from_utf8_lossy(&output.stderr);
 
-    let (status_code, headers) = parse_wget_headers(&stderr_text);
-    let url = find_url_in_args(user_args).unwrap_or_default();
+    let chain = parse_wget_header_blocks(&stderr_text);
+    let last = chain.last().cloned().unwrap_or_default();
+    let status_code = last.status;
 
     debug!(?status_code, exit_code, "wget finished");
 
@@ -340,27 +507,36 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         // result, we can't surface server `verification_failed` reasons for
         // wget retries (only curl/fetch). The retry path falls back to a
         // generic "still 402" message.
-        return Ok(classify_402(&headers, None, &url));
+        let url = payment_url(user_args, ToolKind::Wget, &chain, named)?;
+        return Ok(Hop::Done(classify_402(&last.headers, None, &url)));
     }
+    // wget writes nothing for a redirect it does not follow, so dropping
+    // this run's stderr is all it takes to hide the hop.
+    if !extra_headers.is_empty()
+        && let Some(next) = credential_free_redirect(user_args, ToolKind::Wget, &last)
+    {
+        return Ok(Hop::Redirect(next));
+    }
+    let headers = last.headers;
 
     // Re-emit stderr on success
     eprint!("{stderr_text}");
-    Ok(RunOutcome::Completed {
+    Ok(Hop::Done(RunOutcome::Completed {
         exit_code,
         body: None,
         content_type: None,
         response_headers: headers,
-    })
+    }))
 }
 
-fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+fn httpie_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
     use std::io::IsTerminal;
 
     check_command_exists("http")?;
 
     let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Httpie);
 
-    debug!(args = ?user_args, extra = ?headers, "Running httpie");
+    log_invocation(ToolKind::Httpie, user_args, &headers);
 
     // HTTPie has no `-D <file>` equivalent, so we capture stdout and parse the
     // response status from the first `HTTP/x.y <code>` line. We force three flags
@@ -379,6 +555,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     for h in &headers {
         cmd.arg(h);
     }
+    cmd.args(credential_redirect_guard(ToolKind::Httpie, extra_headers));
     cmd.arg("--no-all");
     cmd.arg("--print=hb");
     if stdout_is_tty {
@@ -399,31 +576,48 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     let exit_code = output.status.code().unwrap_or(1);
     let stdout_text = String::from_utf8_lossy(&output.stdout);
     let stderr_text = String::from_utf8_lossy(&output.stderr);
-    // HTTPie accepts `:port/path` and `host[:port]/path` shorthand;
-    // expand both so the URL persisted alongside an activated
-    // subscription matches what the next request will hit (the SIWMPP
-    // cache lookup is a URL-prefix match).
-    let url = resolve_request_url(user_args, ToolKind::Httpie).unwrap_or_default();
 
     let (status_code, headers, body) = parse_httpie_output(&stdout_text);
 
     debug!(?status_code, exit_code, "httpie finished");
 
+    // `--no-all` hides the hops HTTPie followed, so the 402 is taken to
+    // come from the URL on the command line.
+    let last = ResponseHead {
+        status: status_code,
+        headers,
+    };
     if status_code == Some(402) {
         // Swallow stdout/stderr on 402 — CLI handles display
-        return Ok(classify_402(&headers, body.as_deref(), &url));
+        let url = payment_url(
+            user_args,
+            ToolKind::Httpie,
+            std::slice::from_ref(&last),
+            named,
+        )?;
+        return Ok(Hop::Done(classify_402(
+            &last.headers,
+            body.as_deref(),
+            &url,
+        )));
     }
+    if !extra_headers.is_empty()
+        && let Some(next) = credential_free_redirect(user_args, ToolKind::Httpie, &last)
+    {
+        return Ok(Hop::Redirect(next));
+    }
+    let headers = last.headers;
 
     if !stderr_text.is_empty() {
         eprint!("{stderr_text}");
     }
     print!("{stdout_text}");
-    Ok(RunOutcome::Completed {
+    Ok(Hop::Done(RunOutcome::Completed {
         exit_code,
         body: None,
         content_type: None,
         response_headers: headers,
-    })
+    }))
 }
 
 /// Parse HTTPie's combined stdout into `(status, response_headers, body)`.
@@ -1199,67 +1393,273 @@ fn check_command_exists(cmd: &str) -> Result<()> {
     }
 }
 
+/// One response head (status line and headers) out of a tool's trace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResponseHead {
+    status: Option<u16>,
+    headers: Vec<(String, String)>,
+}
+
+impl ResponseHead {
+    #[cfg(test)]
+    fn into_parts(self) -> (Option<u16>, Vec<(String, String)>) {
+        (self.status, self.headers)
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn redirect_location(&self) -> Option<&str> {
+        self.status
+            .filter(|status| (300..400).contains(status))
+            .and_then(|_| self.header("location"))
+    }
+}
+
 /// Parse HTTP headers from curl's `-D` dump format.
 ///
 /// Handles redirect chains by taking the LAST header block (the final response).
+#[cfg(test)]
 fn parse_http_headers(raw: &str) -> (Option<u16>, Vec<(String, String)>) {
-    let blocks: Vec<&str> = raw.split("\r\n\r\n").filter(|b| !b.is_empty()).collect();
-    let block = match blocks.last() {
-        Some(b) => b,
-        None => return (None, vec![]),
-    };
+    parse_http_header_blocks(raw)
+        .pop()
+        .map_or((None, Vec::new()), ResponseHead::into_parts)
+}
 
-    let mut status_code = None;
-    let mut headers = Vec::new();
-
-    for line in block.lines() {
-        let line = line.trim();
-        if line.starts_with("HTTP/") {
-            status_code = line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u16>().ok());
-        } else if let Some((key, value)) = line.split_once(':') {
-            headers.push((key.trim().to_lowercase(), value.trim().to_string()));
-        }
-    }
-
-    (status_code, headers)
+/// Every response head in curl's `-D` dump, in the order curl received them
+/// (one per redirect hop when curl followed redirects).
+fn parse_http_header_blocks(raw: &str) -> Vec<ResponseHead> {
+    raw.split("\r\n\r\n")
+        .filter(|b| !b.trim().is_empty())
+        .map(|block| {
+            let mut status = None;
+            let mut headers = Vec::new();
+            for line in block.lines() {
+                let line = line.trim();
+                if line.starts_with("HTTP/") {
+                    status = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse::<u16>().ok());
+                } else if let Some((key, value)) = line.split_once(':') {
+                    headers.push((key.trim().to_lowercase(), value.trim().to_string()));
+                }
+            }
+            ResponseHead { status, headers }
+        })
+        .collect()
 }
 
 /// Parse HTTP headers from wget's `--server-response` stderr output.
+#[cfg(test)]
 fn parse_wget_headers(stderr: &str) -> (Option<u16>, Vec<(String, String)>) {
-    let mut status_code = None;
-    let mut headers = Vec::new();
+    parse_wget_header_blocks(stderr)
+        .pop()
+        .map_or((None, Vec::new()), ResponseHead::into_parts)
+}
 
-    let mut current_status = None;
-    let mut current_headers = Vec::new();
-
+/// Every response head in wget's `--server-response` output, one per hop.
+fn parse_wget_header_blocks(stderr: &str) -> Vec<ResponseHead> {
+    let mut blocks: Vec<ResponseHead> = Vec::new();
     for line in stderr.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("HTTP/") {
-            if current_status.is_some() {
-                status_code = current_status;
-                headers = std::mem::take(&mut current_headers);
-            }
-            current_status = trimmed
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u16>().ok());
-        } else if let Some((key, value)) = trimmed.split_once(':') {
+            blocks.push(ResponseHead {
+                status: trimmed
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u16>().ok()),
+                headers: Vec::new(),
+            });
+        } else if let Some(block) = blocks.last_mut()
+            && let Some((key, value)) = trimmed.split_once(':')
+        {
             let key = key.trim();
             if !key.is_empty() && !key.contains(' ') {
-                current_headers.push((key.to_lowercase(), value.trim().to_string()));
+                block
+                    .headers
+                    .push((key.to_lowercase(), value.trim().to_string()));
             }
         }
     }
+    blocks
+}
 
-    if current_status.is_some() {
-        status_code = current_status;
-        headers = current_headers;
+/// The URL that produced the last response in `chain`, given the URL the
+/// tool was asked for: each redirect hop the tool followed moves it to the
+/// hop's `Location`, resolved against the URL that sent it.
+fn answering_url(requested: &str, chain: &[ResponseHead]) -> String {
+    let Ok(mut current) = url::Url::parse(requested) else {
+        return requested.to_string();
+    };
+    let Some((_last, followed)) = chain.split_last() else {
+        return requested.to_string();
+    };
+    let mut moved = false;
+    for head in followed {
+        if let Some(next) = head
+            .redirect_location()
+            .and_then(|location| current.join(location).ok())
+        {
+            moved |= next != current;
+            current = next;
+        }
     }
+    if moved {
+        current.into()
+    } else {
+        requested.to_string()
+    }
+}
 
-    (status_code, headers)
+/// The URL Pay pays for when a 402 arrives at the end of `chain`.
+///
+/// Without injected headers the tool follows redirects the caller asked for
+/// (`curl -L`, wget's default), so the 402 may come from a later hop: a
+/// trailing-slash redirect or an `http` to `https` upgrade. The credential is
+/// built for, and later sent straight to, the URL that asked for it, so it
+/// never rides a redirect. A 402 from another origin than the one the caller
+/// named is refused: Pay only pays the origin on the command line.
+///
+/// The paid retry replays the caller's args at that URL, so it must be the
+/// request that got the 402. See [`ensure_replays_the_redirected_request`].
+fn payment_url(
+    args: &[String],
+    tool: ToolKind,
+    chain: &[ResponseHead],
+    named: &str,
+) -> Result<String> {
+    // Expands HTTPie's `:port/path` shorthand too, so the URL kept with an
+    // activated subscription matches what the next request hits.
+    let requested = resolve_request_url(args, tool).unwrap_or_default();
+    // A target without a scheme (`pay wget example.com/x`) cannot be placed,
+    // so neither can a redirect from it: the 402 may come from any origin.
+    if requested.is_empty() && chain.iter().any(|head| head.redirect_location().is_some()) {
+        return Err(Error::RequestValidation(
+            "the request was redirected before it asked for payment, and Pay cannot tell \
+             which origin asked because the URL has no scheme. Run it again with \
+             `https://` (or `http://`) in front of the URL."
+                .to_string(),
+        ));
+    }
+    let answering = answering_url(&requested, chain);
+    if answering != requested {
+        ensure_replays_the_redirected_request(args, tool, chain, &answering)?;
+        if retarget_args(args, tool, &requested, &answering).is_none() {
+            return Err(Error::RequestValidation(format!(
+                "the request was redirected to {answering}, which asked for payment, but \
+                 Pay cannot aim this command at {answering} without changing the request \
+                 (curl's `-G` builds the query from the request body). Send the request \
+                 to {answering} directly."
+            )));
+        }
+    }
+    if answering == named {
+        return Ok(answering);
+    }
+    let same_origin = match (url::Url::parse(named), url::Url::parse(&answering)) {
+        (Ok(from), Ok(to)) => crate::client::fetch::is_same_origin_redirect(&from, &to),
+        _ => false,
+    };
+    if !same_origin {
+        return Err(Error::RequestValidation(format!(
+            "{named} redirected to {answering}, which asked for payment. Pay only pays \
+             the origin named on the command line; request {answering} directly."
+        )));
+    }
+    Ok(answering)
+}
+
+/// Refuse, before anything is signed, a paid retry that would not be the
+/// request the 402 answered.
+///
+/// The retry sends the caller's args, method and body included, straight to
+/// the URL that asked for payment. After a redirect the tool may have reached
+/// that URL with another request: curl and wget turn a POST into a bodyless
+/// GET on 301, 302 and 303 (HEAD stays HEAD), and keep the method and body
+/// only on 307 and 308. So the replay is faithful for a bodyless GET or HEAD
+/// after any redirect, and for any other request only when every hop was a
+/// 307 or 308 and the body can be sent again (it is not read from stdin).
+/// `-X`, `--post30x` and uploads all fall in the refused set unless every
+/// hop kept the method anyway.
+fn ensure_replays_the_redirected_request(
+    args: &[String],
+    tool: ToolKind,
+    chain: &[ResponseHead],
+    answering: &str,
+) -> Result<()> {
+    if is_bodyless_read(args, tool) {
+        return Ok(());
+    }
+    let followed = chain.split_last().map_or(&[][..], |(_, followed)| followed);
+    let keeps_request = followed
+        .iter()
+        .filter(|head| head.redirect_location().is_some())
+        .all(|head| matches!(head.status, Some(307 | 308)));
+    if keeps_request && !reads_body_from_stdin(args, tool) {
+        return Ok(());
+    }
+    Err(Error::RequestValidation(format!(
+        "the request was redirected to {answering}, which asked for payment, but the \
+         redirect changed the request (its method or body), so Pay cannot replay it \
+         faithfully with the payment. Send the request to {answering} directly."
+    )))
+}
+
+/// Whether the request body (or upload) is read from stdin, which a second
+/// run of the tool cannot read again.
+fn reads_body_from_stdin(args: &[String], tool: ToolKind) -> bool {
+    let Some(spec) = transfer_options(tool) else {
+        return false;
+    };
+    let line = CommandLine::parse(args, spec);
+    line.options.iter().any(|option| {
+        let value = option.value.unwrap_or_default();
+        match (tool, option.name) {
+            (ToolKind::Curl, OptionName::Short('T') | OptionName::Long("upload-file")) => {
+                matches!(value, "-" | ".")
+            }
+            // `--data-raw` and `--form-string` are always literal.
+            (
+                ToolKind::Curl,
+                OptionName::Short('d')
+                | OptionName::Long("data" | "data-ascii" | "data-binary" | "json"),
+            ) => value == "@-",
+            (ToolKind::Curl, OptionName::Long("data-urlencode")) => {
+                curl_urlencode_reads_stdin(value)
+            }
+            (ToolKind::Curl, OptionName::Short('F') | OptionName::Long("form")) => {
+                curl_form_reads_stdin(value)
+            }
+            (ToolKind::Wget, OptionName::Long("post-file" | "body-file")) => value == "-",
+            _ => false,
+        }
+    })
+}
+
+/// `--data-urlencode` reads a file when an `@` comes before any `=`
+/// (`@file`, `name@file`); the file `-` is stdin.
+fn curl_urlencode_reads_stdin(value: &str) -> bool {
+    match value.find(['=', '@']) {
+        Some(at) if value[at..].starts_with('@') => &value[at + 1..] == "-",
+        _ => false,
+    }
+}
+
+/// `-F name=@file` uploads and `-F name=<file` inlines a file, optionally
+/// followed by `;type=...` parameters; the file `-` is stdin.
+fn curl_form_reads_stdin(value: &str) -> bool {
+    let Some((_, content)) = value.split_once('=') else {
+        return false;
+    };
+    let Some(file) = content.strip_prefix(['@', '<']) else {
+        return false;
+    };
+    file.split(';').next() == Some("-")
 }
 
 /// Heuristic: find the URL from command args.
@@ -1299,6 +1699,1024 @@ fn headers_with_default_user_agent(
     headers
 }
 
+/// Reject a curl or wget invocation that would make more than one transfer.
+///
+/// Headers Pay injects (a payment, a sign-in proof, a cached subscription
+/// bearer) and the caller's shared body apply to every transfer in the
+/// command, while the 402 and its credential belong to one URL. A second
+/// URL, `--next`, a config or input file, URL globbing, variable expansion
+/// or a recursive crawl would hand them to destinations nobody paid. Unknown
+/// options are read as flags, so a value they take counts as another URL:
+/// the check errs toward refusing the command.
+fn ensure_single_transfer(args: &[String], tool: ToolKind) -> Result<()> {
+    let refuse = |why: &str| {
+        Err(Error::RequestValidation(format!(
+            "pay sends payment credentials to a single URL, but this command {why}. \
+             Run one `pay {}` per URL.",
+            match tool {
+                ToolKind::Curl => "curl",
+                ToolKind::Wget => "wget",
+                ToolKind::Httpie => "http",
+            }
+        )))
+    };
+    let Some(spec) = transfer_options(tool) else {
+        // HTTPie takes exactly one URL by construction.
+        return Ok(());
+    };
+    let line = CommandLine::parse(args, spec);
+    for option in &line.options {
+        match option.name {
+            OptionName::Long(name) if spec.adds_transfers(name) => {
+                return refuse(&format!("uses `--{name}`"));
+            }
+            // The tool itself rejects an ambiguous abbreviation, but one
+            // that could stand for a transfer-adding option is refused here
+            // whatever the tool's option table says.
+            OptionName::Ambiguous(typed)
+                if spec
+                    .long
+                    .candidates(typed)
+                    .any(|name| spec.adds_transfers(name)) =>
+            {
+                return refuse(&format!("uses `--{typed}`"));
+            }
+            OptionName::Short(c) if spec.multi_transfer_short.contains(c) => {
+                return refuse(&format!("uses `-{c}`"));
+            }
+            _ => {}
+        }
+    }
+    for target in &line.targets {
+        if target.via_option && target.value.starts_with('@') {
+            return refuse("reads URLs from a file");
+        }
+    }
+    if line.targets.len() > 1 {
+        return refuse(&format!("names {} URLs", line.targets.len()));
+    }
+    Ok(())
+}
+
+fn transfer_options(tool: ToolKind) -> Option<&'static TransferOptions> {
+    match tool {
+        ToolKind::Curl => Some(&CURL_OPTIONS),
+        ToolKind::Wget => Some(&WGET_OPTIONS),
+        ToolKind::Httpie => None,
+    }
+}
+
+/// A curl or wget command line split the way the tool reads it: options
+/// with the value each one consumes, and the transfer targets (URLs).
+///
+/// Every check over a command line goes through this one reading, so an
+/// option is never seen as a flag by one check and as a URL by another.
+/// Unknown options are read as flags: a value they take then counts as
+/// another target, which errs toward refusing the command.
+struct CommandLine<'a> {
+    options: Vec<ParsedOption<'a>>,
+    targets: Vec<TargetArg<'a>>,
+}
+
+struct ParsedOption<'a> {
+    name: OptionName<'a>,
+    value: Option<&'a str>,
+    /// The arguments the option and its value occupy (a short-flag cluster
+    /// such as `-sG` is shared by every flag in it).
+    args: std::ops::RangeInclusive<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionName<'a> {
+    /// A long option by its full name, however the caller abbreviated it.
+    Long(&'a str),
+    /// An abbreviation the tool refuses because it fits several options.
+    Ambiguous(&'a str),
+    Short(char),
+}
+
+/// Where a transfer target sits in the argument list.
+struct TargetArg<'a> {
+    index: usize,
+    value: &'a str,
+    /// The target is the value of the tool's URL option (`--url X` or
+    /// `--url=X`) rather than a positional argument.
+    via_option: bool,
+    /// `args[index]` is `--url=<value>`, not the bare value.
+    inline: bool,
+}
+
+impl<'a> CommandLine<'a> {
+    fn parse(args: &'a [String], spec: &TransferOptions) -> Self {
+        let mut options = Vec::new();
+        let mut targets = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let start = i;
+            let arg = args[i].as_str();
+            if arg == "--" {
+                targets.extend((i + 1..args.len()).map(|index| TargetArg {
+                    index,
+                    value: args[index].as_str(),
+                    via_option: false,
+                    inline: false,
+                }));
+                break;
+            }
+            if let Some(long) = arg.strip_prefix("--") {
+                let (name, inline_value) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (long, None),
+                };
+                let (name, arg) = match spec.long.resolve(name) {
+                    LongMatch::Known(name, arg) => (OptionName::Long(name), arg),
+                    LongMatch::Ambiguous(typed) => (OptionName::Ambiguous(typed), LongArg::None),
+                };
+                let is_url = spec
+                    .url_long
+                    .is_some_and(|url| name == OptionName::Long(url));
+                let takes_value = is_url || arg == LongArg::Required;
+                let value = match inline_value {
+                    Some(value) => Some(value),
+                    None if takes_value => {
+                        i += 1;
+                        args.get(i).map(String::as_str)
+                    }
+                    None => None,
+                };
+                if is_url && let Some(value) = value {
+                    targets.push(TargetArg {
+                        index: i,
+                        value,
+                        via_option: true,
+                        inline: inline_value.is_some(),
+                    });
+                }
+                options.push(ParsedOption {
+                    name,
+                    value,
+                    args: start..=i.min(args.len() - 1),
+                });
+            } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
+                let mut chars = shorts.char_indices();
+                while let Some((at, c)) = chars.next() {
+                    if spec.boolean_prefix_short.contains(c) {
+                        // wget's `-nv`, `-nc`, ...: the next letter is part of
+                        // the flag name, not another option.
+                        chars.next();
+                        continue;
+                    }
+                    if spec.value_short.contains(c) {
+                        let rest = &shorts[at + c.len_utf8()..];
+                        let value = if rest.is_empty() {
+                            i += 1;
+                            args.get(i).map(String::as_str)
+                        } else {
+                            Some(rest)
+                        };
+                        options.push(ParsedOption {
+                            name: OptionName::Short(c),
+                            value,
+                            args: start..=i.min(args.len() - 1),
+                        });
+                        break;
+                    }
+                    options.push(ParsedOption {
+                        name: OptionName::Short(c),
+                        value: None,
+                        args: start..=start,
+                    });
+                }
+            } else {
+                targets.push(TargetArg {
+                    index: i,
+                    value: arg,
+                    via_option: false,
+                    inline: false,
+                });
+            }
+            i += 1;
+        }
+        Self { options, targets }
+    }
+}
+
+/// The options of a wget command line, by full name.
+fn wget_options(args: &[String]) -> impl Iterator<Item = (OptionName<'_>, Option<&str>)> {
+    CommandLine::parse(args, &WGET_OPTIONS)
+        .options
+        .into_iter()
+        .map(|option| (option.name, option.value))
+}
+
+/// What [`ensure_single_transfer`] needs to know about a tool's options.
+struct TransferOptions {
+    /// Short options that consume a value (attached or as the next arg).
+    value_short: &'static str,
+    /// Short letters that start a two-letter boolean flag (wget's `-n?`).
+    boolean_prefix_short: &'static str,
+    /// Short options that add transfers on their own.
+    multi_transfer_short: &'static str,
+    /// How long options (without `--`) are spelled and what they take.
+    long: LongOptions,
+    /// Long options that add transfers on their own.
+    multi_transfer_long: &'static [&'static str],
+    multi_transfer_long_prefixes: &'static [&'static str],
+    /// The long option whose value is a URL, if the tool has one.
+    url_long: Option<&'static str>,
+}
+
+impl TransferOptions {
+    fn adds_transfers(&self, name: &str) -> bool {
+        self.multi_transfer_long.contains(&name)
+            || self
+                .multi_transfer_long_prefixes
+                .iter()
+                .any(|p| name.starts_with(p))
+    }
+}
+
+/// Whether a long option takes a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongArg {
+    None,
+    /// The value is the rest of the argument or the next one.
+    Required,
+    /// The value is only ever given inline (`--name=value`).
+    Optional,
+}
+
+/// How a tool matches the long options on its command line.
+enum LongOptions {
+    /// Names are matched exactly (curl). Only the ones that take a value
+    /// are listed; anything else is a flag.
+    Exact {
+        takes_value: &'static [&'static str],
+    },
+    /// `getopt_long` (wget): an exact name, or else any prefix of exactly
+    /// one name, selects that option. This is the tool's whole table.
+    Abbreviable(&'static [(&'static str, LongArg)]),
+}
+
+enum LongMatch<'a> {
+    Known(&'a str, LongArg),
+    Ambiguous(&'a str),
+}
+
+impl LongOptions {
+    fn resolve<'a>(&self, typed: &'a str) -> LongMatch<'a> {
+        match self {
+            Self::Exact { takes_value } => {
+                let arg = if takes_value.contains(&typed) {
+                    LongArg::Required
+                } else {
+                    LongArg::None
+                };
+                LongMatch::Known(typed, arg)
+            }
+            Self::Abbreviable(table) => {
+                if let Some(&(name, arg)) = table.iter().find(|(name, _)| *name == typed) {
+                    return LongMatch::Known(name, arg);
+                }
+                let mut candidates = table.iter().filter(|(name, _)| name.starts_with(typed));
+                match (candidates.next(), candidates.next()) {
+                    (Some(&(name, arg)), None) => LongMatch::Known(name, arg),
+                    (Some(_), Some(_)) => LongMatch::Ambiguous(typed),
+                    // Unknown: the tool refuses to run at all.
+                    (None, _) => LongMatch::Known(typed, LongArg::None),
+                }
+            }
+        }
+    }
+
+    /// Every option name `typed` could abbreviate.
+    fn candidates<'s>(&'s self, typed: &'s str) -> impl Iterator<Item = &'static str> + 's {
+        let table: &'static [(&'static str, LongArg)] = match self {
+            Self::Exact { .. } => &[],
+            Self::Abbreviable(table) => table,
+        };
+        table
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(move |name| name.starts_with(typed))
+    }
+}
+
+static CURL_OPTIONS: TransferOptions = TransferOptions {
+    value_short: "ECbcdDFPHmoxUQreXYytzTuAw",
+    boolean_prefix_short: "",
+    // `-:` is `--next`, `-K` reads a config file that can add URLs.
+    multi_transfer_short: ":K",
+    // curl matches long options exactly: `--nex` is an unknown option, not
+    // `--next` (checked against curl 8.7 and 8.20).
+    long: LongOptions::Exact {
+        takes_value: &[
+            "abstract-unix-socket",
+            "alt-svc",
+            "aws-sigv4",
+            "cacert",
+            "capath",
+            "cert",
+            "cert-type",
+            "ciphers",
+            "connect-timeout",
+            "connect-to",
+            "continue-at",
+            "cookie",
+            "cookie-jar",
+            "create-file-mode",
+            "crlfile",
+            "curves",
+            "data",
+            "data-ascii",
+            "data-binary",
+            "data-raw",
+            "data-urlencode",
+            "delegation",
+            "dns-interface",
+            "dns-ipv4-addr",
+            "dns-ipv6-addr",
+            "dns-servers",
+            "doh-url",
+            "dump-header",
+            "ech",
+            "egd-file",
+            "engine",
+            "etag-compare",
+            "etag-save",
+            "expect100-timeout",
+            "form",
+            "form-string",
+            "ftp-account",
+            "ftp-alternative-to-user",
+            "ftp-method",
+            "ftp-port",
+            "ftp-ssl-ccc-mode",
+            "happy-eyeballs-timeout-ms",
+            "haproxy-clientip",
+            "header",
+            "hostpubmd5",
+            "hostpubsha256",
+            "hsts",
+            "interface",
+            "ip-tos",
+            "ipfs-gateway",
+            "json",
+            "keepalive-cnt",
+            "keepalive-time",
+            "key",
+            "key-type",
+            "knownhosts",
+            "krb",
+            "libcurl",
+            "limit-rate",
+            "local-port",
+            "login-options",
+            "mail-auth",
+            "mail-from",
+            "mail-rcpt",
+            "max-filesize",
+            "max-redirs",
+            "max-time",
+            "netrc-file",
+            "noproxy",
+            "oauth2-bearer",
+            "output",
+            "output-dir",
+            "parallel-max",
+            "pass",
+            "pinnedpubkey",
+            "preproxy",
+            "proto",
+            "proto-default",
+            "proto-redir",
+            "proxy",
+            "proxy1.0",
+            "proxy-cacert",
+            "proxy-capath",
+            "proxy-cert",
+            "proxy-cert-type",
+            "proxy-ciphers",
+            "proxy-crlfile",
+            "proxy-header",
+            "proxy-key",
+            "proxy-key-type",
+            "proxy-pass",
+            "proxy-pinnedpubkey",
+            "proxy-service-name",
+            "proxy-tls13-ciphers",
+            "proxy-tlsauthtype",
+            "proxy-tlspassword",
+            "proxy-tlsuser",
+            "proxy-user",
+            "pubkey",
+            "quote",
+            "random-file",
+            "range",
+            "rate",
+            "referer",
+            "request",
+            "request-target",
+            "resolve",
+            "retry",
+            "retry-delay",
+            "retry-max-time",
+            "sasl-authzid",
+            "service-name",
+            "sigalgs",
+            "socks4",
+            "socks4a",
+            "socks5",
+            "socks5-gssapi-service",
+            "socks5-hostname",
+            "speed-limit",
+            "speed-time",
+            "ssl-sessions",
+            "stderr",
+            "telnet-option",
+            "tftp-blksize",
+            "time-cond",
+            "tls-max",
+            "tls13-ciphers",
+            "tlsauthtype",
+            "tlspassword",
+            "tlsuser",
+            "trace",
+            "trace-ascii",
+            "trace-config",
+            "unix-socket",
+            "upload-file",
+            "upload-flags",
+            "url-query",
+            "user",
+            "user-agent",
+            "vlan-priority",
+            "write-out",
+        ],
+    },
+    // `--variable` and `--expand-*` can synthesise URLs at run time.
+    multi_transfer_long: &["next", "config", "variable"],
+    multi_transfer_long_prefixes: &["expand-"],
+    url_long: Some("url"),
+};
+
+static WGET_OPTIONS: TransferOptions = TransferOptions {
+    value_short: "oaBtOTwQPUlARDIXY",
+    boolean_prefix_short: "n",
+    // `-i` reads URLs from a file; `-r`, `-m` and `-p` crawl; `-e` runs
+    // wgetrc commands, which can set any of those.
+    multi_transfer_short: "irmpe",
+    long: LongOptions::Abbreviable(WGET_LONG_OPTIONS),
+    multi_transfer_long: &[
+        "input-file",
+        "input-metalink",
+        "recursive",
+        "mirror",
+        "page-requisites",
+        "execute",
+        "config",
+        // Downloads the file from the mirrors a metalink response lists.
+        "metalink-over-http",
+    ],
+    multi_transfer_long_prefixes: &[],
+    url_long: None,
+};
+
+/// wget's long options, as `getopt_long` sees them: every entry of
+/// `option_data` in wget's `src/main.c`, plus the `no-` twin `init_switches`
+/// adds for each boolean (booleans take an inline value only, `--foo=off`).
+/// The whole table is needed to resolve abbreviations the way wget does:
+/// `--input-fil` is `--input-file`, `--mirro` is `--mirror`, `--exec` is
+/// `--execute`.
+static WGET_LONG_OPTIONS: &[(&str, LongArg)] = &[
+    ("accept", LongArg::Required),
+    ("accept-regex", LongArg::Required),
+    ("adjust-extension", LongArg::Optional),
+    ("append-output", LongArg::Required),
+    ("ask-password", LongArg::Optional),
+    ("auth-no-challenge", LongArg::Optional),
+    ("background", LongArg::Optional),
+    ("backup-converted", LongArg::Optional),
+    ("backups", LongArg::Optional),
+    ("base", LongArg::Required),
+    ("bind-address", LongArg::Required),
+    ("bind-dns-address", LongArg::Required),
+    ("body-data", LongArg::Required),
+    ("body-file", LongArg::Required),
+    ("ca-certificate", LongArg::Required),
+    ("ca-directory", LongArg::Required),
+    ("cache", LongArg::Optional),
+    ("certificate", LongArg::Required),
+    ("certificate-type", LongArg::Required),
+    ("check-certificate", LongArg::Optional),
+    ("ciphers", LongArg::Required),
+    ("clobber", LongArg::Optional),
+    ("compression", LongArg::Required),
+    ("config", LongArg::Required),
+    ("connect-timeout", LongArg::Required),
+    ("content-disposition", LongArg::Optional),
+    ("content-on-error", LongArg::Optional),
+    ("continue", LongArg::Optional),
+    ("convert-file-only", LongArg::Optional),
+    ("convert-links", LongArg::Optional),
+    ("cookies", LongArg::Optional),
+    ("crl-file", LongArg::Required),
+    ("cut-dirs", LongArg::Required),
+    ("debug", LongArg::Optional),
+    ("default-page", LongArg::Required),
+    ("delete-after", LongArg::Optional),
+    ("directories", LongArg::Optional),
+    ("directory-prefix", LongArg::Required),
+    ("dns-cache", LongArg::Optional),
+    ("dns-servers", LongArg::Required),
+    ("dns-timeout", LongArg::Required),
+    ("domains", LongArg::Required),
+    ("dont-remove-listing", LongArg::None),
+    ("dot-style", LongArg::Required),
+    ("egd-file", LongArg::Required),
+    ("exclude-directories", LongArg::Required),
+    ("exclude-domains", LongArg::Required),
+    ("execute", LongArg::Required),
+    ("follow-ftp", LongArg::Optional),
+    ("follow-tags", LongArg::Required),
+    ("force-directories", LongArg::Optional),
+    ("force-html", LongArg::Optional),
+    ("ftp-password", LongArg::Required),
+    ("ftp-stmlf", LongArg::Optional),
+    ("ftp-user", LongArg::Required),
+    ("ftps-clear-data-connection", LongArg::Optional),
+    ("ftps-fallback-to-ftp", LongArg::Optional),
+    ("ftps-implicit", LongArg::Optional),
+    ("ftps-resume-ssl", LongArg::Optional),
+    ("glob", LongArg::Optional),
+    ("header", LongArg::Required),
+    ("help", LongArg::None),
+    ("host-directories", LongArg::Optional),
+    ("hsts", LongArg::Optional),
+    ("hsts-file", LongArg::Required),
+    ("html-extension", LongArg::Optional),
+    ("htmlify", LongArg::Optional),
+    ("http-keep-alive", LongArg::Optional),
+    ("http-passwd", LongArg::Required),
+    ("http-password", LongArg::Required),
+    ("http-user", LongArg::Required),
+    ("https-only", LongArg::Optional),
+    ("if-modified-since", LongArg::Optional),
+    ("ignore-case", LongArg::Optional),
+    ("ignore-length", LongArg::Optional),
+    ("ignore-tags", LongArg::Required),
+    ("include-directories", LongArg::Required),
+    ("inet4-only", LongArg::Optional),
+    ("inet6-only", LongArg::Optional),
+    ("input-file", LongArg::Required),
+    ("input-metalink", LongArg::Required),
+    ("iri", LongArg::Optional),
+    ("keep-badhash", LongArg::Optional),
+    ("keep-session-cookies", LongArg::Optional),
+    ("level", LongArg::Required),
+    ("limit-rate", LongArg::Required),
+    ("load-cookies", LongArg::Required),
+    ("local-encoding", LongArg::Required),
+    ("max-redirect", LongArg::Required),
+    ("metalink-index", LongArg::Required),
+    ("metalink-over-http", LongArg::Optional),
+    ("method", LongArg::Required),
+    ("mirror", LongArg::Optional),
+    ("netrc", LongArg::Optional),
+    ("no", LongArg::Required),
+    ("no-adjust-extension", LongArg::None),
+    ("no-ask-password", LongArg::None),
+    ("no-auth-no-challenge", LongArg::None),
+    ("no-background", LongArg::None),
+    ("no-backup-converted", LongArg::None),
+    ("no-backups", LongArg::None),
+    ("no-cache", LongArg::None),
+    ("no-check-certificate", LongArg::None),
+    ("no-clobber", LongArg::Optional),
+    ("no-config", LongArg::Optional),
+    ("no-content-disposition", LongArg::None),
+    ("no-content-on-error", LongArg::None),
+    ("no-continue", LongArg::None),
+    ("no-convert-file-only", LongArg::None),
+    ("no-convert-links", LongArg::None),
+    ("no-cookies", LongArg::None),
+    ("no-debug", LongArg::None),
+    ("no-delete-after", LongArg::None),
+    ("no-directories", LongArg::None),
+    ("no-dns-cache", LongArg::None),
+    ("no-follow-ftp", LongArg::None),
+    ("no-force-directories", LongArg::None),
+    ("no-force-html", LongArg::None),
+    ("no-ftp-stmlf", LongArg::None),
+    ("no-ftps-clear-data-connection", LongArg::None),
+    ("no-ftps-fallback-to-ftp", LongArg::None),
+    ("no-ftps-implicit", LongArg::None),
+    ("no-ftps-resume-ssl", LongArg::None),
+    ("no-glob", LongArg::None),
+    ("no-host-directories", LongArg::None),
+    ("no-hsts", LongArg::None),
+    ("no-html-extension", LongArg::None),
+    ("no-htmlify", LongArg::None),
+    ("no-http-keep-alive", LongArg::None),
+    ("no-https-only", LongArg::None),
+    ("no-if-modified-since", LongArg::None),
+    ("no-ignore-case", LongArg::None),
+    ("no-ignore-length", LongArg::None),
+    ("no-inet4-only", LongArg::None),
+    ("no-inet6-only", LongArg::None),
+    ("no-iri", LongArg::None),
+    ("no-keep-badhash", LongArg::None),
+    ("no-keep-session-cookies", LongArg::None),
+    ("no-metalink-over-http", LongArg::None),
+    ("no-mirror", LongArg::None),
+    ("no-netrc", LongArg::None),
+    ("no-no-clobber", LongArg::None),
+    ("no-no-config", LongArg::None),
+    ("no-no-parent", LongArg::None),
+    ("no-page-requisites", LongArg::None),
+    ("no-parent", LongArg::Optional),
+    ("no-passive-ftp", LongArg::None),
+    ("no-preserve-permissions", LongArg::None),
+    ("no-protocol-directories", LongArg::None),
+    ("no-proxy", LongArg::None),
+    ("no-quiet", LongArg::None),
+    ("no-random-wait", LongArg::None),
+    ("no-recursive", LongArg::None),
+    ("no-relative", LongArg::None),
+    ("no-remove-listing", LongArg::None),
+    ("no-report-speed", LongArg::None),
+    ("no-restrict-file-names", LongArg::None),
+    ("no-retr-symlinks", LongArg::None),
+    ("no-retry-connrefused", LongArg::None),
+    ("no-retry-on-host-error", LongArg::None),
+    ("no-save-headers", LongArg::None),
+    ("no-server-response", LongArg::None),
+    ("no-show-progress", LongArg::None),
+    ("no-span-hosts", LongArg::None),
+    ("no-spider", LongArg::None),
+    ("no-strict-comments", LongArg::None),
+    ("no-timestamping", LongArg::None),
+    ("no-trust-server-names", LongArg::None),
+    ("no-unlink", LongArg::None),
+    ("no-use-server-timestamps", LongArg::None),
+    ("no-verbose", LongArg::None),
+    ("no-warc-cdx", LongArg::None),
+    ("no-warc-compression", LongArg::None),
+    ("no-warc-digests", LongArg::None),
+    ("no-warc-keep-log", LongArg::None),
+    ("no-wdebug", LongArg::None),
+    ("no-xattr", LongArg::None),
+    ("output-document", LongArg::Required),
+    ("output-file", LongArg::Required),
+    ("page-requisites", LongArg::Optional),
+    ("parent", LongArg::Optional),
+    ("passive-ftp", LongArg::Optional),
+    ("password", LongArg::Required),
+    ("pinnedpubkey", LongArg::Required),
+    ("post-data", LongArg::Required),
+    ("post-file", LongArg::Required),
+    ("prefer-family", LongArg::Required),
+    ("preferred-location", LongArg::Required),
+    ("preserve-permissions", LongArg::Optional),
+    ("private-key", LongArg::Required),
+    ("private-key-type", LongArg::Required),
+    ("progress", LongArg::Required),
+    ("protocol-directories", LongArg::Optional),
+    ("proxy", LongArg::Optional),
+    ("proxy-passwd", LongArg::Required),
+    ("proxy-password", LongArg::Required),
+    ("proxy-user", LongArg::Required),
+    ("proxy__compat", LongArg::Required),
+    ("quiet", LongArg::Optional),
+    ("quota", LongArg::Required),
+    ("random-file", LongArg::Required),
+    ("random-wait", LongArg::Optional),
+    ("read-timeout", LongArg::Required),
+    ("recursive", LongArg::Optional),
+    ("referer", LongArg::Required),
+    ("regex-type", LongArg::Required),
+    ("reject", LongArg::Required),
+    ("reject-regex", LongArg::Required),
+    ("rejected-log", LongArg::Required),
+    ("relative", LongArg::Optional),
+    ("remote-encoding", LongArg::Required),
+    ("remove-listing", LongArg::Optional),
+    ("report-speed", LongArg::Optional),
+    ("restrict-file-names", LongArg::Optional),
+    ("retr-symlinks", LongArg::Optional),
+    ("retry-connrefused", LongArg::Optional),
+    ("retry-on-host-error", LongArg::Optional),
+    ("retry-on-http-error", LongArg::Required),
+    ("save-cookies", LongArg::Required),
+    ("save-headers", LongArg::Optional),
+    ("secure-protocol", LongArg::Required),
+    ("server-response", LongArg::Optional),
+    ("show-progress", LongArg::Optional),
+    ("span-hosts", LongArg::Optional),
+    ("spider", LongArg::Optional),
+    ("start-pos", LongArg::Required),
+    ("strict-comments", LongArg::Optional),
+    ("timeout", LongArg::Required),
+    ("timestamping", LongArg::Optional),
+    ("tries", LongArg::Required),
+    ("trust-server-names", LongArg::Optional),
+    ("unlink", LongArg::Optional),
+    ("use-askpass", LongArg::Required),
+    ("use-server-timestamps", LongArg::Optional),
+    ("user", LongArg::Required),
+    ("user-agent", LongArg::Required),
+    ("verbose", LongArg::Optional),
+    ("version", LongArg::None),
+    ("wait", LongArg::Required),
+    ("waitretry", LongArg::Required),
+    ("warc-cdx", LongArg::Optional),
+    ("warc-compression", LongArg::Optional),
+    ("warc-dedup", LongArg::Required),
+    ("warc-digests", LongArg::Optional),
+    ("warc-file", LongArg::Required),
+    ("warc-header", LongArg::Required),
+    ("warc-keep-log", LongArg::Optional),
+    ("warc-max-size", LongArg::Required),
+    ("warc-tempdir", LongArg::Required),
+    ("wdebug", LongArg::Optional),
+    ("xattr", LongArg::Optional),
+];
+
+/// Flags that stop the wrapped tool from following redirects, appended after
+/// the user's args (so they win over `-L`, `--location-trusted`, `--follow`
+/// or a `--max-redirect` the caller passed) whenever Pay injects headers.
+///
+/// Every header Pay injects is a credential bound to the URL the 402 came
+/// from: a payment, a sign-in proof, or a cached subscription bearer. The
+/// wrapped tools forward custom headers across redirects (wget even does so
+/// by default, and curl only strips `Authorization`, not `X-PAYMENT`), so a
+/// redirect to another origin would hand the credential to that origin.
+/// Not following is the only boundary we can enforce from outside the tool.
+/// When the caller asked to follow, Pay takes the next hop itself without
+/// its headers (see [`credential_free_redirect`]).
+fn credential_redirect_guard(tool: ToolKind, injected: &[String]) -> &'static [&'static str] {
+    if injected.is_empty() {
+        return &[];
+    }
+    match tool {
+        // `--globoff` keeps `{a,b}` / `[1-9]` in the URL from expanding into
+        // more transfers that would carry the same credential.
+        ToolKind::Curl => &["--no-location", "--globoff"],
+        ToolKind::Wget => &["--max-redirect=0"],
+        ToolKind::Httpie => &["--no-follow"],
+    }
+}
+
+/// Whether the caller's own args ask the tool to follow redirects: `-L`,
+/// `--location` or `--location-trusted` for curl, wget's default unless
+/// `--max-redirect=0`, `--follow` / `-F` for HTTPie. The last word wins.
+fn follows_redirects(args: &[String], tool: ToolKind) -> bool {
+    match tool {
+        ToolKind::Curl => {
+            let line = CommandLine::parse(args, &CURL_OPTIONS);
+            line.options
+                .iter()
+                .fold(false, |follow, option| match option.name {
+                    OptionName::Short('L') | OptionName::Long("location" | "location-trusted") => {
+                        true
+                    }
+                    OptionName::Long("no-location") => false,
+                    _ => follow,
+                })
+        }
+        ToolKind::Wget => {
+            let line = CommandLine::parse(args, &WGET_OPTIONS);
+            line.options
+                .iter()
+                .fold(true, |follow, option| match option.name {
+                    OptionName::Long("max-redirect") => {
+                        option.value.is_none_or(|v| v.trim() != "0")
+                    }
+                    _ => follow,
+                })
+        }
+        ToolKind::Httpie => args.iter().fold(false, |follow, arg| match arg.as_str() {
+            "--follow" | "-F" => true,
+            "--no-follow" => false,
+            _ => follow,
+        }),
+    }
+}
+
+/// Whether the request is a bodyless `GET` or `HEAD`, the only kind Pay
+/// replays at a redirect target: a body was sent to the URL it was bound to
+/// and is not forwarded anywhere else.
+fn is_bodyless_read(args: &[String], tool: ToolKind) -> bool {
+    let read_method = |method: &str| matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD");
+    match tool {
+        ToolKind::Curl => {
+            let line = CommandLine::parse(args, &CURL_OPTIONS);
+            line.options.iter().all(|option| match option.name {
+                OptionName::Short('d' | 'F' | 'T')
+                | OptionName::Long(
+                    "data" | "data-ascii" | "data-binary" | "data-raw" | "data-urlencode" | "json"
+                    | "form" | "form-string" | "upload-file",
+                ) => false,
+                OptionName::Short('X') | OptionName::Long("request") => {
+                    option.value.is_some_and(read_method)
+                }
+                _ => true,
+            })
+        }
+        ToolKind::Wget => {
+            let line = CommandLine::parse(args, &WGET_OPTIONS);
+            line.options.iter().all(|option| match option.name {
+                OptionName::Long("post-data" | "post-file" | "body-data" | "body-file") => false,
+                OptionName::Long("method") => option.value.is_some_and(read_method),
+                _ => true,
+            })
+        }
+        ToolKind::Httpie => {
+            let mut positionals = args.iter().filter(|arg| !arg.starts_with('-'));
+            let mut first = positionals.next();
+            if let Some(method) = first.filter(|m| m.chars().all(|c| c.is_ascii_alphabetic())) {
+                if !read_method(method) {
+                    return false;
+                }
+                first = positionals.next();
+            }
+            // After the URL, only header (`Name:value`) and query
+            // (`name==value`) items: anything else is body data.
+            first.is_some()
+                && positionals.all(|item| {
+                    item.contains("==")
+                        || item.split_once(':').is_some_and(|(name, value)| {
+                            !name.is_empty()
+                                && !name.contains('=')
+                                && !value.starts_with('=')
+                                && !value.starts_with('@')
+                        })
+                })
+                && !args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--form" | "-f" | "--multipart" | "--raw" | "--json" | "-j"
+                    )
+                })
+        }
+    }
+}
+
+/// `args` with the request URL `from` replaced by `to`, or `None` when the
+/// URL is not a single argument Pay can locate.
+///
+/// `to` is a URL the tool reached by following a redirect, query included,
+/// so the options that added to `from`'s query (curl's `--url-query`,
+/// HTTPie's `name==value` items) are dropped: applied again they would
+/// request `to?id=7&id=7`, not the resource that answered. curl's `-G` turns
+/// the request body into query parameters, and dropping it would leave the
+/// body to be sent instead, so a `-G` request is not retargeted at all.
+fn retarget_args(args: &[String], tool: ToolKind, from: &str, to: &str) -> Option<Vec<String>> {
+    let (index, dropped) = match transfer_options(tool) {
+        Some(spec) => {
+            let line = CommandLine::parse(args, spec);
+            let [target] = line.targets.as_slice() else {
+                return None;
+            };
+            if target.value != from {
+                return None;
+            }
+            let mut dropped = Vec::new();
+            for option in &line.options {
+                match (tool, option.name) {
+                    (ToolKind::Curl, OptionName::Short('G') | OptionName::Long("get")) => {
+                        return None;
+                    }
+                    (ToolKind::Curl, OptionName::Long("url-query")) => {
+                        dropped.extend(option.args.clone());
+                    }
+                    _ => {}
+                }
+            }
+            let mut retargeted = args.to_vec();
+            retargeted[target.index] = if target.inline {
+                format!("--url={to}")
+            } else {
+                to.to_string()
+            };
+            return Some(without_args(retargeted, &dropped));
+        }
+        None => {
+            let index = args.iter().position(|arg| {
+                find_url_in_args(std::slice::from_ref(arg))
+                    .or_else(|| httpie_url_shorthand(arg))
+                    .as_deref()
+                    == Some(from)
+            })?;
+            let dropped: Vec<usize> = (index + 1..args.len())
+                .filter(|&at| is_httpie_query_item(&args[at]))
+                .collect();
+            (index, dropped)
+        }
+    };
+    let mut retargeted = args.to_vec();
+    retargeted[index] = to.to_string();
+    Some(without_args(retargeted, &dropped))
+}
+
+/// `args` without the arguments at `dropped`.
+fn without_args(args: Vec<String>, dropped: &[usize]) -> Vec<String> {
+    args.into_iter()
+        .enumerate()
+        .filter(|(at, _)| !dropped.contains(at))
+        .map(|(_, arg)| arg)
+        .collect()
+}
+
+/// An HTTPie request item that adds a query parameter: `name==value`.
+fn is_httpie_query_item(arg: &str) -> bool {
+    !arg.starts_with('-')
+        && arg
+            .split_once("==")
+            .is_some_and(|(name, _)| !name.contains(['=', ':']))
+}
+
+/// The paid request's args aimed at `resource_url`, the URL whose 402 the
+/// credential answers (see [`payment_url`]), so the credential goes straight
+/// there instead of to a URL that redirects to it.
+fn paid_request_args(args: &[String], tool: ToolKind, resource_url: &str) -> Vec<String> {
+    match resolve_request_url(args, tool) {
+        Some(requested) if requested != resource_url && !resource_url.is_empty() => {
+            retarget_args(args, tool, &requested, resource_url).unwrap_or_else(|| args.to_vec())
+        }
+        _ => args.to_vec(),
+    }
+}
+
+/// After a paid request answered with a redirect the caller asked the tool
+/// to follow, the args for the next hop, which runs with no Pay header.
+///
+/// The tool runs credential-bearing requests with redirects off (see
+/// [`credential_redirect_guard`]); this is how `pay curl -L` and `pay wget`
+/// still reach a resource the paid URL redirects to (a canonical path, an
+/// `http` to `https` upgrade) without the payment, sign-in proof or
+/// subscription bearer ever leaving the URL it was bound to.
+///
+/// Only a same-origin `Location` is stepped. The hop reruns the caller's args
+/// at the new URL, so the tool treats it as the first host and sends the
+/// caller's own `-H Authorization`, `-H Cookie` and `-u` there, which its own
+/// redirect handling strips on a cross-host hop. A cross-origin redirect is
+/// relayed as the response instead, with a note naming where it points.
+/// The curl hop also runs with `--globoff`, so a `Location` with `{}` or
+/// `[]` stays one transfer.
+fn credential_free_redirect(
+    args: &[String],
+    tool: ToolKind,
+    response: &ResponseHead,
+) -> Option<Vec<String>> {
+    let location = response.redirect_location()?;
+    if !follows_redirects(args, tool) || !is_bodyless_read(args, tool) {
+        return None;
+    }
+    let requested = resolve_request_url(args, tool)?;
+    let from = url::Url::parse(&requested).ok()?;
+    let next = from.join(location).ok()?;
+    if !matches!(next.scheme(), "http" | "https") {
+        return None;
+    }
+    if !crate::client::fetch::is_same_origin_redirect(&from, &next) {
+        eprintln!(
+            "pay: not following the redirect to {}, another origin than the paid URL; \
+             request it directly if you trust it",
+            next.origin().ascii_serialization()
+        );
+        return None;
+    }
+    let mut next_args = retarget_args(args, tool, &requested, next.as_str())?;
+    if matches!(tool, ToolKind::Curl) {
+        next_args.insert(0, "--globoff".to_string());
+    }
+    Some(next_args)
+}
+
+/// Debug-log a wrapped tool invocation without any header value or argument.
+///
+/// Injected headers are payment credentials, sign-in proofs or subscription
+/// bearers, and the caller's own args can hold `-H Authorization: ...`,
+/// `-u user:pass` or a request body. A debug filter must never turn into a
+/// credential sink, so only header names and the argument count are logged.
+fn log_invocation(tool: ToolKind, user_args: &[String], headers: &[String]) {
+    let header_names: Vec<&str> = headers
+        .iter()
+        .map(|header| {
+            header
+                .split_once(':')
+                .map_or("<malformed>", |(name, _)| name.trim())
+        })
+        .collect();
+    debug!(
+        tool = ?tool,
+        arg_count = user_args.len(),
+        headers = ?header_names,
+        "Running wrapped HTTP client"
+    );
+}
+
 fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
     match tool {
         ToolKind::Curl | ToolKind::Wget => format!("{name}: {value}"),
@@ -1315,11 +2733,20 @@ fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
 /// SIWMPP cache lookup (URL-prefix match against tracked subscriptions)
 /// sees the same URL the request will actually hit.
 fn resolve_request_url(args: &[String], tool: ToolKind) -> Option<String> {
+    if let Some(spec) = transfer_options(tool) {
+        // The transfer target, not the first URL-looking argument: `-e
+        // https://referer.example` is an option value.
+        let line = CommandLine::parse(args, spec);
+        let [target] = line.targets.as_slice() else {
+            return None;
+        };
+        return [target.value]
+            .into_iter()
+            .find(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .map(str::to_string);
+    }
     if let Some(u) = find_url_in_args(args) {
         return Some(u);
-    }
-    if !matches!(tool, ToolKind::Httpie) {
-        return None;
     }
     args.iter().find_map(|a| httpie_url_shorthand(a))
 }
@@ -1385,9 +2812,14 @@ fn httpie_url_shorthand(arg: &str) -> Option<String> {
 /// - curl/wget: `"Authorization: <token>"`
 /// - httpie: `"Authorization:<token>"` (no space — HTTPie request-item form)
 ///
-/// Empty vec when no tracked subscription matches the URL, so callers
-/// pass it through to the existing inner runner unchanged.
-fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
+/// Empty vec when no subscription of the selected account matches the URL,
+/// so callers pass it through to the existing inner runner unchanged.
+fn pre_attach_cached_auth(
+    args: &[String],
+    tool: ToolKind,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Vec<String> {
     let Some(url) = resolve_request_url(args, tool) else {
         return Vec::new();
     };
@@ -1397,7 +2829,12 @@ fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
         return Vec::new();
     }
     let store = crate::accounts::FileAccountsStore::default_path();
-    let Some(token) = crate::client::authenticate::cached_header_for_resource(&store, &url) else {
+    let Some(token) = crate::client::authenticate::cached_header_for_account(
+        &store,
+        network_override,
+        account_override,
+        &url,
+    ) else {
         return Vec::new();
     };
     vec![formatted_header(tool, "Authorization", &token)]
@@ -1413,6 +2850,14 @@ fn user_already_set_user_agent(args: &[String], tool: ToolKind) -> bool {
     if user_already_set_header(args, tool, "user-agent") {
         return true;
     }
+    if let ToolKind::Wget = tool {
+        return wget_options(args).any(|(name, value)| {
+            matches!(
+                name,
+                OptionName::Short('U') | OptionName::Long("user-agent")
+            ) && value.is_some()
+        });
+    }
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         match tool {
@@ -1427,24 +2872,19 @@ fn user_already_set_user_agent(args: &[String], tool: ToolKind) -> bool {
                     return true;
                 }
             }
-            ToolKind::Wget => {
-                if arg == "-U" || arg == "--user-agent" {
-                    return iter.peek().is_some();
-                }
-                if arg.starts_with("-U") && arg.len() > 2 {
-                    return true;
-                }
-                if arg.starts_with("--user-agent=") {
-                    return true;
-                }
-            }
-            ToolKind::Httpie => {}
+            ToolKind::Wget | ToolKind::Httpie => {}
         }
     }
     false
 }
 
 fn user_already_set_header(args: &[String], tool: ToolKind, header_name: &str) -> bool {
+    if let ToolKind::Wget = tool {
+        return wget_options(args).any(|(name, value)| {
+            name == OptionName::Long("header")
+                && value.is_some_and(|value| is_header_name(value, header_name))
+        });
+    }
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         match tool {
@@ -1463,19 +2903,7 @@ fn user_already_set_header(args: &[String], tool: ToolKind, header_name: &str) -
                     return true;
                 }
             }
-            ToolKind::Wget => {
-                if let Some(val) = arg.strip_prefix("--header=")
-                    && is_header_name(val, header_name)
-                {
-                    return true;
-                }
-                if arg == "--header"
-                    && let Some(next) = iter.peek()
-                    && is_header_name(next, header_name)
-                {
-                    return true;
-                }
-            }
+            ToolKind::Wget => {}
             ToolKind::Httpie => {
                 if is_header_name(arg, header_name) {
                     return true;
@@ -1586,11 +3014,1137 @@ mod pre_attach_tests {
         assert_eq!(headers, extra);
     }
 
+    /// Loopback origin that answers its first request with a 302 to a
+    /// second, collector origin, and reports what each one received once
+    /// the wrapped tool has exited.
+    struct CrossOriginRedirect {
+        origin_url: String,
+        collector_url: String,
+        origin: std::thread::JoinHandle<Vec<String>>,
+        collector: std::thread::JoinHandle<Vec<String>>,
+    }
+
+    /// Serve one connection per entry of `responses`, in order, or give up
+    /// after `wait`. Returns the raw head of every request that arrived.
+    fn serve(
+        listener: std::net::TcpListener,
+        wait: std::time::Duration,
+        responses: Vec<String>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{Read, Write};
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + wait;
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => return requests,
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes());
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+            }
+            requests
+        })
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    const PAYMENT_REQUIRED_RESPONSE: &str =
+        "HTTP/1.1 402 Payment Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    impl CrossOriginRedirect {
+        fn start() -> Self {
+            let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin_url = format!("http://{}/start", origin.local_addr().unwrap());
+            let location = format!("http://{}/collect", collector.local_addr().unwrap());
+            let origin = serve(
+                origin,
+                std::time::Duration::from_secs(20),
+                vec![redirect_to(&location)],
+            );
+            let collector = serve(
+                collector,
+                std::time::Duration::from_secs(3),
+                vec![OK_RESPONSE.to_string()],
+            );
+            Self {
+                origin_url,
+                collector_url: location,
+                origin,
+                collector,
+            }
+        }
+
+        /// What the origin and the collector each received.
+        fn requests(self) -> (String, Option<String>) {
+            let origin = self.origin.join().unwrap().pop();
+            let collector = self.collector.join().unwrap().pop();
+            (
+                origin.expect("the tool never reached the origin"),
+                collector,
+            )
+        }
+
+        fn collector_was_contacted(self) -> bool {
+            self.requests().1.is_some()
+        }
+    }
+
+    const PAYMENT_HEADER: &str = "Authorization: Payment redirect-test-credential";
+    const PAYMENT_SECRET: &str = "redirect-test-credential";
+
+    #[test]
+    fn redirect_guard_only_applies_when_credentials_are_injected() {
+        assert!(credential_redirect_guard(ToolKind::Wget, &[]).is_empty());
+        let injected = s(&[PAYMENT_HEADER]);
+        assert_eq!(
+            credential_redirect_guard(ToolKind::Curl, &injected),
+            ["--no-location", "--globoff"]
+        );
+        assert_eq!(
+            credential_redirect_guard(ToolKind::Wget, &injected),
+            ["--max-redirect=0"]
+        );
+        assert_eq!(
+            credential_redirect_guard(ToolKind::Httpie, &injected),
+            ["--no-follow"]
+        );
+    }
+
+    #[test]
+    fn wget_follows_cross_origin_redirects_without_injected_credentials() {
+        // Control for the guard tests below: wget follows redirects by
+        // default, so the collector is reachable when nothing is injected.
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let args = s(&["-q", "-O", "-", &server.origin_url]);
+        run_wget_inner(&args, &[]).unwrap();
+        assert!(server.collector_was_contacted());
+    }
+
+    /// `/start` redirects to `/next` on the same origin, which serves 200.
+    /// Returns the start URL and every request the origin saw.
+    fn same_origin_redirect() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![redirect_to("/next"), OK_RESPONSE.to_string()],
+        );
+        (url, server)
+    }
+
+    #[test]
+    fn wget_follows_a_paid_redirect_without_the_credential() {
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let (url, server) = same_origin_redirect();
+        let args = s(&["-q", "--max-redirect=5", "-O", "-", &url]);
+        let outcome = run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { exit_code: 0, .. }
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "wget stopped at the paid redirect");
+        assert!(
+            requests[0].contains(PAYMENT_SECRET),
+            "the paid URL got the credential"
+        );
+        assert!(!requests[1].contains(PAYMENT_SECRET), "{}", requests[1]);
+    }
+
+    #[test]
+    fn wget_does_not_follow_a_paid_redirect_the_caller_turned_off() {
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let args = s(&["-q", "--max-redirect", "0", "-O", "-", &server.origin_url]);
+        run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(!server.collector_was_contacted());
+    }
+
+    #[test]
+    fn curl_follows_a_paid_redirect_without_the_credential() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let (url, server) = same_origin_redirect();
+        // Even `--location-trusted`, which forwards credentials by design,
+        // must not hand Pay's header to the next hop.
+        let args = s(&["-s", "--location-trusted", &url]);
+        let outcome = run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { exit_code: 0, .. }
+        ));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "curl stopped at the paid redirect");
+        assert!(
+            requests[0].contains(PAYMENT_SECRET),
+            "the paid URL got the credential"
+        );
+        assert!(!requests[1].contains(PAYMENT_SECRET), "{}", requests[1]);
+    }
+
+    /// The hop after a paid redirect reruns the caller's args at the new URL,
+    /// so a cross-origin `Location` would receive the caller's own
+    /// `Authorization`, `Cookie` and `-u`, which the tool's own redirect
+    /// handling strips on a cross-host hop. Pay does not step it.
+    #[test]
+    fn a_paid_cross_origin_redirect_is_not_followed() {
+        let caller = [
+            "-H",
+            "Authorization: Bearer caller-api-key",
+            "-H",
+            "Cookie: sid=caller-cookie",
+        ];
+        if check_command_exists("curl").is_ok() {
+            let server = CrossOriginRedirect::start();
+            let mut args = s(&["-sL", "-u", "user:caller-password"]);
+            args.extend(s(&caller));
+            args.push(server.origin_url.clone());
+            let outcome = run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+            assert!(matches!(outcome, RunOutcome::Completed { .. }));
+            let (origin, collector) = server.requests();
+            assert!(
+                origin.contains(PAYMENT_SECRET),
+                "the paid URL got the credential"
+            );
+            assert_eq!(collector, None, "curl stepped a cross-origin redirect");
+        }
+        if check_command_exists("wget").is_ok() {
+            let server = CrossOriginRedirect::start();
+            let mut args = s(&[
+                "-q",
+                "-O",
+                "-",
+                "--header",
+                "Authorization: Bearer caller-api-key",
+            ]);
+            args.push(server.origin_url.clone());
+            run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+            assert!(
+                !server.collector_was_contacted(),
+                "wget stepped a cross-origin redirect"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hop_after_a_paid_redirect_keeps_curl_globbing_off() {
+        let head = ResponseHead {
+            status: Some(302),
+            headers: vec![("location".to_string(), "/next/[1-9]".to_string())],
+        };
+        let next =
+            credential_free_redirect(&s(&["-sL", "http://a.example/x"]), ToolKind::Curl, &head)
+                .expect("a same-origin hop is stepped");
+        assert_eq!(
+            next,
+            s(&["--globoff", "-sL", "http://a.example/next/[1-9]"])
+        );
+    }
+
+    #[test]
+    fn curl_does_not_follow_a_paid_redirect_unless_asked() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        for flags in [
+            vec!["-s"],
+            vec!["-sL", "--no-location"],
+            vec!["-sL", "-d", "a=1"],
+        ] {
+            let server = CrossOriginRedirect::start();
+            let mut args = s(&flags);
+            args.push(server.origin_url.clone());
+            run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+            assert!(!server.collector_was_contacted(), "{flags:?}");
+        }
+    }
+
+    /// `/a` redirects to `/a/` (a trailing-slash canonicalisation, the same
+    /// shape as an `http` to `https` upgrade), and `/a/` is the paid
+    /// resource: it asks for payment, then serves the paid retry.
+    fn trailing_slash_paywall() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/a", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                redirect_to("/a/"),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+                OK_RESPONSE.to_string(),
+            ],
+        );
+        (url, server)
+    }
+
+    fn request_path(request: &str) -> &str {
+        request.split_whitespace().nth(1).unwrap_or_default()
+    }
+
+    fn pay_behind_a_redirect(tool: ToolKind, args: Vec<String>, url: &str) {
+        let first = match tool {
+            ToolKind::Curl => run_curl_inner(&args, &[]),
+            ToolKind::Wget => run_wget_inner(&args, &[]),
+            ToolKind::Httpie => unreachable!(),
+        }
+        .unwrap();
+        let RunOutcome::UnknownPaymentRequired { resource_url, .. } = first else {
+            panic!("expected the 402 from {url}/: {first:?}");
+        };
+        assert_eq!(resource_url, format!("{url}/"));
+        let paid = run_paid(tool, &args, &resource_url, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(
+            matches!(paid, RunOutcome::Completed { exit_code: 0, .. }),
+            "{paid:?}"
+        );
+    }
+
+    #[test]
+    fn curl_pays_the_url_that_asked_for_payment_behind_a_redirect() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let (url, server) = trailing_slash_paywall();
+        pay_behind_a_redirect(ToolKind::Curl, s(&["-sL", &url]), &url);
+        let requests = server.join().unwrap();
+        let seen: Vec<(&str, bool)> = requests
+            .iter()
+            .map(|r| (request_path(r), r.contains(PAYMENT_SECRET)))
+            .collect();
+        assert_eq!(seen, [("/a", false), ("/a/", false), ("/a/", true)]);
+    }
+
+    #[test]
+    fn wget_pays_the_url_that_asked_for_payment_behind_a_redirect() {
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let (url, server) = trailing_slash_paywall();
+        pay_behind_a_redirect(ToolKind::Wget, s(&["-q", "-O", "-", &url]), &url);
+        let requests = server.join().unwrap();
+        let seen: Vec<(&str, bool)> = requests
+            .iter()
+            .map(|r| (request_path(r), r.contains(PAYMENT_SECRET)))
+            .collect();
+        assert_eq!(seen, [("/a", false), ("/a/", false), ("/a/", true)]);
+    }
+
+    #[test]
+    fn a_402_from_another_origin_is_not_paid() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_url = format!("http://{}/start", origin.local_addr().unwrap());
+        let other_url = format!("http://{}/paid", other.local_addr().unwrap());
+        let wait = std::time::Duration::from_secs(20);
+        let origin = serve(origin, wait, vec![redirect_to(&other_url)]);
+        let other = serve(other, wait, vec![PAYMENT_REQUIRED_RESPONSE.to_string()]);
+        let outcome = run_curl_inner(&s(&["-sL", &origin_url]), &[]);
+        assert!(
+            matches!(&outcome, Err(Error::RequestValidation(m)) if m.contains(&other_url)),
+            "{outcome:?}"
+        );
+        assert_eq!(origin.join().unwrap().len(), 1);
+        assert_eq!(other.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_paying_url_follows_the_redirect_chain_within_one_origin() {
+        let head = |status, location: Option<&str>| ResponseHead {
+            status: Some(status),
+            headers: location
+                .map(|l| vec![("location".to_string(), l.to_string())])
+                .unwrap_or_default(),
+        };
+        let get = s(&["-sL", "http://a.example/x"]);
+        let chain = [
+            head(301, Some("https://a.example/x")),
+            head(302, Some("/x/")),
+            head(402, None),
+        ];
+        assert_eq!(
+            payment_url(&get, ToolKind::Curl, &chain, "http://a.example/x").unwrap(),
+            "https://a.example/x/"
+        );
+        // No redirect: the URL as the caller wrote it.
+        assert_eq!(
+            payment_url(
+                &get,
+                ToolKind::Curl,
+                &[head(402, None)],
+                "http://a.example/x"
+            )
+            .unwrap(),
+            "http://a.example/x"
+        );
+        // A redirect the tool did not follow (the last head) does not move it.
+        assert_eq!(
+            answering_url("http://a.example/x", &[head(302, Some("/y"))]),
+            "http://a.example/x"
+        );
+        for elsewhere in [
+            "https://b.example/x",
+            "https://a.example:8443/x",
+            "http://b.a.example/",
+        ] {
+            let chain = [head(302, Some(elsewhere)), head(402, None)];
+            assert!(
+                payment_url(&get, ToolKind::Curl, &chain, "http://a.example/x").is_err(),
+                "{elsewhere}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_paid_retry_replays_only_the_request_that_got_the_402() {
+        let head = |status, location: Option<&str>| ResponseHead {
+            status: Some(status),
+            headers: location
+                .map(|l| vec![("location".to_string(), l.to_string())])
+                .unwrap_or_default(),
+        };
+        let via = |status| [head(status, Some("/paid")), head(402, None)];
+        let url = "https://a.example/start";
+        let pays = |args: &[&str], tool, chain: &[ResponseHead]| {
+            let mut args = s(args);
+            args.push(url.to_string());
+            payment_url(&args, tool, chain, url)
+        };
+        // A body sent again only on 307 and 308; 301, 302 and 303 turned the
+        // POST into a bodyless GET.
+        for status in [301, 302, 303] {
+            assert!(pays(&["-L", "-d", "x=1"], ToolKind::Curl, &via(status)).is_err());
+            assert!(pays(&["--post-data=x=1"], ToolKind::Wget, &via(status)).is_err());
+            // `-X` and `--post30x` change what the tool sent: refused too.
+            assert!(
+                pays(
+                    &["-L", "-X", "POST", "-d", "x"],
+                    ToolKind::Curl,
+                    &via(status)
+                )
+                .is_err()
+            );
+            assert!(
+                pays(
+                    &["-L", "--post302", "-d", "x"],
+                    ToolKind::Curl,
+                    &via(status)
+                )
+                .is_err()
+            );
+            assert!(pays(&["-L", "-X", "DELETE"], ToolKind::Curl, &via(status)).is_err());
+        }
+        for status in [307, 308] {
+            assert_eq!(
+                pays(&["-L", "-d", "x=1"], ToolKind::Curl, &via(status)).unwrap(),
+                "https://a.example/paid"
+            );
+            assert!(pays(&["--post-data=x=1"], ToolKind::Wget, &via(status)).is_ok());
+            // A body read from stdin cannot be sent a second time.
+            assert!(pays(&["-L", "-d", "@-"], ToolKind::Curl, &via(status)).is_err());
+            assert!(pays(&["-L", "-T", "-"], ToolKind::Curl, &via(status)).is_err());
+            assert!(pays(&["--post-file=-"], ToolKind::Wget, &via(status)).is_err());
+            for stdin in [
+                &["--data-binary", "@-"][..],
+                &["--json", "@-"],
+                &["--data-urlencode", "@-"],
+                &["--data-urlencode", "q@-"],
+                &["-F", "f=@-"],
+                &["-F", "f=<-;type=text/plain"],
+            ] {
+                let args = [&["-L"][..], stdin].concat();
+                assert!(
+                    pays(&args, ToolKind::Curl, &via(status)).is_err(),
+                    "{stdin:?}"
+                );
+            }
+            // Bodies that only look like stdin are literal and can be resent.
+            for literal in [
+                &["--data-raw", "@-"][..],
+                &["--data-raw", "a<-b"],
+                &["--form-string", "f=@-"],
+                &["--form-string", "f=<-"],
+                &["-d", "a@-b"],
+                &["--data-urlencode", "q=@-"],
+                &["-F", "f=a<-b"],
+            ] {
+                let args = [&["-L"][..], literal].concat();
+                assert!(
+                    pays(&args, ToolKind::Curl, &via(status)).is_ok(),
+                    "{literal:?}"
+                );
+            }
+        }
+        // Positive controls: a GET or HEAD is the same request after any
+        // redirect, and without a redirect any request is replayed as is.
+        for status in [301, 302, 303, 307, 308] {
+            assert!(pays(&["-L"], ToolKind::Curl, &via(status)).is_ok());
+            assert!(pays(&["-LI"], ToolKind::Curl, &via(status)).is_ok());
+            assert!(pays(&["-q"], ToolKind::Wget, &via(status)).is_ok());
+        }
+        for args in [&["-d", "@-"][..], &["-X", "DELETE"], &["-T", "-"]] {
+            assert_eq!(pays(args, ToolKind::Curl, &[head(402, None)]).unwrap(), url);
+        }
+    }
+
+    #[test]
+    fn curl_refuses_to_pay_for_a_post_a_redirect_turned_into_a_get() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                "HTTP/1.1 303 See Other\r\nLocation: /paid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+            ],
+        );
+        let outcome = run_curl_inner(&s(&["-sL", "-d", "x=1", &start]), &[]);
+        assert!(
+            matches!(&outcome, Err(Error::RequestValidation(m)) if m.contains("/paid")),
+            "{outcome:?}"
+        );
+        let methods: Vec<String> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| r.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(methods, ["POST /start", "GET /paid"]);
+    }
+
+    #[test]
+    fn curl_pays_the_redirected_query_without_repeating_url_query() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                redirect_to("/paid?id=7"),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+                OK_RESPONSE.to_string(),
+            ],
+        );
+        let args = s(&["-sL", "--url-query", "id=7", &start]);
+        let RunOutcome::UnknownPaymentRequired { resource_url, .. } =
+            run_curl_inner(&args, &[]).unwrap()
+        else {
+            panic!("expected the 402 from /paid?id=7");
+        };
+        let paid = run_paid(ToolKind::Curl, &args, &resource_url, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(paid, RunOutcome::Completed { exit_code: 0, .. }));
+        let seen: Vec<(String, bool)> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let target = r.split_whitespace().nth(1).unwrap_or_default().to_string();
+                (target, r.contains(PAYMENT_SECRET))
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("/start?id=7".to_string(), false),
+                ("/paid?id=7".to_string(), false),
+                ("/paid?id=7".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn curl_refuses_to_pay_a_redirected_get_built_from_its_body() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /paid?id=7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+            ],
+        );
+        let outcome = run_curl_inner(&s(&["-sLG", "-d", "id=7", &start]), &[]);
+        assert!(
+            matches!(&outcome, Err(Error::RequestValidation(m)) if m.contains("-G")),
+            "{outcome:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_redirected_402_for_a_url_without_a_scheme_is_not_paid() {
+        let chain = [
+            ResponseHead {
+                status: Some(302),
+                headers: vec![(
+                    "location".to_string(),
+                    "https://other.example/pay".to_string(),
+                )],
+            },
+            ResponseHead {
+                status: Some(402),
+                headers: vec![],
+            },
+        ];
+        let refused = payment_url(&s(&["-q", "example.com/x"]), ToolKind::Wget, &chain, "");
+        assert!(
+            matches!(&refused, Err(Error::RequestValidation(m)) if m.contains("no scheme")),
+            "{refused:?}"
+        );
+        // Without a redirect the 402 is the named URL's own: unchanged.
+        assert!(
+            payment_url(
+                &s(&["-q", "example.com/x"]),
+                ToolKind::Wget,
+                &chain[1..],
+                ""
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn curl_pays_a_post_that_a_307_kept_a_post() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /paid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+                OK_RESPONSE.to_string(),
+            ],
+        );
+        let args = s(&["-sL", "-d", "x=1", &start]);
+        let RunOutcome::UnknownPaymentRequired { resource_url, .. } =
+            run_curl_inner(&args, &[]).unwrap()
+        else {
+            panic!("expected the 402 from /paid");
+        };
+        let paid = run_paid(ToolKind::Curl, &args, &resource_url, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(paid, RunOutcome::Completed { exit_code: 0, .. }));
+        let requests = server.join().unwrap();
+        let seen: Vec<(&str, &str, bool)> = requests
+            .iter()
+            .map(|r| {
+                let mut line = r.split_whitespace();
+                (
+                    line.next().unwrap_or_default(),
+                    line.next().unwrap_or_default(),
+                    r.contains(PAYMENT_SECRET),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("POST", "/start", false),
+                ("POST", "/paid", false),
+                ("POST", "/paid", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn redirect_following_reads_the_callers_flags() {
+        assert!(follows_redirects(&s(&["-sL", "u"]), ToolKind::Curl));
+        assert!(follows_redirects(
+            &s(&["--location-trusted", "u"]),
+            ToolKind::Curl
+        ));
+        assert!(!follows_redirects(&s(&["-s", "u"]), ToolKind::Curl));
+        assert!(!follows_redirects(
+            &s(&["-L", "--no-location", "u"]),
+            ToolKind::Curl
+        ));
+        // `-e L` is a referer value, not `-L`.
+        assert!(!follows_redirects(&s(&["-eL", "u"]), ToolKind::Curl));
+        assert!(follows_redirects(&s(&["-q", "u"]), ToolKind::Wget));
+        assert!(follows_redirects(
+            &s(&["--max-redirect=3", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!follows_redirects(
+            &s(&["--max-redirect=0", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!follows_redirects(
+            &s(&["--max-redirect", "0", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(follows_redirects(&s(&["--follow", "u"]), ToolKind::Httpie));
+        assert!(!follows_redirects(&s(&["u"]), ToolKind::Httpie));
+    }
+
+    #[test]
+    fn only_bodyless_reads_are_replayed_at_a_redirect_target() {
+        assert!(is_bodyless_read(&s(&["-sL", "u"]), ToolKind::Curl));
+        assert!(is_bodyless_read(&s(&["-I", "u"]), ToolKind::Curl));
+        assert!(is_bodyless_read(&s(&["-X", "GET", "u"]), ToolKind::Curl));
+        for args in [
+            s(&["-d", "a=1", "u"]),
+            s(&["-sd", "a=1", "u"]),
+            s(&["--json", "{}", "u"]),
+            s(&["-F", "f=@x", "u"]),
+            s(&["-T", "file", "u"]),
+            s(&["-X", "DELETE", "u"]),
+        ] {
+            assert!(!is_bodyless_read(&args, ToolKind::Curl), "{args:?}");
+        }
+        assert!(is_bodyless_read(&s(&["-q", "u"]), ToolKind::Wget));
+        assert!(!is_bodyless_read(
+            &s(&["--post-data=a", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!is_bodyless_read(
+            &s(&["--method=PUT", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(is_bodyless_read(
+            &s(&["GET", "u", "Accept:x", "q==1"]),
+            ToolKind::Httpie
+        ));
+        assert!(!is_bodyless_read(&s(&["u", "a=1"]), ToolKind::Httpie));
+        assert!(!is_bodyless_read(&s(&["POST", "u"]), ToolKind::Httpie));
+    }
+
+    #[test]
+    fn the_paid_request_is_retargeted_in_place() {
+        let to = "https://a.example/x/";
+        assert_eq!(
+            paid_request_args(
+                &s(&["-sL", "-e", "https://ref.example", "http://a.example/x"]),
+                ToolKind::Curl,
+                to
+            ),
+            s(&["-sL", "-e", "https://ref.example", to])
+        );
+        assert_eq!(
+            paid_request_args(&s(&["--url=http://a.example/x"]), ToolKind::Curl, to),
+            s(&[&format!("--url={to}")])
+        );
+        assert_eq!(
+            paid_request_args(&s(&["-q", "http://a.example/x"]), ToolKind::Wget, to),
+            s(&["-q", to])
+        );
+        assert_eq!(
+            paid_request_args(
+                &s(&["--follow", "http://a.example/x"]),
+                ToolKind::Httpie,
+                to
+            ),
+            s(&["--follow", to])
+        );
+        // Unchanged when it already targets the URL.
+        assert_eq!(
+            paid_request_args(&s(&["-q", to]), ToolKind::Wget, to),
+            s(&["-q", to])
+        );
+    }
+
+    #[test]
+    fn a_retargeted_request_keeps_the_query_of_the_url_it_reached() {
+        let to = "https://a.example/paid?id=7";
+        assert_eq!(
+            paid_request_args(
+                &s(&[
+                    "-sL",
+                    "--url-query",
+                    "id=7",
+                    "--url-query=b=2",
+                    "http://a.example/x"
+                ]),
+                ToolKind::Curl,
+                to
+            ),
+            s(&["-sL", to])
+        );
+        assert_eq!(
+            paid_request_args(
+                &s(&[
+                    "--follow",
+                    "http://a.example/x",
+                    "id==7",
+                    "Accept:x",
+                    "Q:a==b"
+                ]),
+                ToolKind::Httpie,
+                to
+            ),
+            s(&["--follow", to, "Accept:x", "Q:a==b"])
+        );
+        // `-G` moves the body into the query; Pay cannot retarget it.
+        assert_eq!(
+            retarget_args(
+                &s(&["-sG", "-d", "id=7", "http://a.example/x"]),
+                ToolKind::Curl,
+                "http://a.example/x",
+                to
+            ),
+            None
+        );
+        // Without a redirect, the caller's query options stay.
+        let named = "http://a.example/x";
+        assert_eq!(
+            paid_request_args(&s(&["--url-query", "id=7", named]), ToolKind::Curl, named),
+            s(&["--url-query", "id=7", named])
+        );
+    }
+
+    #[test]
+    fn a_single_transfer_is_accepted() {
+        for args in [
+            s(&[
+                "-sS",
+                "-H",
+                "Accept: x",
+                "-d",
+                "a=1",
+                "https://a.example/paid",
+            ]),
+            s(&["-o", "out.json", "--url", "https://a.example/paid"]),
+            s(&[
+                "-X",
+                "POST",
+                "-ehttps://referer.example",
+                "https://a.example/paid",
+            ]),
+            s(&[
+                "--max-time",
+                "5",
+                "-w",
+                "%{http_code}",
+                "https://a.example/paid",
+            ]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Curl).is_ok(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            s(&["-q", "-O", "-", "https://a.example/paid"]),
+            s(&[
+                "-nv",
+                "--header",
+                "Accept: x",
+                "-Oout",
+                "https://a.example/paid",
+            ]),
+            s(&["--post-data=a=1", "-U", "agent", "https://a.example/paid"]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_invocations_with_more_than_one_transfer_are_refused() {
+        for args in [
+            s(&["https://a.example/paid", "https://collector.example/"]),
+            s(&["https://a.example/paid", "collector.example"]),
+            s(&[
+                "--url",
+                "https://a.example/paid",
+                "https://collector.example/",
+            ]),
+            s(&[
+                "https://a.example/paid",
+                "--next",
+                "https://collector.example/",
+            ]),
+            s(&["https://a.example/paid", "-:", "https://collector.example/"]),
+            s(&["-K", "urls.txt", "https://a.example/paid"]),
+            s(&["-sK", "urls.txt"]),
+            s(&["--url", "@urls.txt"]),
+            s(&["--variable", "u=x", "--expand-url", "{{u}}"]),
+            s(&[
+                "-d",
+                "a=1",
+                "--",
+                "https://a.example/paid",
+                "https://c.example/",
+            ]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Curl).is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wget_invocations_with_more_than_one_transfer_are_refused() {
+        for args in [
+            s(&["https://a.example/paid", "https://collector.example/"]),
+            s(&["-i", "urls.txt"]),
+            s(&["--input-file=urls.txt"]),
+            s(&["-r", "https://a.example/paid"]),
+            s(&["-qm", "https://a.example/paid"]),
+            s(&["--page-requisites", "https://a.example/paid"]),
+            s(&["-e", "recursive=on", "https://a.example/paid"]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wget_abbreviations_are_read_as_the_option_they_select() {
+        // getopt_long accepts any unambiguous prefix of a long option.
+        for args in [
+            s(&["--input-fil=urls.txt"]),
+            s(&["--input-fil", "urls.txt"]),
+            s(&["--mirro", "https://a.example/paid"]),
+            s(&["--recur", "https://a.example/paid"]),
+            s(&["--page-req", "https://a.example/paid"]),
+            s(&["--exec", "recursive=on", "https://a.example/paid"]),
+            s(&["--conf=evil.wgetrc", "https://a.example/paid"]),
+            s(&["--metalink-over", "https://a.example/paid"]),
+            // Ambiguous, and one reading (`--config`) adds transfers.
+            s(&["--con", "x", "https://a.example/paid"]),
+            // Booleans take no separate value: both URLs are transfers.
+            s(&[
+                "--backups",
+                "https://collector.example/",
+                "https://a.example/paid",
+            ]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_err(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            s(&["--head", "Accept: x", "https://a.example/paid"]),
+            s(&["--output-doc=-", "https://a.example/paid"]),
+            s(&["--no-verb", "--quiet", "https://a.example/paid"]),
+            s(&["--report-speed=bits", "https://a.example/paid"]),
+            s(&["--no-recursive", "https://a.example/paid"]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wget_abbreviations_reach_every_reading_of_the_command_line() {
+        assert!(!follows_redirects(
+            &s(&["--max-redir=0", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!is_bodyless_read(
+            &s(&["--post-d=a=1", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(user_already_set_auth(
+            &s(&["--head=Authorization: Bearer mine", "https://a.example/"]),
+            ToolKind::Wget
+        ));
+        assert!(user_already_set_user_agent(
+            &s(&["--user-a", "agent", "https://a.example/"]),
+            ToolKind::Wget
+        ));
+        let request =
+            ParsedWgetRequest::from_args(&s(&["--post-d", "a=1", "https://a.example/paid"]));
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.body.as_deref(), Some("a=1"));
+        assert_eq!(request.url.as_deref(), Some("https://a.example/paid"));
+    }
+
+    #[test]
+    fn curl_long_options_are_never_abbreviated() {
+        // curl rejects `--nex` as unknown rather than reading `--next`, so
+        // it is a flag here too; the URL count still holds the line.
+        assert!(
+            ensure_single_transfer(&s(&["--nex", "https://a.example/paid"]), ToolKind::Curl)
+                .is_ok()
+        );
+        assert!(
+            ensure_single_transfer(
+                &s(&["https://a.example/paid", "--nex", "https://c.example/"]),
+                ToolKind::Curl
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn credentials_are_never_injected_into_a_multi_transfer_command() {
+        // The public retry entry points refuse before spawning anything.
+        let args = s(&["https://a.example/paid", "https://collector.example/"]);
+        let payment = s(&[PAYMENT_HEADER]);
+        if check_command_exists("curl").is_ok() {
+            assert!(matches!(
+                run_curl_inner(&args, &payment),
+                Err(Error::RequestValidation(_))
+            ));
+        }
+        if check_command_exists("wget").is_ok() {
+            assert!(matches!(
+                run_wget_inner(&args, &payment),
+                Err(Error::RequestValidation(_))
+            ));
+        }
+        // And so does the pre-signing validation the CLI runs.
+        assert!(validate_curl_args_against_catalog(&args).is_err());
+        assert!(validate_wget_args_against_catalog(&args).is_err());
+    }
+
+    #[test]
+    fn curl_url_globs_do_not_fan_credentials_out() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        // Without --globoff this glob would be two transfers: the origin and
+        // the collector. With it, curl requests a literal (invalid) URL.
+        let collector = server.collector_url.clone();
+        let glob = format!("{{{},{}}}", server.origin_url, collector);
+        let _ = run_curl_inner(&s(&["-s", &glob]), &s(&[PAYMENT_HEADER]));
+        let _ = run_curl_inner(&s(&["-s", &server.origin_url]), &[]);
+        assert!(!server.collector_was_contacted());
+    }
+
+    /// Collects every formatted field of every event it sees.
+    #[derive(Clone, Default)]
+    struct EventText(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl tracing::Subscriber for EventText {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut String);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={value:?};", field.name());
+                }
+            }
+            event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn invocation_logs_carry_header_names_but_no_secrets() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        // A process-wide subscriber: a scoped one races other tests over
+        // the callsite interest cache and can miss the event.
+        static EVENTS: std::sync::OnceLock<EventText> = std::sync::OnceLock::new();
+        let events = EVENTS.get_or_init(|| {
+            let events = EventText::default();
+            let _ = tracing::subscriber::set_global_default(events.clone());
+            events
+        });
+        let server = CrossOriginRedirect::start();
+        let args = s(&[
+            "-s",
+            "-H",
+            "X-Api-Key: caller-secret",
+            "-u",
+            "user:caller-password",
+            &server.origin_url,
+        ]);
+        run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        let _ = server.collector_was_contacted();
+        let logged = events.0.lock().unwrap().clone();
+        // Positive control: the event was captured and names the headers.
+        assert!(logged.contains("Authorization"), "{logged}");
+        assert!(logged.contains("User-Agent"), "{logged}");
+        for secret in [
+            "redirect-test-credential",
+            "caller-secret",
+            "caller-password",
+        ] {
+            assert!(
+                !logged.contains(secret),
+                "a caller credential leaked into the logged event"
+            );
+        }
+    }
+
     #[test]
     fn no_url_means_no_pre_attach() {
         let args = s(&["--help"]);
         assert_eq!(resolve_request_url(&args, ToolKind::Httpie), None);
-        assert!(pre_attach_cached_auth(&args, ToolKind::Httpie).is_empty());
+        assert!(pre_attach_cached_auth(&args, ToolKind::Httpie, None, None).is_empty());
     }
 }
 
@@ -1727,58 +4281,29 @@ struct ParsedWgetRequest {
 
 impl ParsedWgetRequest {
     fn from_args(args: &[String]) -> Self {
-        let mut url = None;
+        let url = resolve_request_url(args, ToolKind::Wget);
         let mut explicit_method = None;
         let mut body = None;
         let mut post_body_seen = false;
-        let mut i = 0;
-
-        while i < args.len() {
-            let arg = &args[i];
-            match arg.as_str() {
-                "--method" => {
-                    if let Some(value) = args.get(i + 1) {
+        for (name, value) in wget_options(args) {
+            match name {
+                OptionName::Long("method") => {
+                    if let Some(value) = value {
                         explicit_method = Some(value.to_ascii_uppercase());
-                        i += 1;
                     }
                 }
-                "--post-data" | "--body-data" => {
-                    if let Some(value) = args.get(i + 1) {
-                        body = Some(value.clone());
-                        post_body_seen = true;
-                        i += 1;
+                OptionName::Long("post-data" | "body-data") => {
+                    if let Some(value) = value {
+                        body = Some(value.to_string());
                     }
+                    post_body_seen = true;
                 }
-                "--spider" => {
+                OptionName::Long("post-file" | "body-file") => post_body_seen = true,
+                OptionName::Long("spider") => {
                     explicit_method.get_or_insert_with(|| "HEAD".to_string());
                 }
-                _ => {
-                    if let Some(value) = arg.strip_prefix("--method=") {
-                        explicit_method = Some(value.to_ascii_uppercase());
-                    } else if let Some(value) = arg.strip_prefix("--post-data=") {
-                        body = Some(value.to_string());
-                        post_body_seen = true;
-                    } else if let Some(value) = arg.strip_prefix("--body-data=") {
-                        body = Some(value.to_string());
-                        post_body_seen = true;
-                    } else if matches!(
-                        arg.as_str(),
-                        "--post-file" | "--body-file" | "--post-file=" | "--body-file="
-                    ) {
-                        post_body_seen = true;
-                        if !arg.ends_with('=') && args.get(i + 1).is_some() {
-                            i += 1;
-                        }
-                    } else if arg.starts_with("--post-file=") || arg.starts_with("--body-file=") {
-                        post_body_seen = true;
-                    } else if url.is_none()
-                        && (arg.starts_with("http://") || arg.starts_with("https://"))
-                    {
-                        url = Some(arg.clone());
-                    }
-                }
+                _ => {}
             }
-            i += 1;
         }
 
         let method = explicit_method.unwrap_or_else(|| {

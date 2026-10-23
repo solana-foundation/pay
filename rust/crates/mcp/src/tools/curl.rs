@@ -1163,7 +1163,12 @@ fn do_paid_fetch(
     // non-expired token), attach it BEFORE the first fetch. On hit the
     // server validates the token and skips the 402 entirely — no Touch
     // ID prompt, no extra round trip. On miss this is a no-op.
-    let cached_auth_header = pay_core::client::authenticate::cached_header_for_resource(store, url);
+    let cached_auth_header = pay_core::client::authenticate::cached_header_for_account(
+        store,
+        network_override.as_deref(),
+        account_override.as_deref(),
+        url,
+    );
     let mut initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
         Some(token)
             if !extra_headers
@@ -1247,14 +1252,17 @@ fn do_paid_fetch(
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_mpp(ch.as_ref(), &resource_url)?;
                     }
+                    // An unresolved earlier try resends its credential, so a
+                    // retry after a lost response never signs a second charge.
                     let (auth_header, _ephemeral) = scope.with_approval(peer.as_ref(), |auth| {
-                        pay_core::client::mpp::build_credential_with_override(
+                        pay_core::client::mpp::build_credential_for_attempt(
                             ch.as_ref(),
                             store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
                             auth,
+                            &attempt,
                         )
                     })?;
                     headers.push(("Authorization".to_string(), auth_header));
@@ -1532,9 +1540,11 @@ fn do_paid_fetch(
             resource_url,
             ..
         } => {
-            if let Some(permissions) = &scope.payment_permissions {
-                permissions.authorize_session(&challenge, &resource_url)?;
-            }
+            let approved_payout = scope
+                .payment_permissions
+                .as_ref()
+                .map(|permissions| permissions.authorize_session(&challenge, &resource_url))
+                .transpose()?;
             let key = session_key.ok_or_else(|| {
                 pay_core::Error::Mpp(
                     "MPP session payments require an absolute HTTP(S) URL".to_string(),
@@ -1549,17 +1559,22 @@ fn do_paid_fetch(
                         account_override.as_deref(),
                         url,
                         auth,
+                        Some(&attempt),
+                        approved_payout.as_ref(),
                     )
                 })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), open_authorization));
-            let retry = paid_fetch(&headers)?;
-            if matches!(&retry, RunOutcome::Completed { .. }) {
-                // Only retain a session after the gateway accepted its open
-                // request; otherwise the channel may not exist remotely.
-                session_cache.store(key, use_authorization);
+            // Retain the channel's reusable authorization before the open is
+            // sent. If the answer is lost, the next request presents it
+            // instead of funding a second channel; a gateway that never saw
+            // the open answers that with a 402, which drops it.
+            session_cache.store(key.clone(), use_authorization);
+            let retry = paid_fetch(&headers);
+            if !session_open_may_have_landed(&retry) {
+                session_cache.remove(&key);
             }
-            interpret_retry(retry)
+            interpret_retry(retry?)
         }
         RunOutcome::SubscriptionChallenge {
             challenge,
@@ -1721,6 +1736,19 @@ fn commit_batch_settlement(
     ) {
         tracing::warn!(%error, "batch-settlement receipt not adopted; the next request retries the same credential");
     }
+}
+
+/// Whether a session open's paid retry leaves the channel possibly open.
+/// Only a fresh challenge or a payment rejection proves the gateway refused
+/// the open; any response it completed, and any failure without an answer,
+/// may follow an accepted open.
+fn session_open_may_have_landed(
+    retry: &Result<pay_core::client::runner::RunOutcome, pay_core::Error>,
+) -> bool {
+    matches!(
+        retry,
+        Ok(pay_core::client::runner::RunOutcome::Completed { .. }) | Err(_)
+    )
 }
 
 fn interpret_retry(
@@ -2208,6 +2236,37 @@ mod tests {
         assert_eq!(session_payer(&store, Some("mainnet"), Some("b")), "PubkeyB");
         assert_eq!(session_payer(&store, None, None), "PubkeyA");
         assert_eq!(session_payer(&store, Some("devnet"), None), "");
+    }
+
+    #[test]
+    fn a_session_open_without_a_definitive_refusal_keeps_its_channel() {
+        use pay_core::client::runner::RunOutcome;
+        let completed = |exit_code| {
+            Ok(RunOutcome::Completed {
+                exit_code,
+                body: None,
+                content_type: None,
+                response_headers: Vec::new(),
+            })
+        };
+        // The gateway answered, or the answer was lost after the open left.
+        assert!(session_open_may_have_landed(&completed(0)));
+        assert!(session_open_may_have_landed(&completed(1)));
+        assert!(session_open_may_have_landed(&Err(pay_core::Error::Mpp(
+            "Request failed: connection reset".to_string()
+        ))));
+        // The gateway refused the open: no channel to reuse.
+        assert!(!session_open_may_have_landed(&Ok(
+            RunOutcome::PaymentRejected {
+                reason: "insufficient deposit".to_string(),
+                retryable: false,
+                advertised_challenges: Default::default(),
+                resource_url: "https://api.example.com/v1".to_string(),
+            }
+        )));
+        assert!(!session_open_may_have_landed(&Ok(x402_outcome(
+            "https://api.example.com/v1"
+        ))));
     }
 
     #[test]

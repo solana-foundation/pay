@@ -57,6 +57,24 @@ pub fn subject_for(provider_id: &str, account_identity: &str) -> String {
     format!("sub_{}", &hex[..32])
 }
 
+/// The upstream login session a browser or credential acts in: the
+/// provider's session id (Privy's `sid`) and when the token proving it was
+/// issued, in unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginSession {
+    pub id: String,
+    pub issued_at: u64,
+}
+
+/// What a browser's signed subject cookie says: who it is and the login
+/// session it was set in. A cookie never stands on its own; every approval
+/// made with it is bound to, and revoked with, that session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserLogin {
+    pub subject: String,
+    pub session: LoginSession,
+}
+
 /// One tenant's wallet and rules.
 #[derive(Clone)]
 pub struct TenantRecord {
@@ -73,9 +91,21 @@ pub struct TenantRecord {
     /// Provider credentials that sign for this wallet.
     pub credentials: Credentials,
     pub policy: SpendPolicy,
+    /// Wallets this tenant's payments may reach.
+    pub recipients: pay_mcp::ApprovedRecipients,
 }
 
+/// Recipients a fresh connector wallet may pay: any, since a tenant has no
+/// way yet to approve specific ones. Every approval names each destination.
+pub const DEFAULT_RECIPIENTS: pay_mcp::ApprovedRecipients = pay_mcp::ApprovedRecipients::Any;
+
 impl TenantRecord {
+    /// The challenge-term checks every payment from this wallet passes
+    /// before it is built or signed.
+    pub fn payment_permissions(&self) -> pay_mcp::McpPermissions {
+        pay_mcp::McpPermissions::hosted(&self.recipients)
+    }
+
     /// The spend-ledger key: the provider wallet, not the subject, so every
     /// connection linked to one wallet shares one allowance.
     pub fn ledger_key(&self) -> String {
@@ -115,9 +145,15 @@ struct LinkTicket {
 #[async_trait::async_trait]
 pub trait SpendHistory: Send + Sync {
     /// USD minor units `wallet` paid out in stablecoins during the current
-    /// UTC day. An error means unknown, and binding fails closed.
+    /// UTC day. An error means unavailable, and binding fails closed;
+    /// [`UNCOUNTABLE_SPEND`] means binding succeeds with nothing left today.
     async fn spent_today(&self, wallet: &str) -> Result<u64, String>;
 }
+
+/// What [`SpendHistory::spent_today`] answers for a wallet whose history
+/// today exists but is too long to count: more than any daily cap, so the
+/// wallet signs in but pays nothing more until the UTC day turns.
+pub const UNCOUNTABLE_SPEND: u64 = u64::MAX;
 
 /// A history with a fixed answer, for tests.
 pub struct FixedHistory(pub u64);
@@ -229,7 +265,11 @@ impl TenantRegistry {
         if self.seeded.lock().unwrap().contains(&key) {
             return Ok(());
         }
-        let spent = history.spent_today(&tenant.pubkey).await?;
+        let mut spent = history.spent_today(&tenant.pubkey).await?;
+        if spent == UNCOUNTABLE_SPEND {
+            // Exactly the cap: nothing more today, and a refusal that reads.
+            spent = tenant.policy.daily_cap.unwrap_or(UNCOUNTABLE_SPEND);
+        }
         if self.seeded.lock().unwrap().insert(key.clone()) {
             let _ = self.ledger.check_and_record(&key, spent, None);
         }
@@ -275,15 +315,52 @@ impl TenantRegistry {
     /// Read a server-authenticated browser subject. Unsigned and tampered
     /// cookies are deliberately ignored.
     pub fn subject_from_cookie(&self, headers: &axum::http::HeaderMap) -> Option<String> {
-        let signed = cookie::value(headers, cookie::SUBJECT_NAME)?;
-        self.verify_cookie_value(b"subject", &signed)
-            .filter(|subject| !subject.is_empty() && subject.len() <= 128)
+        self.login_from_cookie(headers).map(|login| login.subject)
     }
 
-    pub fn subject_cookie(&self, subject: &str, secure: bool) -> axum::http::HeaderValue {
+    /// Who this browser signed in as, and in which login session. Whether
+    /// that session is still live is the caller's question to the provider.
+    pub fn login_from_cookie(&self, headers: &axum::http::HeaderMap) -> Option<BrowserLogin> {
+        use base64::Engine;
+        let signed = cookie::value(headers, cookie::SUBJECT_NAME)?;
+        let value = self.verify_cookie_value(b"subject", &signed)?;
+        let mut parts = value.split('~');
+        let (Some(subject), Some(id), Some(issued_at), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(id)
+            .ok()
+            .and_then(|id| String::from_utf8(id).ok())
+            .filter(|id| !id.is_empty())?;
+        if subject.is_empty() || subject.len() > 128 {
+            return None;
+        }
+        Some(BrowserLogin {
+            subject: subject.to_string(),
+            session: LoginSession {
+                id,
+                issued_at: issued_at.parse().ok()?,
+            },
+        })
+    }
+
+    /// Remember a browser as `subject`, signed in during `session`: the
+    /// cookie can approve again only while that session is live.
+    pub fn subject_cookie(
+        &self,
+        subject: &str,
+        session: &LoginSession,
+        secure: bool,
+    ) -> axum::http::HeaderValue {
+        use base64::Engine;
+        let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&session.id);
+        let value = format!("{subject}~{id}~{}", session.issued_at);
         cookie::set(
             cookie::SUBJECT_NAME,
-            &self.sign_cookie_value(b"subject", subject),
+            &self.sign_cookie_value(b"subject", &value),
             secure,
         )
     }
@@ -375,6 +452,28 @@ impl TenantRegistry {
             .lock()
             .unwrap()
             .insert(record.subject.clone(), Arc::new(record));
+    }
+
+    /// Bind the provider wallet's owner, in one step unbinding every other
+    /// subject still on that wallet: a former owner, or connections that
+    /// former owner linked. Returns those subjects, whose credentials the
+    /// caller must revoke.
+    pub fn bind_owner(&self, record: TenantRecord) -> Vec<String> {
+        let mut tenants = self.tenants.lock().unwrap();
+        let stale: Vec<String> = tenants
+            .values()
+            .filter(|t| {
+                t.provider == record.provider
+                    && t.wallet_id == record.wallet_id
+                    && t.subject != record.subject
+            })
+            .map(|t| t.subject.clone())
+            .collect();
+        for subject in &stale {
+            tenants.remove(subject);
+        }
+        tenants.insert(record.subject.clone(), Arc::new(record));
+        stale
     }
 
     pub fn get(&self, subject: &str) -> Option<Arc<TenantRecord>> {
@@ -637,7 +736,7 @@ impl PayContext for CloudContext {
             approval: Arc::new(self.approval(&record)),
             // Fail closed on challenge-selected terms: mainnet stablecoins
             // only, before any payment is built or signed.
-            payment_permissions: Some(Arc::new(pay_mcp::McpPermissions::hosted())),
+            payment_permissions: Some(Arc::new(record.payment_permissions())),
             // The server has no access to the caller's files.
             body_files: false,
             // Arbitrary public APIs remain available, but tenant-controlled
@@ -666,7 +765,47 @@ mod tests {
             pubkey: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z".to_string(),
             credentials,
             policy: SpendPolicy::dollars(1.0, 5.0),
+            recipients: DEFAULT_RECIPIENTS,
         }
+    }
+
+    #[test]
+    fn a_tenant_pays_only_the_recipients_it_approved() {
+        const PAYEE: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        const SPLIT: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+        let charge = pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "5000000",
+                "currency": "USDC",
+                "recipient": PAYEE,
+                "methodDetails": {
+                    "network": "mainnet",
+                    "splits": [{ "recipient": SPLIT, "amount": "4000000" }],
+                },
+            }))
+            .unwrap(),
+        );
+        let url = "https://merchant.example/paid";
+        let mut tenant = record("sub_1");
+        tenant.recipients = pay_mcp::ApprovedRecipients::Only(vec![PAYEE.parse().unwrap()]);
+        assert!(
+            tenant
+                .payment_permissions()
+                .authorize_mpp(&charge, url)
+                .is_err(),
+            "the split goes to a wallet the tenant never approved"
+        );
+        tenant.recipients = DEFAULT_RECIPIENTS;
+        assert!(
+            tenant
+                .payment_permissions()
+                .authorize_mpp(&charge, url)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -700,13 +839,17 @@ mod tests {
     fn subject_cookie_round_trips() {
         use axum::http::{HeaderMap, header};
         let registry = TenantRegistry::new();
-        let value = registry.subject_cookie("sub_abc", true);
+        let session = LoginSession {
+            id: "sess_1".to_string(),
+            issued_at: 1_700_000_000,
+        };
+        let value = registry.subject_cookie("sub_abc", &session, true);
         let text = value.to_str().unwrap();
-        assert!(text.starts_with("pay_subject=sub_abc."), "{text}");
+        assert!(text.starts_with("pay_subject=sub_abc~"), "{text}");
         assert!(text.ends_with("; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure"));
         assert!(
             !registry
-                .subject_cookie("s", false)
+                .subject_cookie("s", &session, false)
                 .to_str()
                 .unwrap()
                 .contains("Secure")
@@ -728,6 +871,26 @@ mod tests {
             registry.subject_from_cookie(&headers).as_deref(),
             Some("sub_abc")
         );
+        assert_eq!(
+            registry.login_from_cookie(&headers),
+            Some(BrowserLogin {
+                subject: "sub_abc".to_string(),
+                session: session.clone(),
+            })
+        );
+        // A signed subject without a login session (the old format) is
+        // not a login.
+        let mut sessionless = HeaderMap::new();
+        sessionless.insert(
+            header::COOKIE,
+            format!(
+                "pay_subject={}",
+                registry.sign_cookie_value(b"subject", "sub_abc")
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(registry.login_from_cookie(&sessionless), None);
 
         let mut tampered = HeaderMap::new();
         tampered.insert(

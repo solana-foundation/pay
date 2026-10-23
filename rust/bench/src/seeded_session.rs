@@ -15,7 +15,9 @@ use pay_core::server::session::{SessionMpp, test_channel_state};
 use pay_kit::mpp::blockhash::BlockhashCache;
 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
 use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
-use pay_kit::mpp::store::{ChannelLifecycle, ChannelState, ChannelStore, StoreError};
+use pay_kit::mpp::store::{
+    ChannelLifecycle, ChannelPredicate, ChannelState, ChannelStore, StoreError,
+};
 use sha2::{Digest, Sha256};
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
@@ -91,6 +93,19 @@ impl ChannelStore for ShardedMemoryChannelStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         self.data.remove(channel_id);
         Box::pin(async { Ok(()) })
+    }
+
+    fn delete_channel_if(
+        &self,
+        channel_id: &str,
+        approve: ChannelPredicate,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        // `remove_if` evaluates the predicate under the shard write guard.
+        let deleted = self
+            .data
+            .remove_if(channel_id, |_, state| approve(state))
+            .is_some();
+        Box::pin(async move { Ok(deleted) })
     }
 
     fn update_channel(

@@ -609,6 +609,11 @@ async fn push_session_full_flow() {
                 use base64::Engine as _;
                 let result = match body["method"].as_str().unwrap_or_default() {
                     "getSlot" => serde_json::json!(challenged_slot + 1),
+                    // The client checks the challenged blockhash is live.
+                    "isBlockhashValid" => serde_json::json!({
+                        "context": { "slot": challenged_slot },
+                        "value": true
+                    }),
                     "sendTransaction" => serde_json::json!(
                         pay_kit::mpp::program::payment_channels::decode_transaction(
                             body["params"][0].as_str().unwrap()
@@ -742,10 +747,15 @@ async fn push_session_full_flow() {
         &challenged_request,
         &payer_signer,
         session_signer,
-        None, // bind to the challenged recentBlockhash
+        pay_kit::mpp::client::OpenBlockhash::verify(
+            &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url.clone()),
+            &challenged_request,
+        )
+        .await
+        .unwrap(),
+        &pay_kit::mpp::client::SessionOpenAuthorization::client_signed(deposit),
         pay_kit::mpp::client::PaymentChannelSessionOpenOptions {
             open: pay_kit::mpp::client::PaymentChannelOpenOptions {
-                deposit: Some(deposit),
                 grace_period: Some(grace_period),
                 salt: Some(salt),
                 ..Default::default()

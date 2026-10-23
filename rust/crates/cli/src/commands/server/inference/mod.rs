@@ -1307,6 +1307,7 @@ models:
                 ttft_ms: Some(180),
                 tokens_prompt: Some(12),
                 tokens_completion: Some(214),
+                tokens_completion_estimated: false,
                 tokens_per_sec: Some(41.2),
             }),
         });

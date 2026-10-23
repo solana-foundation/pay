@@ -21,17 +21,17 @@
 //! `\n` escapes accepted) or `PRIVY_JWKS_URL` (default: the app's JWKS at
 //! auth.privy.io; it can hold several keys during a rotation). The JWKS is
 //! refetched every few minutes and replaced wholesale, so a key Privy
-//! retires stops verifying; keys that cannot be refreshed for an hour stop
-//! verifying too.
+//! retires stops verifying; keys due for a refetch that fails stop verifying
+//! too, and a `kid` the current set does not name never verifies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::tenants::TenantRecord;
+use crate::tenants::{LoginSession, TenantRecord};
 
 pub const PROVIDER_ID: &str = "privy";
 pub const APP_ID_ENV: &str = "PRIVY_APP_ID";
@@ -49,13 +49,21 @@ const ISSUER: &str = "privy.io";
 const JWKS_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Least time between refetches, so unknown `kid`s cannot hammer Privy.
 const JWKS_RETRY_AFTER: Duration = Duration::from_secs(30);
-/// Beyond this age without a successful refetch the keys are not trusted.
-const JWKS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// How long a revoked session is remembered: past the lifetime of any
 /// access token issued for it.
 const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Most sign-outs one user is remembered by, session by session. One more
+/// refuses every token of theirs issued so far instead, in a single entry,
+/// so no one user can fill the list.
+const MAX_SIGN_OUTS_PER_USER: usize = 8;
+/// Most sign-outs by expired tokens one user is remembered by, session by
+/// session. They do not count toward [`MAX_SIGN_OUTS_PER_USER`], so a few
+/// old leaked tokens cannot sign the user out everywhere; past this many the
+/// user falls back to the same one-entry floor, so no one user can fill the
+/// list either.
+const MAX_EXPIRED_SIGN_OUTS_PER_USER: usize = 64;
 /// Most revoked sessions remembered at once.
-const MAX_REVOKED_SESSIONS: usize = 4096;
+pub(crate) const MAX_REVOKED_SESSIONS: usize = 65_536;
 
 #[derive(Clone)]
 pub struct Config {
@@ -130,8 +138,9 @@ pub fn default_jwks_url(app_id: &str) -> String {
 pub struct Identity {
     /// `did:privy:…`, stable for the user in this app.
     pub user_id: String,
-    /// The Privy session (`sid`) the token belongs to; always present.
-    pub session_id: Option<String>,
+    /// The Privy session (`sid`) the token belongs to, and when the token
+    /// was issued.
+    pub session: LoginSession,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +148,18 @@ struct Claims {
     sub: String,
     #[serde(default)]
     sid: Option<String>,
+    /// When the token was issued; a token without it cannot be placed
+    /// against what this process has seen.
+    iat: u64,
+    /// When the token expires.
+    exp: u64,
+}
+
+/// A sign-out request's bearer, verified by [`Privy::identify_for_sign_out`]:
+/// who it proves, and whether the token had already expired.
+pub struct SignOutBearer {
+    pub identity: Identity,
+    expired: bool,
 }
 
 /// A user's Solana wallet at Privy.
@@ -240,6 +261,190 @@ impl Keys {
     }
 }
 
+/// Sign-outs this process remembers, each until no token it refuses can
+/// still be live. Both maps together hold at most [`MAX_REVOKED_SESSIONS`].
+#[derive(Default)]
+struct SignOuts {
+    /// Signed-out sessions by `sid`: whose (the subject), and when.
+    sessions: HashMap<String, (String, Instant)>,
+    /// The same sessions by subject, so a user's share is counted without
+    /// scanning everyone's.
+    by_user: HashMap<String, Vec<String>>,
+    /// Sessions signed out by expired tokens, by subject: counted toward
+    /// [`MAX_EXPIRED_SIGN_OUTS_PER_USER`] instead.
+    expired_by_user: HashMap<String, Vec<String>>,
+    /// Users who signed out more than [`MAX_SIGN_OUTS_PER_USER`] sessions:
+    /// the unix second before which none of their tokens is accepted, and
+    /// when it was set.
+    users: HashMap<String, (u64, Instant)>,
+}
+
+fn remembered(at: &Instant, now: Instant) -> bool {
+    now.saturating_duration_since(*at) <= REVOKED_SESSION_TTL
+}
+
+impl SignOuts {
+    fn len(&self) -> usize {
+        self.sessions.len() + self.users.len()
+    }
+
+    fn refuses(&self, subject: &str, session: &LoginSession) -> bool {
+        let now = Instant::now();
+        self.sessions
+            .get(&session.id)
+            .is_some_and(|(_, at)| remembered(at, now))
+            || self
+                .users
+                .get(subject)
+                .is_some_and(|(floor, at)| remembered(at, now) && session.issued_at < *floor)
+    }
+
+    /// Remember that `subject` signed `session` out. Returns false, holding
+    /// nothing new, when every entry is a live sign-out of someone else.
+    fn insert(&mut self, subject: &str, session: &str, now: Instant) -> bool {
+        // Forget this user's expired sign-outs, then count what is left.
+        let sessions = &mut self.sessions;
+        let theirs = self.by_user.entry(subject.to_string()).or_default();
+        theirs.retain(|sid| {
+            let keep = sessions
+                .get(sid)
+                .is_some_and(|(owner, at)| owner == subject && remembered(at, now));
+            if !keep && sessions.get(sid).is_some_and(|(owner, _)| owner == subject) {
+                sessions.remove(sid);
+            }
+            keep
+        });
+        if let Some((_, at)) = sessions.get_mut(session) {
+            *at = now;
+            if theirs.is_empty() {
+                self.by_user.remove(subject);
+            }
+            return true;
+        }
+        if theirs.len() >= MAX_SIGN_OUTS_PER_USER {
+            // One user signing out session after session is remembered by
+            // one entry: every token of theirs issued so far is refused.
+            for sid in theirs.drain(..) {
+                sessions.remove(&sid);
+            }
+            self.by_user.remove(subject);
+            let floor = unix_now() + 1;
+            let entry = self
+                .users
+                .entry(subject.to_string())
+                .or_insert((floor, now));
+            *entry = (entry.0.max(floor), now);
+            return true;
+        }
+        if self.len() >= MAX_REVOKED_SESSIONS {
+            self.sessions.retain(|_, (_, at)| remembered(at, now));
+            self.users.retain(|_, (_, at)| remembered(at, now));
+            let sessions = &self.sessions;
+            for lists in [&mut self.by_user, &mut self.expired_by_user] {
+                lists.retain(|_, sids| {
+                    sids.retain(|sid| sessions.contains_key(sid));
+                    !sids.is_empty()
+                });
+            }
+            if self.len() >= MAX_REVOKED_SESSIONS {
+                return false;
+            }
+        }
+        self.sessions
+            .insert(session.to_string(), (subject.to_string(), now));
+        self.by_user
+            .entry(subject.to_string())
+            .or_default()
+            .push(session.to_string());
+        true
+    }
+
+    /// Remember that `subject` signed `session` out without counting it
+    /// toward their [`MAX_SIGN_OUTS_PER_USER`] share. Returns false as
+    /// [`Self::insert`] does.
+    fn insert_uncounted(&mut self, subject: &str, session: &str, now: Instant) -> bool {
+        let sessions = &mut self.sessions;
+        let theirs = self.expired_by_user.entry(subject.to_string()).or_default();
+        theirs.retain(|sid| {
+            sessions
+                .get(sid)
+                .is_some_and(|(owner, at)| owner == subject && remembered(at, now))
+        });
+        if let Some((_, at)) = sessions.get_mut(session) {
+            *at = now;
+            if theirs.is_empty() {
+                self.expired_by_user.remove(subject);
+            }
+            return true;
+        }
+        if theirs.len() >= MAX_EXPIRED_SIGN_OUTS_PER_USER {
+            // Past their share, one entry refuses every token of theirs
+            // issued so far, as for live sign-outs.
+            for sid in theirs.drain(..) {
+                sessions.remove(&sid);
+            }
+            self.expired_by_user.remove(subject);
+            let floor = unix_now() + 1;
+            let entry = self
+                .users
+                .entry(subject.to_string())
+                .or_insert((floor, now));
+            *entry = (entry.0.max(floor), now);
+            return true;
+        }
+        if self.len() >= MAX_REVOKED_SESSIONS {
+            self.sessions.retain(|_, (_, at)| remembered(at, now));
+            self.users.retain(|_, (_, at)| remembered(at, now));
+            let sessions = &self.sessions;
+            for lists in [&mut self.by_user, &mut self.expired_by_user] {
+                lists.retain(|_, sids| {
+                    sids.retain(|sid| sessions.contains_key(sid));
+                    !sids.is_empty()
+                });
+            }
+            if self.len() >= MAX_REVOKED_SESSIONS {
+                return false;
+            }
+        }
+        self.sessions
+            .insert(session.to_string(), (subject.to_string(), now));
+        self.expired_by_user
+            .entry(subject.to_string())
+            .or_default()
+            .push(session.to_string());
+        true
+    }
+
+    /// Forget the oldest remembered session to make room.
+    fn evict_oldest(&mut self) {
+        let Some((sid, owner)) = self
+            .sessions
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(sid, (owner, _))| (sid.clone(), owner.clone()))
+        else {
+            let oldest = self
+                .users
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(subject, _)| subject.clone());
+            if let Some(subject) = oldest {
+                self.users.remove(&subject);
+            }
+            return;
+        };
+        self.sessions.remove(&sid);
+        for lists in [&mut self.by_user, &mut self.expired_by_user] {
+            if let Some(sids) = lists.get_mut(&owner) {
+                sids.retain(|other| *other != sid);
+                if sids.is_empty() {
+                    lists.remove(&owner);
+                }
+            }
+        }
+    }
+}
+
 /// The Privy client pay-connect holds: app credentials and the verifier.
 pub struct Privy {
     cfg: Config,
@@ -249,10 +454,18 @@ pub struct Privy {
     refresh: tokio::sync::Mutex<Option<Instant>>,
     refresh_after: Duration,
     retry_after: Duration,
-    max_age: Duration,
+    /// The last refetch failed: a set due for one is no longer confirmed.
+    refresh_failed: std::sync::atomic::AtomicBool,
     validation: jsonwebtoken::Validation,
-    /// Sessions signed out here, by `sid`, with when.
-    revoked: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    /// [`Privy::validation`] without the expiry check, for sign-outs.
+    sign_out_validation: jsonwebtoken::Validation,
+    /// Sign-outs remembered in this process.
+    revoked: std::sync::Mutex<SignOuts>,
+    /// Unix second before which no token is accepted. Sign-outs are
+    /// remembered in this process only, so a token issued before it started
+    /// may belong to a session signed out on a previous run: it is refused,
+    /// and its holder signs in again.
+    not_before: std::sync::atomic::AtomicU64,
 }
 
 impl Privy {
@@ -291,6 +504,8 @@ impl Privy {
         validation.set_issuer(&[ISSUER]);
         validation.set_audience(&[cfg.app_id.as_str()]);
         validation.set_required_spec_claims(&["exp", "sub", "aud", "iss"]);
+        let mut sign_out_validation = validation.clone();
+        sign_out_validation.validate_exp = false;
         let http = reqwest::Client::builder()
             .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(20))
@@ -303,9 +518,11 @@ impl Privy {
             refresh: tokio::sync::Mutex::new(None),
             refresh_after: JWKS_REFRESH_AFTER,
             retry_after: JWKS_RETRY_AFTER,
-            max_age: JWKS_MAX_AGE,
+            refresh_failed: std::sync::atomic::AtomicBool::new(false),
             validation,
+            sign_out_validation,
             revoked: Default::default(),
+            not_before: std::sync::atomic::AtomicU64::new(unix_now()),
         })
     }
 
@@ -320,6 +537,49 @@ impl Privy {
     /// Verify a token against keys refreshed from the JWKS when they have
     /// aged or do not name the token's `kid`.
     pub async fn authenticate(&self, access_token: &str) -> Result<Identity, String> {
+        self.refresh_keys_for(access_token).await?;
+        self.verify(access_token)
+    }
+
+    /// Who a sign-out bearer proves, and which session to end: a token
+    /// Privy signed for this app, refreshing keys as [`Privy::authenticate`]
+    /// does, even when it has expired or its session is already refused
+    /// here. Ending a session needs proof it was the caller's, not that it
+    /// is still live; refusing an expired or signed-out token would leave
+    /// what it approved live.
+    pub async fn identify_for_sign_out(&self, access_token: &str) -> Result<SignOutBearer, String> {
+        self.refresh_keys_for(access_token).await?;
+        let (identity, exp) = self.decode_claims(access_token, &self.sign_out_validation)?;
+        Ok(SignOutBearer {
+            identity,
+            expired: exp <= unix_now(),
+        })
+    }
+
+    /// Sign out the session `bearer` proves. An expired bearer still ends
+    /// its session, but does not count toward the user's share of
+    /// remembered sign-outs: otherwise a handful of old leaked tokens, each
+    /// for its own session, would raise the floor that signs the user out
+    /// everywhere, again and again.
+    pub fn sign_out(&self, bearer: &SignOutBearer) {
+        let subject = subject_for_user(&bearer.identity.user_id);
+        let session = &bearer.identity.session.id;
+        if !bearer.expired {
+            return self.revoke_session(&subject, session);
+        }
+        let now = Instant::now();
+        let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+        if revoked.insert_uncounted(&subject, session, now) {
+            return;
+        }
+        self.not_before
+            .fetch_max(unix_now() + 1, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!("too many Privy sign-outs to remember; every earlier token is refused");
+        revoked.evict_oldest();
+        revoked.insert_uncounted(&subject, session, now);
+    }
+
+    async fn refresh_keys_for(&self, access_token: &str) -> Result<(), String> {
         let kid = jsonwebtoken::decode_header(access_token.trim())
             .map_err(|e| e.to_string())?
             .kid;
@@ -329,7 +589,7 @@ impl Privy {
         {
             self.refresh_jwks().await;
         }
-        self.verify(access_token)
+        Ok(())
     }
 
     async fn refresh_jwks(&self) {
@@ -349,12 +609,18 @@ impl Privy {
                     keys,
                     fetched_at: Some(Instant::now()),
                 });
+                self.refresh_failed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
-            Err(error) => tracing::error!(
-                %error,
-                age_secs = set.fetched_at.map(|at| at.elapsed().as_secs()),
-                "Privy JWKS refresh failed; keeping the last set until it expires"
-            ),
+            Err(error) => {
+                self.refresh_failed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    %error,
+                    age_secs = set.fetched_at.map(|at| at.elapsed().as_secs()),
+                    "Privy JWKS refresh failed; sign-ins fail until it succeeds"
+                )
+            }
         }
     }
 
@@ -371,23 +637,56 @@ impl Privy {
     }
 
     /// Verify an access token the browser obtained from Privy: signature,
-    /// issuer, audience (this app), expiry. The subject is the user.
-    pub fn verify(&self, access_token: &str) -> Result<Identity, String> {
+    /// issuer, audience (this app), expiry. The subject is the user. Only
+    /// [`Privy::authenticate`] calls this, after refreshing what is due.
+    fn verify(&self, access_token: &str) -> Result<Identity, String> {
+        let identity = self.decode(access_token, &self.validation)?;
+        if !self.session_is_live(&subject_for_user(&identity.user_id), &identity.session) {
+            return Err("the Privy session was signed out".to_string());
+        }
+        Ok(identity)
+    }
+
+    /// The identity a token signed by the app's keys proves, under
+    /// `validation`, whether or not its session is still live.
+    fn decode(
+        &self,
+        access_token: &str,
+        validation: &jsonwebtoken::Validation,
+    ) -> Result<Identity, String> {
+        self.decode_claims(access_token, validation)
+            .map(|(identity, _)| identity)
+    }
+
+    /// [`Self::decode`], with the token's `exp`.
+    fn decode_claims(
+        &self,
+        access_token: &str,
+        validation: &jsonwebtoken::Validation,
+    ) -> Result<(Identity, u64), String> {
         let token = access_token.trim();
         let kid = jsonwebtoken::decode_header(token)
             .map_err(|e| e.to_string())?
             .kid;
         let set = self.key_set();
-        if set
-            .fetched_at
-            .is_some_and(|at| at.elapsed() >= self.max_age)
-        {
-            return Err("the Privy verification keys could not be refreshed".to_string());
+        if let Some(fetched_at) = set.fetched_at {
+            // A set due for a refetch is trusted only while refetches work;
+            // an outage must not keep a key Privy has retired alive.
+            if fetched_at.elapsed() >= self.refresh_after
+                && self
+                    .refresh_failed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("the Privy verification keys could not be refreshed".to_string());
+            }
+            if kid.is_some() && !set.keys.knows(kid.as_deref()) {
+                return Err("the token's signing key is not in the app's JWKS".to_string());
+            }
         }
         let mut last = String::from("no verification key");
         let mut data = None;
         for key in set.keys.candidates(kid.as_deref()) {
-            match jsonwebtoken::decode::<Claims>(token, key, &self.validation) {
+            match jsonwebtoken::decode::<Claims>(token, key, validation) {
                 Ok(d) => {
                     data = Some(d);
                     break;
@@ -404,38 +703,47 @@ impl Privy {
             .sid
             .filter(|sid| !sid.trim().is_empty())
             .ok_or_else(|| "the token carries no Privy session".to_string())?;
-        if self.is_revoked(&session) {
-            return Err("the Privy session was signed out".to_string());
-        }
-        Ok(Identity {
-            user_id: data.claims.sub,
-            session_id: Some(session),
-        })
+        let session = LoginSession {
+            id: session,
+            issued_at: data.claims.iat,
+        };
+        Ok((
+            Identity {
+                user_id: data.claims.sub,
+                session,
+            },
+            data.claims.exp,
+        ))
     }
 
-    /// Refuse further sign-ins with `session` for as long as its access
-    /// tokens can live.
-    pub fn revoke_session(&self, session: &str) {
+    /// Whether credentials may still be derived from `session`, a login of
+    /// `subject`: it was not signed out here, and was proven by a token
+    /// issued since this process began remembering sign-outs.
+    pub fn session_is_live(&self, subject: &str, session: &LoginSession) -> bool {
+        session.issued_at >= self.not_before.load(std::sync::atomic::Ordering::SeqCst)
+            && !self
+                .revoked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .refuses(subject, session)
+    }
+
+    /// Refuse further sign-ins with `session`, a login of `subject`, for as
+    /// long as its access tokens can live.
+    pub fn revoke_session(&self, subject: &str, session: &str) {
         let now = Instant::now();
         let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
-        revoked.retain(|_, at| now.saturating_duration_since(*at) <= REVOKED_SESSION_TTL);
-        if revoked.len() >= MAX_REVOKED_SESSIONS
-            && let Some(oldest) = revoked
-                .iter()
-                .min_by_key(|(_, at)| **at)
-                .map(|(sid, _)| sid.clone())
-        {
-            revoked.remove(&oldest);
+        if revoked.insert(subject, session, now) {
+            return;
         }
-        revoked.insert(session.to_string(), now);
-    }
-
-    fn is_revoked(&self, session: &str) -> bool {
-        self.revoked
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(session)
-            .is_some_and(|at| at.elapsed() <= REVOKED_SESSION_TTL)
+        // Only sign-outs by many distinct users fill the list. Forgetting
+        // one must not revive its tokens: first refuse every token issued
+        // so far, which signs everyone out, then make room.
+        self.not_before
+            .fetch_max(unix_now() + 1, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!("too many Privy sign-outs to remember; every earlier token is refused");
+        revoked.evict_oldest();
+        revoked.insert(subject, session, now);
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -588,8 +896,16 @@ impl Privy {
             pubkey: wallet.address.clone(),
             credentials,
             policy: crate::tenants::DEFAULT_POLICY,
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn fetch_jwks(http: &reqwest::Client, url: &str) -> Result<String, ConfigError> {
@@ -615,7 +931,7 @@ pub struct OnChainSpendHistory {
     http: reqwest::Client,
 }
 
-/// Signature pages read per wallet; a wallet past this many transactions
+/// Signature pages read per address; an address past this many transactions
 /// today is reported as unknown rather than undercounted.
 const HISTORY_PAGES: usize = 4;
 const HISTORY_PAGE: usize = 1_000;
@@ -652,6 +968,78 @@ impl OnChainSpendHistory {
     }
 }
 
+impl OnChainSpendHistory {
+    /// The wallet's stablecoin token accounts, under either token program.
+    /// A delegate's transfer names only the token account, never the owner,
+    /// so the owner's own signature index misses it.
+    async fn stablecoin_accounts(&self, wallet: &str) -> Result<Vec<String>, String> {
+        use pay_kit::mpp::protocol::solana::{is_known_stablecoin_mint, programs};
+        let mut accounts = Vec::new();
+        for program in [programs::TOKEN_PROGRAM, programs::TOKEN_2022_PROGRAM] {
+            let found = self
+                .rpc(
+                    "getTokenAccountsByOwner",
+                    json!([wallet, { "programId": program },
+                           { "encoding": "jsonParsed", "commitment": "confirmed" }]),
+                )
+                .await?;
+            let found = found["value"]
+                .as_array()
+                .ok_or("getTokenAccountsByOwner: not a list")?;
+            for entry in found {
+                let pubkey = entry["pubkey"]
+                    .as_str()
+                    .ok_or("getTokenAccountsByOwner: account without pubkey")?;
+                let mint = entry["account"]["data"]["parsed"]["info"]["mint"]
+                    .as_str()
+                    .ok_or_else(|| format!("getTokenAccountsByOwner: {pubkey} has no mint"))?;
+                if is_known_stablecoin_mint(mint) {
+                    accounts.push(pubkey.to_string());
+                }
+            }
+        }
+        Ok(accounts)
+    }
+
+    /// Signatures of `address`'s successful transactions since `day_start`,
+    /// or `None` when there are more than can be read.
+    async fn signatures_today(
+        &self,
+        address: &str,
+        day_start: i64,
+    ) -> Result<Option<Vec<String>>, String> {
+        let mut before: Option<String> = None;
+        let mut signatures = Vec::new();
+        for _ in 0..HISTORY_PAGES {
+            let mut config = json!({ "limit": HISTORY_PAGE, "commitment": "confirmed" });
+            if let Some(before) = &before {
+                config["before"] = json!(before);
+            }
+            let page = self
+                .rpc("getSignaturesForAddress", json!([address, config]))
+                .await?;
+            let page = page
+                .as_array()
+                .ok_or("getSignaturesForAddress: not a list")?;
+            for entry in page {
+                // An unknown block time counts as today.
+                if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
+                    return Ok(Some(signatures));
+                }
+                let signature = entry["signature"].as_str().ok_or("signature missing")?;
+                before = Some(signature.to_string());
+                if entry["err"].is_null() {
+                    signatures.push(signature.to_string());
+                }
+            }
+            if page.len() < HISTORY_PAGE {
+                return Ok(Some(signatures));
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::tenants::SpendHistory for OnChainSpendHistory {
     async fn spent_today(&self, wallet: &str) -> Result<u64, String> {
@@ -660,45 +1048,41 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
             .map_err(|e| e.to_string())?
             .as_secs();
         let day_start = (now / 86_400 * 86_400) as i64;
-        let mut before: Option<String> = None;
-        let mut raw = 0_u64;
-        for _ in 0..HISTORY_PAGES {
-            let mut config = json!({ "limit": HISTORY_PAGE, "commitment": "confirmed" });
-            if let Some(before) = &before {
-                config["before"] = json!(before);
-            }
-            let page = self
-                .rpc("getSignaturesForAddress", json!([wallet, config]))
-                .await?;
-            let page = page
-                .as_array()
-                .ok_or("getSignaturesForAddress: not a list")?;
-            for entry in page {
-                // An unknown block time counts as today.
-                if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
-                    return Ok(raw.div_ceil(100));
+        // The owner's own transactions, and every transaction touching one of
+        // its stablecoin accounts, each counted once.
+        let mut signatures = std::collections::BTreeSet::new();
+        let mut addresses = vec![wallet.to_string()];
+        addresses.extend(self.stablecoin_accounts(wallet).await?);
+        for address in addresses {
+            match self.signatures_today(&address, day_start).await? {
+                Some(today) => signatures.extend(today),
+                // Anyone can push an address past what can be read by
+                // naming it in cheap transactions. That history is not
+                // unavailable, it is uncountable: today's allowance is
+                // treated as spent, and the wallet still signs in.
+                None => {
+                    tracing::warn!(%address, "too many transactions today to count; no spend left today");
+                    return Ok(crate::tenants::UNCOUNTABLE_SPEND);
                 }
-                let signature = entry["signature"].as_str().ok_or("signature missing")?;
-                before = Some(signature.to_string());
-                if !entry["err"].is_null() {
-                    continue;
-                }
-                let tx = self
-                    .rpc(
-                        "getTransaction",
-                        json!([signature, { "encoding": "json", "commitment": "confirmed",
-                                            "maxSupportedTransactionVersion": 0 }]),
-                    )
-                    .await?;
-                let tx: ConfirmedTransaction = serde_json::from_value(tx)
-                    .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
-                raw = raw.saturating_add(tx.stablecoin_outflow(wallet));
-            }
-            if page.len() < HISTORY_PAGE {
-                return Ok(raw.div_ceil(100));
             }
         }
-        Err(format!("{wallet} has too many transactions today to count"))
+        let mut raw = 0_u64;
+        for signature in signatures {
+            let tx = self
+                .rpc(
+                    "getTransaction",
+                    json!([signature, { "encoding": "json", "commitment": "confirmed",
+                                        "maxSupportedTransactionVersion": 0 }]),
+                )
+                .await?;
+            let tx: ConfirmedTransaction = serde_json::from_value(tx)
+                .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
+            let outflow = tx
+                .stablecoin_outflow(wallet)
+                .map_err(|e| format!("getTransaction {signature}: {e}"))?;
+            raw = raw.saturating_add(outflow);
+        }
+        Ok(raw.div_ceil(100))
     }
 }
 
@@ -707,6 +1091,7 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
 #[derive(Deserialize)]
 struct ConfirmedTransaction {
     meta: TransactionMeta,
+    transaction: TransactionBody,
 }
 
 #[derive(Deserialize)]
@@ -715,13 +1100,73 @@ struct TransactionMeta {
     err: Option<serde_json::Value>,
     pre_token_balances: Vec<serde_json::Value>,
     post_token_balances: Vec<serde_json::Value>,
+    #[serde(default)]
+    inner_instructions: Option<Vec<InnerInstructions>>,
+    /// Keys a version-0 transaction loaded from lookup tables.
+    #[serde(default)]
+    loaded_addresses: Option<LoadedAddresses>,
 }
 
+#[derive(Deserialize)]
+struct TransactionBody {
+    message: Message,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Message {
+    header: MessageHeader,
+    account_keys: Vec<String>,
+    instructions: Vec<Instruction>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageHeader {
+    /// The first this many account keys signed the transaction.
+    num_required_signatures: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Instruction {
+    program_id_index: usize,
+    /// Base58, as `json` encoding returns it.
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct InnerInstructions {
+    instructions: Vec<Instruction>,
+}
+
+#[derive(Deserialize)]
+struct LoadedAddresses {
+    #[serde(default)]
+    writable: Vec<String>,
+    #[serde(default)]
+    readonly: Vec<String>,
+}
+
+/// Token-2022 instruction tags whose amounts live in encrypted balances:
+/// `ConfidentialTransferExtension`, `ConfidentialTransferFeeExtension`,
+/// `ConfidentialMintBurnExtension`. Public balance deltas do not show them.
+const CONFIDENTIAL_TOKEN_INSTRUCTIONS: [u8; 3] = [27, 37, 42];
+
 impl ConfirmedTransaction {
-    /// Raw six-decimal stablecoin units `owner`'s token accounts lost.
-    fn stablecoin_outflow(&self, owner: &str) -> u64 {
+    /// Raw six-decimal stablecoin units `owner`'s token accounts lost. An
+    /// error when `owner` signed a transaction that moved confidential
+    /// balances, whose amounts cannot be read from it: unknown spend is not
+    /// zero spend. Only the account owner can debit a confidential balance
+    /// (Token-2022 takes no delegate for it), so a confidential instruction
+    /// in a transaction `owner` did not sign, which anyone can send naming
+    /// the wallet or its accounts, spent nothing of theirs.
+    fn stablecoin_outflow(&self, owner: &str) -> Result<u64, String> {
         if self.meta.err.is_some() {
-            return 0;
+            return Ok(0);
+        }
+        if self.signed_by(owner) && self.moves_confidential_balances()? {
+            return Err("confidential token history is not auditable".to_string());
         }
         let balances = |entries: &[serde_json::Value]| -> BTreeMap<u64, u64> {
             entries
@@ -742,9 +1187,60 @@ impl ConfirmedTransaction {
         };
         let pre = balances(&self.meta.pre_token_balances);
         let post = balances(&self.meta.post_token_balances);
-        pre.iter()
+        Ok(pre
+            .iter()
             .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
-            .fold(0, u64::saturating_add)
+            .fold(0, u64::saturating_add))
+    }
+
+    /// Whether `key` is one of the transaction's signers.
+    fn signed_by(&self, key: &str) -> bool {
+        let message = &self.transaction.message;
+        message
+            .account_keys
+            .iter()
+            .take(message.header.num_required_signatures)
+            .any(|signer| signer == key)
+    }
+
+    /// Whether any instruction, top-level or inner, is a Token-2022
+    /// confidential-balance instruction. Unreadable instructions count as one.
+    fn moves_confidential_balances(&self) -> Result<bool, String> {
+        let token_2022 = pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM;
+        let loaded = self.meta.loaded_addresses.as_ref();
+        let keys: Vec<&str> = self
+            .transaction
+            .message
+            .account_keys
+            .iter()
+            .chain(loaded.into_iter().flat_map(|l| l.writable.iter()))
+            .chain(loaded.into_iter().flat_map(|l| l.readonly.iter()))
+            .map(String::as_str)
+            .collect();
+        let inner = self
+            .meta
+            .inner_instructions
+            .iter()
+            .flatten()
+            .flat_map(|set| set.instructions.iter());
+        for instruction in self.transaction.message.instructions.iter().chain(inner) {
+            let program = keys
+                .get(instruction.program_id_index)
+                .ok_or("an instruction names a program outside the transaction")?;
+            if *program != token_2022 {
+                continue;
+            }
+            let data = bs58::decode(&instruction.data)
+                .into_vec()
+                .map_err(|e| format!("unreadable Token-2022 instruction: {e}"))?;
+            if data
+                .first()
+                .is_none_or(|tag| CONFIDENTIAL_TOKEN_INSTRUCTIONS.contains(tag))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -1012,7 +1508,7 @@ pub(crate) mod tests {
         let privy = Privy::new(app.cfg.clone()).unwrap();
         let identity = privy.verify(&app.token_for(USER)).unwrap();
         assert_eq!(identity.user_id, USER);
-        assert_eq!(identity.session_id.as_deref(), Some("sess_1"));
+        assert_eq!(identity.session.id, "sess_1");
 
         let other_app = FakeApp::new("http://unused");
         assert!(
@@ -1053,17 +1549,198 @@ pub(crate) mod tests {
 
         let token = app.token_for(USER);
         assert!(privy.verify(&token).is_ok());
-        privy.revoke_session("sess_1");
+        privy.revoke_session(&subject_for_user(USER), "sess_1");
         assert!(
             privy.verify(&token).is_err(),
             "a signed-out session is refused"
         );
         let other = app.token(json!({
-            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_2", "exp": unix() + 60
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_2", "exp": unix() + 60,
+            "iat": unix()
         }));
         assert!(
             privy.verify(&other).is_ok(),
             "other sessions are unaffected"
+        );
+    }
+
+    /// Sign-outs live in this process only; a token issued before it began
+    /// may belong to a session signed out on a previous run, so it is
+    /// refused rather than trusted.
+    #[test]
+    fn tokens_from_before_this_process_are_refused() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |iat: u64| {
+            app.token(json!({
+                "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1",
+                "exp": unix() + 600, "iat": iat
+            }))
+        };
+        assert!(privy.verify(&token(unix())).is_ok());
+        assert!(privy.verify(&token(unix() - 120)).is_err());
+        let undated = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 600
+        }));
+        assert!(privy.verify(&undated).is_err(), "no iat, no placement");
+        let cookie_session = |issued_at| LoginSession {
+            id: "sess_1".to_string(),
+            issued_at,
+        };
+        let subject = subject_for_user(USER);
+        assert!(privy.session_is_live(&subject, &cookie_session(unix())));
+        assert!(!privy.session_is_live(&subject, &cookie_session(unix() - 120)));
+    }
+
+    /// A full sign-out list never forgets a sign-out in a way that lets its
+    /// token back in: it refuses every token issued so far instead. Only
+    /// sign-outs by many distinct users fill it.
+    #[test]
+    fn a_full_sign_out_list_refuses_rather_than_forgets() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sid: &str, iat: u64| {
+            app.token(json!({
+                "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": unix() + 600, "iat": iat
+            }))
+        };
+        let victim = token("sess_victim", unix());
+        let bystander = token("sess_bystander", unix());
+        privy.revoke_session(&subject_for_user(USER), "sess_victim");
+        for i in 1..MAX_REVOKED_SESSIONS {
+            privy.revoke_session(&format!("sub_{i}"), &format!("sess_{i}"));
+        }
+        assert!(privy.verify(&victim).is_err());
+        assert!(privy.verify(&bystander).is_ok(), "not full yet");
+
+        privy.revoke_session("sub_one_too_many", "sess_one_too_many");
+        assert!(privy.verify(&victim).is_err(), "the evicted sign-out holds");
+        assert!(privy.verify(&bystander).is_err(), "everyone signs in again");
+        assert!(privy.verify(&token("sess_new", unix() + 2)).is_ok());
+    }
+
+    /// A sign-out proven by an expired token still ends its session, but
+    /// does not count toward the user's share: old leaked tokens, each for
+    /// its own session, must not raise the floor that signs the user out of
+    /// every session.
+    #[tokio::test]
+    async fn expired_sign_out_bearers_do_not_sign_the_user_out_everywhere() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sid: &str, iat: u64, exp: u64| {
+            app.token(json!({
+                "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": exp, "iat": iat
+            }))
+        };
+        let live = token("sess_live", unix(), unix() + 600);
+        for i in 0..=2 * MAX_SIGN_OUTS_PER_USER {
+            let leaked = token(&format!("sess_old_{i}"), unix() - 7_200, unix() - 3_600);
+            let bearer = privy.identify_for_sign_out(&leaked).await.unwrap();
+            privy.sign_out(&bearer);
+        }
+        assert!(
+            privy
+                .verify(&token("sess_old_0", unix(), unix() + 600))
+                .is_err(),
+            "an expired bearer still ends its own session"
+        );
+        assert!(
+            privy.verify(&live).is_ok(),
+            "expired bearers do not sign the user out of other sessions"
+        );
+
+        // Positive control: the same number of live sign-outs does.
+        for i in 0..=MAX_SIGN_OUTS_PER_USER {
+            let current = token(&format!("sess_new_{i}"), unix(), unix() + 600);
+            let bearer = privy.identify_for_sign_out(&current).await.unwrap();
+            privy.sign_out(&bearer);
+        }
+        assert!(
+            privy.verify(&live).is_err(),
+            "live sign-outs past the share raise the floor"
+        );
+    }
+
+    /// One user's expired-token sign-outs never fill the list: past their
+    /// share they fall back to the per-user floor, which signs out only them.
+    #[tokio::test]
+    async fn one_users_expired_sign_outs_never_fill_the_list() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sub: &str, sid: &str, iat: u64, exp: u64| {
+            app.token(json!({
+                "sub": sub, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": exp, "iat": iat
+            }))
+        };
+        let bystander = token(
+            "did:privy:someone-else",
+            "sess_bystander",
+            unix(),
+            unix() + 600,
+        );
+        for i in 0..4 * MAX_EXPIRED_SIGN_OUTS_PER_USER {
+            let leaked = token(
+                USER,
+                &format!("sess_old_{i}"),
+                unix() - 7_200,
+                unix() - 3_600,
+            );
+            let bearer = privy.identify_for_sign_out(&leaked).await.unwrap();
+            privy.sign_out(&bearer);
+        }
+        assert!(
+            privy.revoked.lock().unwrap().len() <= MAX_EXPIRED_SIGN_OUTS_PER_USER + 1,
+            "one user's expired sign-outs grew the list"
+        );
+        assert!(privy.verify(&bystander).is_ok(), "nobody else signs out");
+        assert!(
+            privy
+                .verify(&token(USER, "sess_fresh", unix() + 2, unix() + 600))
+                .is_ok(),
+            "a later sign-in works"
+        );
+    }
+
+    /// One user signing out session after session never fills the list:
+    /// past their share they are remembered by one entry that refuses all
+    /// of their earlier tokens, and nobody else is signed out.
+    #[test]
+    fn one_user_signing_out_repeatedly_signs_out_only_themselves() {
+        const OTHER: &str = "did:privy:someone-else";
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sub: &str, sid: &str, iat: u64| {
+            app.token(json!({
+                "sub": sub, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": unix() + 600, "iat": iat
+            }))
+        };
+        let bystander = token(OTHER, "sess_bystander", unix());
+        let first = token(USER, "sess_0", unix());
+        let untouched = token(USER, "sess_kept", unix());
+        let subject = subject_for_user(USER);
+        for i in 0..MAX_SIGN_OUTS_PER_USER {
+            privy.revoke_session(&subject, &format!("sess_{i}"));
+        }
+        assert!(privy.verify(&first).is_err());
+        assert!(privy.verify(&untouched).is_ok(), "within their share");
+
+        for i in MAX_SIGN_OUTS_PER_USER..2 * MAX_REVOKED_SESSIONS {
+            privy.revoke_session(&subject, &format!("sess_{i}"));
+        }
+        assert!(privy.revoked.lock().unwrap().len() <= MAX_SIGN_OUTS_PER_USER + 1);
+        assert!(privy.verify(&first).is_err(), "earlier sign-outs hold");
+        assert!(
+            privy.verify(&untouched).is_err(),
+            "past their share every earlier token of theirs is refused"
+        );
+        assert!(privy.verify(&bystander).is_ok(), "nobody else signs out");
+        assert!(
+            privy.verify(&token(USER, "sess_fresh", unix() + 2)).is_ok(),
+            "they sign in again"
         );
     }
 
@@ -1084,7 +1761,8 @@ pub(crate) mod tests {
             let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
-                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 60 }),
+                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1",
+                         "exp": unix() + 60, "iat": unix() }),
                 &key,
             )
             .unwrap()
@@ -1107,7 +1785,7 @@ pub(crate) mod tests {
     }
 
     /// A JWKS endpoint whose document the test can replace or break.
-    async fn mock_jwks(doc: Arc<Mutex<Option<String>>>) -> String {
+    pub(crate) async fn mock_jwks(doc: Arc<Mutex<Option<String>>>) -> String {
         async fn serve(
             State(doc): State<Arc<Mutex<Option<String>>>>,
         ) -> Result<String, axum::http::StatusCode> {
@@ -1127,7 +1805,7 @@ pub(crate) mod tests {
         format!("http://{addr}/jwks.json")
     }
 
-    fn jwk(kid: &str, key: &SigningKey) -> serde_json::Value {
+    pub(crate) fn jwk(kid: &str, key: &SigningKey) -> serde_json::Value {
         use base64::Engine;
         let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let point = key.verifying_key().to_encoded_point(false);
@@ -1135,12 +1813,13 @@ pub(crate) mod tests {
                 "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap()) })
     }
 
-    fn signed_by(key: &SigningKey, kid: &str, user: &str) -> String {
+    pub(crate) fn signed_by(key: &SigningKey, kid: &str, user: &str) -> String {
         let pem = key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap();
         let encoding = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(kid.to_string());
-        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 600 });
+        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "sid": "sess_1",
+                             "exp": unix() + 600, "iat": unix() });
         jsonwebtoken::encode(&header, &claims, &encoding).unwrap()
     }
 
@@ -1220,16 +1899,23 @@ pub(crate) mod tests {
         let mut privy = Privy::connect(cfg).await.unwrap();
         let token = signed_by(&key, "kid_1", USER);
         *doc.lock().unwrap() = None;
+        // Keys not yet due for a refetch need no JWKS.
+        assert!(privy.authenticate(&token).await.is_ok());
+        // Once due, a failed refetch fails closed: the key may be retired.
         privy.refresh_after = Duration::ZERO;
         privy.retry_after = Duration::ZERO;
-        // A failed refresh keeps the last set while it is young enough.
-        assert!(privy.authenticate(&token).await.is_ok());
-        privy.max_age = Duration::ZERO;
         assert!(privy.authenticate(&token).await.is_err(), "fails closed");
+        // Also while refetches are throttled after the failure.
+        privy.retry_after = Duration::from_secs(60);
+        assert!(privy.authenticate(&token).await.is_err(), "still closed");
+        // A working refetch restores sign-ins.
+        privy.retry_after = Duration::ZERO;
+        *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_1", &key)] }).to_string());
+        assert!(privy.authenticate(&token).await.is_ok());
         // A configured PEM never ages.
         let app = FakeApp::new("http://unused");
         let mut pem = Privy::new(app.cfg.clone()).unwrap();
-        pem.max_age = Duration::ZERO;
+        pem.refresh_after = Duration::ZERO;
         assert!(pem.authenticate(&app.token_for(USER)).await.is_ok());
     }
 
@@ -1311,6 +1997,90 @@ pub(crate) mod tests {
         }
     }
 
+    /// A transaction body with nothing in it but balances.
+    static NO_INSTRUCTIONS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
+        || json!({ "message": { "header": { "numRequiredSignatures": 0 }, "accountKeys": [], "instructions": [] } }),
+    );
+
+    /// A confidential debit changes no public balance, so a transaction
+    /// carrying one is unknown spend, never zero; other Token-2022
+    /// instructions are read as usual.
+    #[test]
+    fn confidential_token_instructions_make_history_unauditable() {
+        use pay_kit::mpp::protocol::solana::programs;
+        let tx = |instructions: serde_json::Value, inner: serde_json::Value| {
+            serde_json::from_value::<ConfirmedTransaction>(json!({
+                "transaction": { "message": {
+                    "header": { "numRequiredSignatures": 1 },
+                    "accountKeys": [ADDRESS, programs::TOKEN_2022_PROGRAM],
+                    "instructions": instructions } },
+                "meta": { "err": null, "preTokenBalances": [], "postTokenBalances": [],
+                          "innerInstructions": inner,
+                          "loadedAddresses": { "writable": [], "readonly": [programs::TOKEN_PROGRAM] } }
+            }))
+            .unwrap()
+        };
+        let ix = |program: usize, data: &[u8]| json!({ "programIdIndex": program, "accounts": [], "data": bs58::encode(data).into_string() });
+        // TransferChecked under Token-2022, Transfer under the token program
+        // (tag 27 is not confidential there).
+        let public = tx(json!([ix(1, &[12, 0]), ix(2, &[27])]), json!([]));
+        assert_eq!(public.stablecoin_outflow(ADDRESS), Ok(0));
+        for tag in CONFIDENTIAL_TOKEN_INSTRUCTIONS {
+            let top = tx(json!([ix(1, &[tag, 7])]), json!([]));
+            assert!(top.stablecoin_outflow(ADDRESS).is_err(), "tag {tag}");
+            let inner = tx(
+                json!([]),
+                json!([{ "index": 0, "instructions": [ix(1, &[tag, 7])] }]),
+            );
+            assert!(
+                inner.stablecoin_outflow(ADDRESS).is_err(),
+                "inner tag {tag}"
+            );
+        }
+        let unreadable = tx(
+            json!([{ "programIdIndex": 1, "accounts": [], "data": "0OIl" }]),
+            json!([]),
+        );
+        assert!(unreadable.stablecoin_outflow(ADDRESS).is_err());
+    }
+
+    /// Only the owner can debit a confidential balance, so a confidential
+    /// instruction in a transaction the wallet did not sign (anyone can send
+    /// one naming the wallet) leaves its history countable.
+    #[test]
+    fn confidential_instructions_the_wallet_did_not_sign_spend_nothing() {
+        use pay_kit::mpp::protocol::solana::{mints, programs};
+        let balance = |amount: u64| {
+            json!([{ "accountIndex": 2, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                     "uiTokenAmount": { "amount": amount.to_string() } }])
+        };
+        // The confidential instruction is always Token-2022, the last key.
+        let tx = |signers: usize, keys: &[&str]| {
+            serde_json::from_value::<ConfirmedTransaction>(json!({
+                "transaction": { "message": {
+                    "header": { "numRequiredSignatures": signers },
+                    "accountKeys": keys,
+                    "instructions": [{ "programIdIndex": keys.len() - 1, "accounts": [],
+                                       "data": bs58::encode([27, 7]).into_string() }] } },
+                "meta": { "err": null, "preTokenBalances": balance(5_000_000),
+                          "postTokenBalances": balance(4_000_000) }
+            }))
+            .unwrap()
+        };
+        let attacker = "Attacker11111111111111111111111111111111111";
+        let token_2022 = programs::TOKEN_2022_PROGRAM;
+        // The attacker signs; the wallet is only named.
+        let theirs = tx(1, &[attacker, ADDRESS, token_2022]);
+        assert_eq!(theirs.stablecoin_outflow(ADDRESS), Ok(1_000_000));
+        let unsigned = tx(0, &[ADDRESS, token_2022]);
+        assert_eq!(unsigned.stablecoin_outflow(ADDRESS), Ok(1_000_000));
+        // The wallet among the signers: unauditable, as before.
+        let cosigned = tx(2, &[attacker, ADDRESS, token_2022]);
+        assert!(cosigned.stablecoin_outflow(ADDRESS).is_err());
+        let signed = tx(1, &[ADDRESS, token_2022]);
+        assert!(signed.stablecoin_outflow(ADDRESS).is_err());
+    }
+
     #[test]
     fn outflow_counts_only_the_owners_stablecoin_debits() {
         use pay_kit::mpp::protocol::solana::mints;
@@ -1319,7 +2089,7 @@ pub(crate) mod tests {
             json!({ "accountIndex": index, "owner": owner, "mint": mint,
                     "uiTokenAmount": { "amount": amount.to_string(), "decimals": 6 } })
         };
-        let tx = json!({ "meta": { "err": null,
+        let tx = json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
             "preTokenBalances": [
                 balance(1, ADDRESS, usdc, 5_000_000),
                 balance(2, "someone", usdc, 0),
@@ -1335,6 +2105,7 @@ pub(crate) mod tests {
             serde_json::from_value::<ConfirmedTransaction>(tx.clone())
                 .unwrap()
                 .stablecoin_outflow(owner)
+                .unwrap()
         };
         assert_eq!(outflow(&tx, ADDRESS), 1_250_000);
         assert_eq!(outflow(&tx, "someone"), 0, "an inflow is not spend");
@@ -1361,23 +2132,47 @@ pub(crate) mod tests {
             .as_secs() as i64;
         let day_start = now / 86_400 * 86_400;
         let debit = |amount: u64| {
-            json!({ "meta": { "err": null,
+            json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
                 "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
                                        "uiTokenAmount": { "amount": "10000000" } }],
                 "postTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
                                         "uiTokenAmount": { "amount": (10_000_000 - amount).to_string() } }] } })
         };
         let rpc = move |Json(request): Json<serde_json::Value>| async move {
+            use pay_kit::mpp::protocol::solana::programs;
+            let account = |pubkey: &str, mint: &str| json!({ "pubkey": pubkey, "account": { "data": { "parsed": { "info": { "mint": mint } } } } });
             let result = match request["method"].as_str().unwrap() {
-                "getSignaturesForAddress" => json!([
-                    { "signature": "today_1", "blockTime": now, "err": null },
-                    { "signature": "today_failed", "blockTime": now, "err": { "x": 1 } },
-                    { "signature": "today_2", "blockTime": day_start, "err": null },
-                    { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
-                ]),
+                "getTokenAccountsByOwner" => {
+                    assert_eq!(request["params"][0], ADDRESS);
+                    match request["params"][1]["programId"].as_str().unwrap() {
+                        programs::TOKEN_PROGRAM => json!({ "value": [
+                            account("usdc_account", mints::USDC_MAINNET),
+                            account("meme_account", "MemeMint1111111111111111111111111111111111"),
+                        ] }),
+                        programs::TOKEN_2022_PROGRAM => json!({ "value": [] }),
+                        other => panic!("{other}"),
+                    }
+                }
+                "getSignaturesForAddress" => match request["params"][0].as_str().unwrap() {
+                    ADDRESS => json!([
+                        { "signature": "today_1", "blockTime": now, "err": null },
+                        { "signature": "today_failed", "blockTime": now, "err": { "x": 1 } },
+                        { "signature": "today_2", "blockTime": day_start, "err": null },
+                        { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
+                    ]),
+                    // A delegate's transfer names the token account, not the
+                    // owner; the owner's own transfers name both.
+                    "usdc_account" => json!([
+                        { "signature": "delegated", "blockTime": now, "err": null },
+                        { "signature": "today_1", "blockTime": now, "err": null },
+                        { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
+                    ]),
+                    other => panic!("{other} must not be read"),
+                },
                 "getTransaction" => match request["params"][0].as_str().unwrap() {
                     "today_1" => debit(1_000_001),
                     "today_2" => debit(500_000),
+                    "delegated" => debit(2_000_000),
                     other => panic!("{other} must not be read"),
                 },
                 other => panic!("{other}"),
@@ -1391,14 +2186,84 @@ pub(crate) mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let history = OnChainSpendHistory::new(format!("http://{addr}/"));
-        // 1.500001 USDC rounds up to 15,001 minor units.
-        assert_eq!(history.spent_today(ADDRESS).await.unwrap(), 15_001);
+        // 3.500001 USDC, the delegated transfer and each transaction counted
+        // once, rounds up to 35,001 minor units.
+        assert_eq!(history.spent_today(ADDRESS).await.unwrap(), 35_001);
         assert!(
             OnChainSpendHistory::new("http://127.0.0.1:1/")
                 .spent_today(ADDRESS)
                 .await
                 .is_err()
         );
+    }
+
+    /// Anyone can flood a wallet's token account with dust transfers. History
+    /// too long to read leaves no allowance today, but the wallet still binds.
+    #[tokio::test]
+    async fn uncountable_history_spends_the_day_without_blocking_sign_in() {
+        use crate::tenants::{SpendHistory, TenantRegistry, UNCOUNTABLE_SPEND};
+        use pay_kit::mpp::protocol::solana::{mints, programs};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let rpc = move |Json(request): Json<serde_json::Value>| async move {
+            let result = match request["method"].as_str().unwrap() {
+                "getTokenAccountsByOwner" => {
+                    match request["params"][1]["programId"].as_str().unwrap() {
+                        programs::TOKEN_PROGRAM => json!({ "value": [{ "pubkey": "usdc_account",
+                            "account": { "data": { "parsed": { "info": { "mint": mints::USDC_MAINNET } } } } }] }),
+                        _ => json!({ "value": [] }),
+                    }
+                }
+                "getSignaturesForAddress" => match request["params"][0].as_str().unwrap() {
+                    ADDRESS => json!([]),
+                    // Every page full of today's dust.
+                    _ => {
+                        let page = request["params"][1]["before"].as_str().unwrap_or("").len();
+                        json!(
+                            (0..HISTORY_PAGE)
+                                .map(|i| json!({ "signature": format!("dust_{page}_{i}"),
+                                             "blockTime": now, "err": null }))
+                                .collect::<Vec<_>>()
+                        )
+                    }
+                },
+                other => panic!("{other} must not be called"),
+            };
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(rpc)))
+                .await
+                .unwrap();
+        });
+        let history = OnChainSpendHistory::new(format!("http://{addr}/"));
+        assert_eq!(history.spent_today(ADDRESS).await, Ok(UNCOUNTABLE_SPEND));
+
+        let mut credentials = pay_core::remote::Credentials::new();
+        credentials.insert("secret_key".to_string(), "sk_test_1".to_string());
+        let tenant = TenantRecord {
+            subject: "sub_1".to_string(),
+            account_name: "grok".to_string(),
+            provider: PROVIDER_ID.to_string(),
+            wallet_id: "w_1".to_string(),
+            pubkey: ADDRESS.to_string(),
+            credentials,
+            policy: pay_mcp::policy::SpendPolicy::dollars(1.0, 5.0),
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
+        };
+        let registry = TenantRegistry::new();
+        registry.seed_spend(&tenant, &history).await.unwrap();
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        let fresh = TenantRegistry::new();
+        fresh
+            .seed_spend(&tenant, &crate::tenants::FixedHistory(0))
+            .await
+            .unwrap();
+        assert!(fresh.reserve_cli_transaction(&tenant, 1).is_ok());
     }
 
     #[tokio::test]
@@ -1414,6 +2279,7 @@ pub(crate) mod tests {
                 let transaction = transaction.clone();
                 async move {
                     let result = match request["method"].as_str().unwrap() {
+                        "getTokenAccountsByOwner" => json!({ "value": [] }),
                         "getSignaturesForAddress" => {
                             json!([{ "signature": "today", "blockTime": now, "err": null }])
                         }
@@ -1442,6 +2308,7 @@ pub(crate) mod tests {
             pubkey: ADDRESS.to_string(),
             credentials,
             policy: pay_mcp::policy::SpendPolicy::dollars(1.0, 5.0),
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
         };
         let registry = TenantRegistry::new();
         for missing in [json!(null), json!({ "meta": null })] {
@@ -1451,10 +2318,12 @@ pub(crate) mod tests {
             assert!(registry.seed_spend(&tenant, &history).await.is_err());
         }
         // A failed seed left the wallet unseeded: complete history still lands.
-        let full = spend_rpc(json!({ "meta": { "err": null,
+        let full = spend_rpc(
+            json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
             "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
                                    "uiTokenAmount": { "amount": "5000000" } }],
-            "postTokenBalances": [] } }))
+            "postTokenBalances": [] } }),
+        )
         .await;
         assert_eq!(full.spent_today(ADDRESS).await.unwrap(), 50_000);
         registry.seed_spend(&tenant, &full).await.unwrap();

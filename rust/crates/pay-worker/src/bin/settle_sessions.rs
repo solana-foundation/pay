@@ -14,10 +14,12 @@ use axum::Router;
 use axum::routing::get;
 use futures::{StreamExt, stream};
 use pay_api_core::rpc::RpcClient;
+use pay_kit::core::payment_channel::payer_refund::DistributeClearance;
 use pay_kit::core::payment_channels;
 use pay_kit::core::settlement::worker::{RpcBroadcaster, SettlementConfig, spawn};
 use pay_kit::core::store::{
-    ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, RedisChannelStore, StoreError,
+    ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, ObservationOutcome,
+    ObservedLifecycle, OnchainObservation, RedisChannelStore, StoreError,
 };
 use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig, TxPipelineError};
 use pay_kit::mpp::server::session::{
@@ -35,7 +37,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_REDIS_PREFIX: &str = "pay:session:v1:";
 const BATCH_REDIS_PREFIX_BASE: &str = "pay:batch:v1:";
@@ -800,6 +802,7 @@ fn bound_distribution_instruction(
     onchain: &channel::DecodedChannel,
     treasury_owner: &Pubkey,
     token_program: &Pubkey,
+    clearance: &DistributeClearance,
 ) -> Result<solana_instruction::Instruction, JobError> {
     let deployment = channel::session_deployment(config)?;
     if onchain.channel.version != deployment.version {
@@ -822,7 +825,7 @@ fn bound_distribution_instruction(
         splits: config.splits.clone(),
         distribution_hash: onchain.channel.distribution_hash,
     }
-    .distribute_instruction(treasury_owner, token_program)
+    .distribute_instruction(treasury_owner, token_program, clearance)
     .map_err(binding_error)
 }
 
@@ -1095,10 +1098,14 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                                 "would delete Redis session for absent on-chain channel"
                             );
                         } else if cleanup_ready {
-                            match session.store.delete_channel(&result.channel_id).await {
-                                Ok(()) => info!(
+                            match delete_fenced_channel(&session.store, &result.channel_id).await {
+                                Ok(FencedDelete::Deleted) => info!(
                                     channel_id = %result.channel_id,
                                     "deleted Redis session for absent on-chain channel"
+                                ),
+                                Ok(FencedDelete::InFlight) => info!(
+                                    channel_id = %result.channel_id,
+                                    "retaining Redis session while new work is in flight"
                                 ),
                                 Err(error) => {
                                     failures += 1;
@@ -1609,9 +1616,9 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                         .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let channels =
-                channel::fetch_channels_each(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
-            Ok::<_, JobError>(states.into_iter().zip(channels).collect::<Vec<_>>())
+            let (slot, channels) =
+                channel::fetch_channels_each_at(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
+            Ok::<_, JobError>((slot, states.into_iter().zip(channels).collect::<Vec<_>>()))
         }
         .await;
         (count, fetched)
@@ -1622,10 +1629,13 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     .collect::<Vec<_>>()
     .await;
     let mut fetched_channels = Vec::with_capacity(metrics.channels_scanned);
+    // The slot each channel was read at, fencing its recorded observation.
+    let mut read_slots = HashMap::new();
     for (batch_size, fetched_batch) in fetched_batches {
         match fetched_batch {
-            Ok(channels) => {
+            Ok((slot, channels)) => {
                 for (state, fetched) in channels {
+                    read_slots.insert(state.channel_id.clone(), slot);
                     match fetched {
                         Ok(onchain) => fetched_channels.push((state, onchain)),
                         Err(error) => {
@@ -1709,17 +1719,25 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     for reconciliation in reconciliations {
         match reconciliation {
             Ok(result) => {
-                if let Some(settled_on_chain) = result.observed_settled_on_chain
-                    && let Err(error) = update_batch_settled_watermark(
+                if let Some(observed) = result.observed {
+                    match update_batch_settled_watermark(
                         &batch.store,
                         &result.channel_id,
-                        settled_on_chain,
+                        observed,
+                        read_slots.get(&result.channel_id).copied(),
                         now.max(0) as u64,
                     )
                     .await
-                {
-                    metrics.failures += 1;
-                    warn!(channel_id = %result.channel_id, %error, "failed to persist observed batch settlement watermark");
+                    {
+                        Ok(ObservationOutcome::Fresh) => {}
+                        Ok(ObservationOutcome::Behind { recorded }) => {
+                            debug!(channel_id = %result.channel_id, recorded, "batch channel read lagged the recorded slot; snapshot not renewed");
+                        }
+                        Err(error) => {
+                            metrics.failures += 1;
+                            warn!(channel_id = %result.channel_id, %error, "failed to persist observed batch settlement watermark");
+                        }
+                    }
                 }
                 if let Some(settled) = result.stablecoin_settled_base_units {
                     telemetry::record_channel_settled("x402/batch", &result.channel_id, settled);
@@ -1744,12 +1762,17 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                 } else {
                     metrics.skipped += 1;
                 }
-                if result.delete_absent
-                    && !runtime.dry_run
-                    && let Err(error) = batch.store.delete_channel(&result.channel_id).await
-                {
-                    metrics.failures += 1;
-                    warn!(channel_id = %result.channel_id, %error, "failed to delete absent batch channel");
+                if result.delete_absent && !runtime.dry_run {
+                    match delete_fenced_channel(&batch.store, &result.channel_id).await {
+                        Ok(FencedDelete::Deleted) => {}
+                        Ok(FencedDelete::InFlight) => {
+                            info!(channel_id = %result.channel_id, "retaining absent batch channel while new work is in flight");
+                        }
+                        Err(error) => {
+                            metrics.failures += 1;
+                            warn!(channel_id = %result.channel_id, %error, "failed to delete absent batch channel");
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -1887,10 +1910,18 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                 &candidate.channel_id,
                 candidate.after.unsealed,
             );
+            // A confirmed settlement proves the watermark, and a sealing
+            // one the terminal state; neither is a read of an open channel,
+            // so an unsealed one never renews the snapshot.
             if let Err(error) = update_batch_settled_watermark(
                 &batch.store,
                 &candidate.channel_id,
-                candidate.settled_on_chain,
+                ChainObservation {
+                    settled: candidate.settled_on_chain,
+                    lifecycle: (!candidate.after.unsealed)
+                        .then_some(ObservedLifecycle::Terminal { started_at: None }),
+                },
+                None,
                 unix_now().max(0) as u64,
             )
             .await
@@ -1926,11 +1957,27 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                     }
                 }
                 BatchStoreAction::Delete => {
-                    if let Err(error) = batch.store.delete_channel(&candidate.channel_id).await {
-                        metrics.failures += 1;
-                        warn!(channel_id = %candidate.channel_id, %error, "failed to delete reclaimed batch channel");
+                    match delete_fenced_channel(&batch.store, &candidate.channel_id).await {
+                        Ok(FencedDelete::Deleted) => {}
+                        Ok(FencedDelete::InFlight) => {
+                            info!(channel_id = %candidate.channel_id, "retaining reclaimed batch channel while new work is in flight");
+                        }
+                        Err(error) => {
+                            metrics.failures += 1;
+                            warn!(channel_id = %candidate.channel_id, %error, "failed to delete reclaimed batch channel");
+                        }
                     }
                 }
+            }
+            if candidate.forfeited_accepted > 0 {
+                error!(
+                    scheme = "x402/batch",
+                    channel_id = %candidate.channel_id,
+                    %signature,
+                    settled = candidate.settled_on_chain,
+                    forfeited = candidate.forfeited_accepted,
+                    "batch channel sealed below its accepted cumulative was distributed; the accepted delta above settled is forfeited"
+                );
             }
             info!(
                 scheme = "x402/batch",
@@ -1984,6 +2031,41 @@ fn settlement_config(
         config.max_voucher_settlements_per_tx = config.max_voucher_settlements_per_tx.min(14);
     }
     config
+}
+
+/// Outcome of [`delete_fenced_channel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedDelete {
+    Deleted,
+    /// A reservation or setup admitted after the caller's snapshot is still
+    /// in flight, or the record changed under the delete; it is kept for a
+    /// later pass.
+    InFlight,
+}
+
+/// Delete the record of a channel whose account is gone, without trusting
+/// the snapshot that proved it: the kit's [`ChannelStore::delete_channel_if`]
+/// rechecks, against the record it actually removes, that no reservation or
+/// setup is in flight. A request admitted after the snapshot either keeps its
+/// record or, once the record is gone, is refused as an unknown channel.
+async fn delete_fenced_channel(
+    store: &impl ChannelStore,
+    channel_id: &str,
+) -> Result<FencedDelete, StoreError> {
+    if store
+        .delete_channel_if(
+            channel_id,
+            Box::new(|state| !state.has_in_flight_authorization()),
+        )
+        .await?
+    {
+        return Ok(FencedDelete::Deleted);
+    }
+    // Refused, changed concurrently, or already gone.
+    Ok(match store.get_channel(channel_id).await? {
+        None => FencedDelete::Deleted,
+        Some(_) => FencedDelete::InFlight,
+    })
 }
 
 async fn retain_sealed_record(
@@ -2258,7 +2340,7 @@ struct BatchReconcileResult {
     stablecoin_settled_base_units: Option<u64>,
     stablecoin_distributed_base_units: Option<u64>,
     escrow_active: Option<bool>,
-    observed_settled_on_chain: Option<u64>,
+    observed: Option<ChainObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2297,6 +2379,9 @@ struct BatchCandidate {
     before: ChannelInventorySnapshot,
     after: ChannelInventorySnapshot,
     settled_on_chain: u64,
+    /// Accepted cumulative above what a sealed channel settled. Sealing is
+    /// terminal, so this payout forfeits it; reported once it lands.
+    forfeited_accepted: u64,
 }
 
 fn batch_reconciliation_due(
@@ -2329,25 +2414,72 @@ fn batch_reconciliation_due(
             || now_seconds.saturating_sub(state.last_activity_at) >= max_idle.as_secs())
 }
 
+/// What one chain read (or confirmed transaction) established about a
+/// batch channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainObservation {
+    settled: u64,
+    /// The lifecycle the read showed; `None` when nothing was read beyond the
+    /// settlement watermark.
+    lifecycle: Option<ObservedLifecycle>,
+}
+
+impl ChainObservation {
+    /// The channel as read at `now` (unix seconds), fenced the way the
+    /// gateway fences its own reads.
+    fn of(onchain: &channel::DecodedChannel, now: i64) -> Self {
+        let status = onchain.channel.status;
+        let started_at =
+            (onchain.channel.closure_started_at != 0 || status != STATUS_OPEN).then(|| {
+                u64::try_from(onchain.channel.closure_started_at)
+                    .ok()
+                    .filter(|started| *started > 0)
+                    .unwrap_or(now.max(1) as u64)
+            });
+        let lifecycle = match (status, started_at) {
+            (STATUS_OPEN | STATUS_CLOSING, Some(started_at)) => {
+                ObservedLifecycle::Closing { started_at }
+            }
+            (STATUS_OPEN | STATUS_CLOSING, None) => ObservedLifecycle::Open,
+            _ => ObservedLifecycle::Terminal { started_at },
+        };
+        Self {
+            settled: onchain.channel.settlement.settled,
+            lifecycle: Some(lifecycle),
+        }
+    }
+}
+
+/// Persist a chain observation through the kit's
+/// [`ChannelState::record_onchain_observation`]: the lifecycle fences it
+/// carries (a close, a seal) land in the same write that renews the
+/// gateway's admission snapshot, and a read from a bank behind `slot`'s
+/// recorded predecessor applies its fences without renewing it.
 async fn update_batch_settled_watermark(
-    store: &RedisChannelStore,
+    store: &impl ChannelStore,
     channel_id: &str,
-    settled_on_chain: u64,
-    checked_at: u64,
-) -> Result<(), StoreError> {
+    observed: ChainObservation,
+    slot: Option<u64>,
+    now: u64,
+) -> Result<ObservationOutcome, StoreError> {
+    let outcome = Arc::new(std::sync::Mutex::new(ObservationOutcome::Fresh));
+    let out = Arc::clone(&outcome);
     store
         .update_channel(
             channel_id,
             Box::new(move |current| {
                 let mut state = current
                     .ok_or_else(|| StoreError::Internal("batch channel not found".into()))?;
-                state.settled_on_chain = state.settled_on_chain.max(settled_on_chain);
-                state.onchain_checked_at = state.onchain_checked_at.max(checked_at);
+                state.settled_on_chain = state.settled_on_chain.max(observed.settled);
+                if let Some(lifecycle) = observed.lifecycle {
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = state
+                        .record_onchain_observation(OnchainObservation { slot, lifecycle }, now);
+                }
                 Ok(state)
             }),
         )
-        .await
-        .map(|_| ())
+        .await?;
+    Ok(*outcome.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The deployment this worker settles: canonical-program batch channels. A
@@ -2534,7 +2666,7 @@ async fn reconcile_batch_channel(
             stablecoin_settled_base_units: None,
             stablecoin_distributed_base_units: None,
             escrow_active: Some(false),
-            observed_settled_on_chain: None,
+            observed: None,
         });
     };
     let channel_id = onchain.address;
@@ -2562,6 +2694,7 @@ async fn reconcile_batch_channel(
     );
     let distributed_metric = stablecoin_base_units_option(&onchain.mint(), distributed);
     let mut instructions = Vec::new();
+    let mut forfeited_accepted = 0;
     let (kind, store_action, after, confirmed_settled) = match onchain.channel.status {
         STATUS_OPEN => {
             let mut target_settled = onchain.channel.settlement.settled;
@@ -2618,8 +2751,22 @@ async fn reconcile_batch_channel(
                     onchain.channel.settlement.payout_watermark,
                     threshold,
                 )
-            });
-            if !should_distribute {
+            }) && target_settled
+                > onchain.channel.settlement.payout_watermark;
+            let distribution = if should_distribute {
+                batch_distribution(
+                    rpc,
+                    rpc_url,
+                    &onchain,
+                    treasury_owner,
+                    token_programs,
+                    channel::DistributeStage::Open,
+                )
+                .await?
+            } else {
+                None
+            };
+            let Some(distribution) = distribution else {
                 if kind == BatchCandidateKind::Payout {
                     return Ok(BatchReconcileResult {
                         channel_id: state_channel_id,
@@ -2629,7 +2776,7 @@ async fn reconcile_batch_channel(
                         stablecoin_settled_base_units: settled_metric,
                         stablecoin_distributed_base_units: distributed_metric,
                         escrow_active: Some(true),
-                        observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                        observed: Some(ChainObservation::of(&onchain, now)),
                     });
                 }
                 return Ok(BatchReconcileResult {
@@ -2637,7 +2784,7 @@ async fn reconcile_batch_channel(
                     candidate: Some(BatchCandidate {
                         channel_id: state_channel_id,
                         instructions,
-                        kind,
+                        kind: BatchCandidateKind::Claim,
                         store_action: BatchStoreAction::Keep,
                         before: snapshot,
                         after: inventory_snapshot(
@@ -2649,45 +2796,17 @@ async fn reconcile_batch_channel(
                             &onchain.mint(),
                         ),
                         settled_on_chain: target_settled,
+                        forfeited_accepted: 0,
                     }),
                     delete_absent: false,
                     snapshot,
                     stablecoin_settled_base_units: settled_metric,
                     stablecoin_distributed_base_units: distributed_metric,
                     escrow_active: Some(true),
-                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                    observed: Some(ChainObservation::of(&onchain, now)),
                 });
-            }
-            if target_settled <= onchain.channel.settlement.payout_watermark {
-                return Ok(BatchReconcileResult {
-                    channel_id: state_channel_id,
-                    candidate: None,
-                    delete_absent: false,
-                    snapshot,
-                    stablecoin_settled_base_units: settled_metric,
-                    stablecoin_distributed_base_units: distributed_metric,
-                    escrow_active: Some(true),
-                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
-                });
-            }
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
+            };
+            instructions.push(distribution);
             (
                 kind,
                 BatchStoreAction::Keep,
@@ -2703,16 +2822,8 @@ async fn reconcile_batch_channel(
             )
         }
         STATUS_CLOSING if state.final_cumulative.is_none() => {
-            if now >= onchain.close_deadline()
-                && state.cumulative > onchain.channel.settlement.settled
-            {
-                return Err(JobError::Config(format!(
-                    "batch channel {} closed with {} accepted above the settled {}; refusing to \
-                     seal below it",
-                    state.channel_id,
-                    state.cumulative - onchain.channel.settlement.settled,
-                    onchain.channel.settlement.settled
-                )));
+            if now >= onchain.close_deadline() {
+                require_settled_covers_accepted(&state, &onchain, "seal")?;
             }
             // A live reservation defers the seal on both sides of the deadline.
             return Ok(BatchReconcileResult {
@@ -2723,7 +2834,7 @@ async fn reconcile_batch_channel(
                 stablecoin_settled_base_units: settled_metric,
                 stablecoin_distributed_base_units: distributed_metric,
                 escrow_active: Some(true),
-                observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                observed: Some(ChainObservation::of(&onchain, now)),
             });
         }
         STATUS_CLOSING if now < onchain.close_deadline() => {
@@ -2748,100 +2859,81 @@ async fn reconcile_batch_channel(
                     JobError::TxBuild(format!("settle-and-seal instruction: {error}"))
                 })?,
             );
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
-            (
-                BatchCandidateKind::FinalizeClose,
-                BatchStoreAction::MarkFinalized,
-                inventory_snapshot(
-                    true,
-                    STATUS_DISTRIBUTED,
-                    target_settled,
-                    target_settled,
-                    state.cumulative,
-                    &onchain.mint(),
-                ),
+            sealed_close(
+                &mut instructions,
+                batch_distribution(
+                    rpc,
+                    rpc_url,
+                    &onchain,
+                    treasury_owner,
+                    token_programs,
+                    channel::DistributeStage::Sealed {
+                        settled: target_settled,
+                    },
+                )
+                .await?,
                 target_settled,
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
             )
         }
         STATUS_CLOSING if now >= onchain.close_deadline() => {
-            if state.cumulative > onchain.channel.settlement.settled {
-                return Err(JobError::Config(format!(
-                    "batch channel {} closed with {} accepted above the settled {}; refusing to \
-                     seal below it",
-                    state.channel_id,
-                    state.cumulative - onchain.channel.settlement.settled,
-                    onchain.channel.settlement.settled
-                )));
-            }
+            require_settled_covers_accepted(&state, &onchain, "seal")?;
             instructions.push(channel::build_seal_ix(&channel_id));
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
-            (
-                BatchCandidateKind::FinalizeClose,
-                BatchStoreAction::MarkFinalized,
-                inventory_snapshot(
-                    true,
-                    STATUS_DISTRIBUTED,
-                    onchain.channel.settlement.settled,
-                    onchain.channel.settlement.settled,
-                    state.cumulative,
-                    &onchain.mint(),
-                ),
+            sealed_close(
+                &mut instructions,
+                batch_distribution(
+                    rpc,
+                    rpc_url,
+                    &onchain,
+                    treasury_owner,
+                    token_programs,
+                    channel::DistributeStage::Sealed {
+                        settled: onchain.channel.settlement.settled,
+                    },
+                )
+                .await?,
                 onchain.channel.settlement.settled,
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
             )
         }
         STATUS_SEALED => {
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
+            // A permissionless seal can land before this worker ever reads
+            // Closing, below the accepted cumulative. Sealing is terminal: no
+            // settle can raise it any more, and holding the channel would only
+            // strand the settled payout (anyone can still crank `distribute`).
+            // So it is distributed, and the forfeited delta reported once the
+            // payout lands rather than dropped silently.
+            forfeited_accepted = state
+                .cumulative
+                .saturating_sub(onchain.channel.settlement.settled);
+            let Some(distribution) = batch_distribution(
+                rpc,
+                rpc_url,
                 &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
+                treasury_owner,
+                token_programs,
+                channel::DistributeStage::Sealed {
+                    settled: onchain.channel.settlement.settled,
+                },
+            )
+            .await?
+            else {
+                return Ok(BatchReconcileResult {
+                    channel_id: state_channel_id,
+                    candidate: None,
+                    delete_absent: false,
+                    snapshot,
+                    stablecoin_settled_base_units: settled_metric,
+                    stablecoin_distributed_base_units: distributed_metric,
+                    escrow_active: Some(true),
+                    observed: Some(ChainObservation::of(&onchain, now)),
+                });
+            };
+            instructions.push(distribution);
             (
                 BatchCandidateKind::Payout,
                 BatchStoreAction::MarkFinalized,
@@ -2879,7 +2971,7 @@ async fn reconcile_batch_channel(
                 stablecoin_settled_base_units: settled_metric,
                 stablecoin_distributed_base_units: distributed_metric,
                 escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
-                observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                observed: Some(ChainObservation::of(&onchain, now)),
             });
         }
         status => {
@@ -2900,14 +2992,124 @@ async fn reconcile_batch_channel(
             before: snapshot,
             after,
             settled_on_chain: confirmed_settled,
+            forfeited_accepted,
         }),
         delete_absent: false,
         snapshot,
         stablecoin_settled_base_units: settled_metric,
         stablecoin_distributed_base_units: distributed_metric,
         escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
-        observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+        observed: Some(ChainObservation::of(&onchain, now)),
     })
+}
+
+/// Refuse to `action` (seal) a batch channel whose on-chain settlement is
+/// below the cumulative this service accepted and served: sealing it would
+/// forfeit the delta for good. The record stays, and the error surfaces every
+/// pass until an operator resolves it.
+fn require_settled_covers_accepted(
+    state: &ChannelState,
+    onchain: &channel::DecodedChannel,
+    action: &str,
+) -> Result<(), JobError> {
+    let settled = onchain.channel.settlement.settled;
+    if state.cumulative > settled {
+        return Err(JobError::Config(format!(
+            "batch channel {} closed with {} accepted above the settled {settled}; refusing to \
+             {action} below it",
+            state.channel_id,
+            state.cumulative - settled,
+        )));
+    }
+    Ok(())
+}
+
+/// The batch `distribute` for `onchain` at `stage`, or `None` while a refund
+/// is due and the payer's refund account is closed. The worker never
+/// recreates that account itself: its rent would return to the payer on the
+/// next close, so recreating it on every payout lets a payer drain the
+/// operator. The claim or seal lands alone and the payout follows once the
+/// payer recreates the account. A payout that refunds nothing never waits.
+async fn batch_distribution(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    onchain: &channel::DecodedChannel,
+    treasury_owner: &Pubkey,
+    token_programs: &HashMap<Pubkey, Pubkey>,
+    stage: channel::DistributeStage,
+) -> Result<Option<solana_instruction::Instruction>, JobError> {
+    let token_program = token_programs
+        .get(&onchain.mint())
+        .copied()
+        .ok_or_else(|| {
+            JobError::TxBuild(format!(
+                "token program unavailable for batch channel mint {}",
+                onchain.mint()
+            ))
+        })?;
+    if let channel::RefundAccount::Unpayable { reason, .. } = channel::payer_refund_account(
+        rpc,
+        rpc_url,
+        onchain,
+        &token_program,
+        &payment_channels::default_program_id(),
+        stage,
+    )
+    .await?
+    {
+        warn!(
+            channel_id = %onchain.address,
+            reason,
+            "payer refund account cannot take the refund; deferring distribution"
+        );
+        return Ok(None);
+    }
+    let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
+    Ok(Some(
+        channel::build_distribute_ix(onchain, treasury_owner, &token_program, &preimage).0,
+    ))
+}
+
+/// Finish a batch close that seals `settled`: with its distribution it is
+/// terminal, without it only the seal lands and the record stays for the
+/// sealed-channel payout.
+fn sealed_close(
+    instructions: &mut Vec<solana_instruction::Instruction>,
+    distribution: Option<solana_instruction::Instruction>,
+    settled: u64,
+    payout_watermark: u64,
+    cumulative: u64,
+    mint: &Pubkey,
+) -> (
+    BatchCandidateKind,
+    BatchStoreAction,
+    ChannelInventorySnapshot,
+    u64,
+) {
+    match distribution {
+        Some(distribution) => {
+            instructions.push(distribution);
+            (
+                BatchCandidateKind::FinalizeClose,
+                BatchStoreAction::MarkFinalized,
+                inventory_snapshot(true, STATUS_DISTRIBUTED, settled, settled, cumulative, mint),
+                settled,
+            )
+        }
+        None => (
+            BatchCandidateKind::FinalizeClose,
+            BatchStoreAction::Keep,
+            inventory_snapshot(
+                true,
+                STATUS_SEALED,
+                settled,
+                payout_watermark,
+                cumulative,
+                mint,
+            ),
+            settled,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3380,41 +3582,88 @@ async fn build_idle_close_candidate(
         )));
     }
 
-    let Some(mut instructions) =
-        close_settlement_instructions(state, onchain, now, operator, &program)?
+    let Some(CloseSettlement {
+        mut instructions,
+        settled: close_settled,
+    }) = close_settlement_instructions(state, onchain, now, operator, &program)?
     else {
         return Ok(None);
     };
 
-    let (distribution, token_program) = if let Some(config) = bound_config {
-        let token_program = config
-            .token_program
-            .ok_or_else(|| binding_error("missing token program"))?;
-        channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
-        (
-            bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?,
-            token_program,
-        )
-    } else {
-        let token_program = channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
-        let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
-        (
-            channel::build_distribute_ix_for_program(
-                onchain,
-                treasury_owner,
-                &token_program,
-                &preimage,
-                &program,
-            )
-            .0,
-            token_program,
-        )
+    let token_program = match bound_config {
+        Some(config) => {
+            let token_program = config
+                .token_program
+                .ok_or_else(|| binding_error("missing token program"))?;
+            channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
+            token_program
+        }
+        None => channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?,
     };
-    instructions.push(channel::payer_refund_account_ix(
-        operator,
+    // Never recreated at the operator's expense (see `batch_distribution`):
+    // with a refund due and the payer's refund account unpayable only the
+    // close lands, and the sealed channel is distributed once the payer
+    // repairs it.
+    let refund = channel::payer_refund_account(
+        rpc,
+        rpc_url,
         onchain,
         &token_program,
-    ));
+        &program,
+        channel::DistributeStage::Sealed {
+            settled: close_settled,
+        },
+    )
+    .await?;
+    let clearance = match refund {
+        channel::RefundAccount::Payable(clearance) => clearance,
+        channel::RefundAccount::Unpayable { reason, .. } => {
+            warn!(
+                channel_id = %state.channel_id,
+                reason,
+                "payer refund account cannot take the refund; closing without distributing"
+            );
+            if instructions.is_empty() {
+                return Ok(None);
+            }
+            let before = inventory_snapshot(
+                state.sealed,
+                onchain.channel.status,
+                onchain.channel.settlement.settled,
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
+            );
+            let after = inventory_snapshot(
+                true,
+                STATUS_SEALED,
+                onchain.channel.settlement.settled.max(state.cumulative),
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
+            );
+            return Ok(Some(SettlementCandidate {
+                channel_id: state.channel_id.clone(),
+                instructions,
+                kind: CandidateKind::Watermark,
+                before,
+                after,
+            }));
+        }
+    };
+    let distribution = if let Some(config) = bound_config {
+        bound_distribution_instruction(config, onchain, treasury_owner, &token_program, &clearance)?
+    } else {
+        let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
+        channel::build_distribute_ix_for_program(
+            onchain,
+            treasury_owner,
+            &token_program,
+            &preimage,
+            &program,
+        )
+        .0
+    };
     instructions.push(distribution);
     let before = inventory_snapshot(
         state.sealed,
@@ -3442,14 +3691,23 @@ async fn build_idle_close_candidate(
     }))
 }
 
+/// The instructions that seal a channel for an idle close, and the settled
+/// amount the sealed channel carries once they land.
+#[derive(Debug)]
+struct CloseSettlement {
+    instructions: Vec<solana_instruction::Instruction>,
+    settled: u64,
+}
+
 fn close_settlement_instructions(
     state: &ChannelState,
     onchain: &channel::DecodedChannel,
     now: i64,
     operator: &Pubkey,
     program: &Pubkey,
-) -> Result<Option<Vec<solana_instruction::Instruction>>, JobError> {
-    let instructions = match onchain.channel.status {
+) -> Result<Option<CloseSettlement>, JobError> {
+    let settled = onchain.channel.settlement.settled;
+    let (instructions, settled) = match onchain.channel.status {
         status
             if status == STATUS_OPEN
                 || (status == STATUS_CLOSING && now < onchain.close_deadline()) =>
@@ -3461,7 +3719,7 @@ fn close_settlement_instructions(
                 &onchain_signer,
                 now,
             )?;
-            payment_channels::build_settle_and_seal_instructions(
+            let instructions = payment_channels::build_settle_and_seal_instructions(
                 operator,
                 &onchain.address,
                 &onchain_signer,
@@ -3470,15 +3728,17 @@ fn close_settlement_instructions(
                 expires_at,
                 program,
             )
-            .map_err(|error| JobError::TxBuild(format!("settle-and-seal instruction: {error}")))?
+            .map_err(|error| JobError::TxBuild(format!("settle-and-seal instruction: {error}")))?;
+            (instructions, cumulative)
         }
-        STATUS_SEALED => Vec::new(),
-        STATUS_CLOSING if now >= onchain.close_deadline() => {
+        STATUS_SEALED => (Vec::new(), settled),
+        STATUS_CLOSING if now >= onchain.close_deadline() => (
             vec![channel::build_seal_ix_for_program(
                 &onchain.address,
                 program,
-            )]
-        }
+            )],
+            settled,
+        ),
         STATUS_DISTRIBUTED => return Ok(None),
         status => {
             return Err(JobError::TxBuild(format!(
@@ -3488,7 +3748,10 @@ fn close_settlement_instructions(
         }
     };
 
-    Ok(Some(instructions))
+    Ok(Some(CloseSettlement {
+        instructions,
+        settled,
+    }))
 }
 
 fn close_voucher(
@@ -3685,7 +3948,7 @@ fn default_batch_redis_prefix(network: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_kit::core::store::ChannelLifecycle;
+    use pay_kit::core::store::{AuthorizationRequest, BatchReservation, ChannelLifecycle};
 
     #[test]
     fn default_batch_prefix_matches_the_gateway_per_network_namespace() {
@@ -3700,6 +3963,23 @@ mod tests {
             default_batch_redis_prefix("sandbox"),
             "pay:batch:v1:localnet:"
         );
+    }
+
+    /// `state`, confirmed open onchain just now, so the kit admits charges
+    /// on it without an RPC read.
+    fn freshly_observed(mut state: ChannelState) -> ChannelState {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        state.record_onchain_observation(
+            pay_kit::core::store::OnchainObservation {
+                slot: None,
+                lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+            },
+            now,
+        );
+        state
     }
 
     fn channel_state() -> ChannelState {
@@ -4201,7 +4481,14 @@ mod tests {
             &preimage,
             &config.channel_program.unwrap(),
         );
-        let ix = bound_distribution_instruction(&restored, &onchain, &treasury, &token).unwrap();
+        let ix = bound_distribution_instruction(
+            &restored,
+            &onchain,
+            &treasury,
+            &token,
+            &clearance(&onchain),
+        )
+        .unwrap();
         assert_eq!(ix.program_id, base.program_id);
         assert_eq!(ix.data, base.data);
         assert_eq!(&ix.accounts[..base.accounts.len()], &base.accounts);
@@ -4217,7 +4504,57 @@ mod tests {
             ix.accounts[base.accounts.len() + 4]
         );
         restored.channel_version = Some(1);
-        assert!(bound_distribution_instruction(&restored, &onchain, &treasury, &token).is_err());
+        assert!(
+            bound_distribution_instruction(
+                &restored,
+                &onchain,
+                &treasury,
+                &token,
+                &clearance(&onchain)
+            )
+            .is_err()
+        );
+    }
+
+    /// A distribute clearance for `onchain`, as for a channel that owes no
+    /// refund.
+    fn clearance(onchain: &channel::DecodedChannel) -> DistributeClearance {
+        use pay_kit::core::payment_channel::payer_refund::{
+            RefundDeadline, SealedRefundTerms, payer_refund,
+        };
+        let terms = SealedRefundTerms {
+            channel: onchain.address,
+            payer: onchain.payer(),
+            mint: onchain.mint(),
+            token_program: Pubkey::new_unique(),
+            deposit: 0,
+            settled: 0,
+            payer_withdrawn_at: 0,
+        };
+        let deadline = RefundDeadline {
+            sealed_at: 0,
+            grace_period: 0,
+        };
+        payer_refund(&terms, None, deadline, 0).clearance().unwrap()
+    }
+
+    #[test]
+    fn a_bound_distribution_refuses_another_channels_clearance() {
+        let (_, config, onchain) = closing_fixture();
+        let mut other = onchain.clone();
+        other.address = Pubkey::new_unique();
+        let treasury = Pubkey::new_unique();
+        let token = config.token_program.unwrap();
+        assert!(
+            bound_distribution_instruction(
+                &config,
+                &onchain,
+                &treasury,
+                &token,
+                &clearance(&other)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4228,7 +4565,14 @@ mod tests {
         let preimage = bound_preimage(&config, &onchain).unwrap();
         let v1 = channel::build_distribute_ix(&onchain, &treasury, &token, &preimage).0;
         assert_eq!(
-            bound_distribution_instruction(&config, &onchain, &treasury, &token).unwrap(),
+            bound_distribution_instruction(
+                &config,
+                &onchain,
+                &treasury,
+                &token,
+                &clearance(&onchain)
+            )
+            .unwrap(),
             v1
         );
     }
@@ -4306,6 +4650,8 @@ mod tests {
         // The real candidate builder must verify mint ownership and retain the
         // V2 program and both mandatory distribution-hook account groups.
         let token = restored.token_program.unwrap();
+        // Served for both the mint and the payer's refund account reads.
+        let refund_data = live_refund_account_data(&onchain);
         let app = Router::new().route(
             "/",
             axum::routing::post(
@@ -4314,7 +4660,7 @@ mod tests {
                     axum::Json(serde_json::json!({
                         "jsonrpc": "2.0", "id": request["id"],
                         "result": {"context": {"slot": 42}, "value": [{
-                            "owner": token.to_string(), "data": ["", "base64"],
+                            "owner": token.to_string(), "data": [refund_data, "base64"],
                             "lamports": 1, "executable": false, "rentEpoch": 0
                         }]}
                     }))
@@ -4347,7 +4693,8 @@ mod tests {
         let program = restored.channel_program.unwrap();
         let close = close_settlement_instructions(&claimed, &onchain, 120, &operator, &program)
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .instructions;
         assert_eq!(&candidate.instructions[..close.len()], &close);
         assert!(close.iter().any(|ix| ix.program_id == program));
         let preimage = bound_preimage(&restored, &onchain).unwrap();
@@ -4356,7 +4703,7 @@ mod tests {
         )
         .0;
         let distribution = candidate.instructions.last().unwrap();
-        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+        assert_operator_funds_no_account(&candidate.instructions, &operator);
         assert_eq!(distribution.program_id, program);
         assert_eq!(distribution.data, base.data);
         assert_eq!(
@@ -4385,7 +4732,10 @@ mod tests {
         let binding = CloseBinding::new(&state, &config).unwrap();
         let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
         let id = state.channel_id.clone();
-        store.put_channel(&id, state).await.unwrap();
+        store
+            .put_channel(&id, freshly_observed(state))
+            .await
+            .unwrap();
         let server = SessionServer::new(config, store.clone());
         let mut delivery = DeliveryRequest::new(&id, 1);
         delivery.expires_at = Some(2);
@@ -4667,7 +5017,8 @@ mod tests {
             &program,
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .instructions;
         let expected = payment_channels::build_settle_and_seal_instructions(
             &config.operator.parse().unwrap(),
             &onchain.address,
@@ -5405,6 +5756,74 @@ mod tests {
         .await
     }
 
+    fn authorization(id: &str, amount: u64, cumulative: u64) -> AuthorizationRequest {
+        AuthorizationRequest {
+            authorization_id: id.into(),
+            request_fingerprint: format!("{id}-fingerprint"),
+            amount,
+            cumulative,
+            lease: Duration::from_secs(300),
+            now: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_channel_cleanup_keeps_work_admitted_after_the_snapshot() {
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let state = channel_state();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+
+        // The reconciliation snapshot sees nothing in flight, then a request
+        // is admitted before the cleanup runs.
+        let snapshot = store.get_channel(&id).await.unwrap().unwrap();
+        assert!(!snapshot.has_in_flight_authorization());
+        let reserved = store
+            .reserve_authorization(
+                &id,
+                None,
+                authorization("late", 100, 100),
+                Box::new(|_| Ok(None)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reserved, BatchReservation::Reserved(_)));
+        assert_eq!(
+            delete_fenced_channel(&store, &id).await.unwrap(),
+            FencedDelete::InFlight
+        );
+        let kept = store.get_channel(&id).await.unwrap().unwrap();
+        assert_eq!(kept.pending_deliveries.len(), 1);
+        assert!(!kept.sealed && kept.close_requested_at.is_none());
+
+        // With nothing in flight the record goes, and is fenced on the way:
+        // a request racing the delete is refused, never admitted.
+        let quiet = channel_state();
+        let quiet_id = quiet.channel_id.clone();
+        store.put_channel(&quiet_id, quiet).await.unwrap();
+        let fenced = retain_sealed_record(&store, &quiet_id).await;
+        assert!(fenced.is_ok());
+        let refused = store
+            .reserve_authorization(
+                &quiet_id,
+                None,
+                authorization("racing", 100, 100),
+                Box::new(|_| Ok(None)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(refused, BatchReservation::Closing));
+        assert_eq!(
+            delete_fenced_channel(&store, &quiet_id).await.unwrap(),
+            FencedDelete::Deleted
+        );
+        assert!(store.get_channel(&quiet_id).await.unwrap().is_none());
+        assert_eq!(
+            delete_fenced_channel(&store, &quiet_id).await.unwrap(),
+            FencedDelete::Deleted
+        );
+    }
+
     #[tokio::test]
     async fn one_absent_read_never_deletes_a_live_v1_session() {
         let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
@@ -5559,12 +5978,48 @@ mod tests {
         operator: &Pubkey,
         now: i64,
     ) -> Result<BatchReconcileResult, JobError> {
-        let rpc = RpcClient::new(Duration::from_millis(10)).unwrap();
-        let token_programs =
-            HashMap::from([(onchain.mint(), pay_api_core::ata::SPL_TOKEN_PROGRAM_ID)]);
-        reconcile_batch_channel(
+        reconcile_batch_with_refund_account(state, onchain, operator, now, None, true).await
+    }
+
+    /// Base64 of an initialized token account the payer of `onchain` holds
+    /// for its mint: a refund account the kit's check finds payable.
+    fn live_refund_account_data(onchain: &channel::DecodedChannel) -> String {
+        use base64::Engine as _;
+        let mut data = vec![0u8; 165];
+        data[..32].copy_from_slice(onchain.mint().as_ref());
+        data[32..64].copy_from_slice(onchain.payer().as_ref());
+        data[108] = 1;
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
+    /// Reconcile against an RPC whose only account read is the payer's
+    /// refund account, live or closed.
+    async fn reconcile_batch_with_refund_account(
+        state: ChannelState,
+        onchain: &channel::DecodedChannel,
+        operator: &Pubkey,
+        now: i64,
+        distribution_threshold_base_units: Option<u64>,
+        refund_live: bool,
+    ) -> Result<BatchReconcileResult, JobError> {
+        let token = pay_api_core::ata::SPL_TOKEN_PROGRAM_ID;
+        let refund =
+            pay_api_core::ata::associated_token_address(&onchain.payer(), &onchain.mint(), &token);
+        let refund_data = live_refund_account_data(onchain);
+        let (url, server) = spawn_rpc(move |request| {
+            assert_eq!(request["method"], "getMultipleAccounts");
+            assert_eq!(request["params"][0][0], refund.to_string());
+            let account = refund_live.then(
+                || serde_json::json!({"owner": token.to_string(), "data": [refund_data, "base64"]}),
+            );
+            serde_json::json!({"context": {"slot": 1}, "value": [account]})
+        })
+        .await;
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        let token_programs = HashMap::from([(onchain.mint(), token)]);
+        let result = reconcile_batch_channel(
             &rpc,
-            "http://127.0.0.1:1",
+            &url,
             state,
             Some(onchain.clone()),
             now,
@@ -5572,9 +6027,11 @@ mod tests {
             operator,
             &Pubkey::new_unique(),
             &token_programs,
-            None,
+            distribution_threshold_base_units,
         )
-        .await
+        .await;
+        server.abort();
+        result
     }
 
     #[tokio::test]
@@ -5635,56 +6092,355 @@ mod tests {
         assert_eq!(candidate.settled_on_chain, 350);
     }
 
-    fn assert_refund_account_precedes_distribute(
+    /// The worker never funds an account creation: every ATA create it
+    /// would pay for is rent a payer can reclaim by closing the account.
+    fn assert_operator_funds_no_account(
         instructions: &[solana_instruction::Instruction],
         operator: &Pubkey,
     ) {
-        use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
-        let position = instructions
-            .iter()
-            .position(|ix| {
-                ix.data.first() == Some(&DISTRIBUTE_DISCRIMINATOR) && ix.accounts.len() >= 11
-            })
-            .expect("distribute instruction");
-        let create = &instructions[position - 1];
-        assert_eq!(
-            create.program_id,
-            payment_channels::to_address(&pay_api_core::ata::ATA_PROGRAM_ID)
-        );
-        assert_eq!(create.data, vec![1], "CreateIdempotent");
-        assert_eq!(
-            create.accounts[0].pubkey,
-            payment_channels::to_address(operator)
-        );
-        assert_eq!(
-            create.accounts[1].pubkey, instructions[position].accounts[4].pubkey,
-            "the refund account distribute writes"
+        let ata_program = payment_channels::to_address(&pay_api_core::ata::ATA_PROGRAM_ID);
+        assert!(
+            !instructions.iter().any(|ix| ix.program_id == ata_program
+                && ix.accounts.first().map(|meta| meta.pubkey)
+                    == Some(payment_channels::to_address(operator))),
+            "operator-funded account create"
         );
     }
 
+    fn distributes(instructions: &[solana_instruction::Instruction]) -> bool {
+        use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
+        instructions
+            .iter()
+            .any(|ix| ix.data.first() == Some(&DISTRIBUTE_DISCRIMINATOR) && ix.accounts.len() >= 11)
+    }
+
     #[tokio::test]
-    async fn every_batch_distribution_recreates_a_closed_payer_refund_account() {
+    async fn batch_distribution_never_funds_the_payer_refund_account() {
         let (state, mut onchain, operator) = batch_closing_fixture();
-        // Already sealed by another crank: distribute alone, refund account first.
+        let mut frozen = state.clone();
+        frozen.freeze_watermark_at(frozen.cumulative);
+        let mut settled = state.clone();
+        settled.cumulative = 100;
+        settled.freeze_watermark_at(100);
+        let past = onchain.close_deadline();
+        // Every case refunds the payer (deposit 1000 above what settles), so
+        // the payout reads its refund account.
+        let cases = [
+            (STATUS_SEALED, settled.clone(), 0),
+            (STATUS_CLOSING, frozen, 1_010),
+            (STATUS_CLOSING, settled, past),
+        ];
+        for (status, state, now) in cases {
+            onchain.channel.status = status;
+            // Live refund account: the payout rides along, with no create.
+            let live = reconcile_batch_with_refund_account(
+                state.clone(),
+                &onchain,
+                &operator,
+                now,
+                Some(1),
+                true,
+            )
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+            assert!(distributes(&live.instructions), "status {status}");
+            assert_operator_funds_no_account(&live.instructions, &operator);
+
+            // Closed by the payer: the claim or seal lands alone and the
+            // record stays for the payout once the payer recreates it.
+            let closed = reconcile_batch_with_refund_account(
+                state,
+                &onchain,
+                &operator,
+                now,
+                Some(1),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_operator_funds_no_account(
+                closed
+                    .candidate
+                    .as_ref()
+                    .map_or(&[][..], |candidate| &candidate.instructions),
+                &operator,
+            );
+            match closed.candidate {
+                None => assert_eq!(status, STATUS_SEALED),
+                Some(candidate) => {
+                    assert!(!distributes(&candidate.instructions), "status {status}");
+                    assert!(!candidate.instructions.is_empty());
+                    assert!(matches!(candidate.store_action, BatchStoreAction::Keep));
+                    assert_ne!(candidate.kind, BatchCandidateKind::ClaimAndPayout);
+                    assert!(!candidate.after.rent_unclaimed, "not distributed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_payout_that_refunds_nothing_never_waits_for_the_refund_account() {
+        let (state, onchain, operator) = batch_closing_fixture();
+        let mut open = onchain.clone();
+        open.channel.status = STATUS_OPEN;
+        // Exactly the deposit settles at the seal: nothing to refund.
+        let mut exact = onchain.clone();
+        exact.channel.deposit = state.cumulative;
+        let mut sealed_exact = exact.clone();
+        sealed_exact.channel.status = STATUS_SEALED;
+        sealed_exact.channel.settlement.settled = state.cumulative;
+        // The payer already withdrew its headroom.
+        let mut withdrawn = sealed_exact.clone();
+        withdrawn.channel.deposit = 1_000;
+        withdrawn.channel.payer_withdrawn_at = 1;
+        // A payer close in grace settles the frozen watermark.
+        let mut frozen = state.clone();
+        frozen.freeze_watermark_at(frozen.cumulative);
+        let cases = [
+            ("open claim and payout", &state, open, 0),
+            ("exact settle and seal", &frozen, exact, 1_010),
+            ("sealed at its deposit", &state, sealed_exact, 0),
+            ("sealed after withdrawal", &state, withdrawn, 0),
+        ];
+        for (case, state, onchain, now) in cases {
+            let candidate = reconcile_batch_with_refund_account(
+                state.clone(),
+                &onchain,
+                &operator,
+                now,
+                Some(1),
+                false,
+            )
+            .await
+            .unwrap()
+            .candidate
+            .unwrap_or_else(|| panic!("{case}: no candidate"));
+            assert!(distributes(&candidate.instructions), "{case}");
+            assert_operator_funds_no_account(&candidate.instructions, &operator);
+        }
+
+        // Positive control: with a refund due the same sealed payout waits.
+        let mut refunding = onchain;
+        refunding.channel.status = STATUS_SEALED;
+        refunding.channel.settlement.settled = state.cumulative;
+        let deferred =
+            reconcile_batch_with_refund_account(state, &refunding, &operator, 0, Some(1), false)
+                .await
+                .unwrap();
+        assert!(deferred.candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_idle_close_that_refunds_nothing_distributes_past_a_closed_refund_account() {
+        let (state, mut onchain, operator) = batch_closing_fixture();
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        // Every account read is null: the payer's refund account is closed.
+        let (url, server) = absent_everywhere(0).await;
+        let treasury = Pubkey::new_unique();
+        let close = |onchain: channel::DecodedChannel| {
+            let (rpc, url, state) = (&rpc, url.clone(), state.clone());
+            async move {
+                build_idle_close_candidate(
+                    rpc, &url, &state, &onchain, 120, &operator, &treasury, None,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+
+        // The close settles exactly the deposit, so distribute refunds
+        // nothing and rides along.
+        let mut exact = onchain.clone();
+        exact.channel.deposit = state.cumulative;
+        let candidate = close(exact).await;
+        assert!(distributes(&candidate.instructions));
+        assert_eq!(candidate.kind, CandidateKind::IdleClose);
+
+        // Positive control: headroom is refunded, so only the close lands.
+        let candidate = close(onchain).await;
+        assert!(!distributes(&candidate.instructions));
+        assert_eq!(candidate.kind, CandidateKind::Watermark);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_channel_sealed_below_its_accepted_cumulative_is_distributed_and_reports_the_loss() {
+        let (state, mut onchain, operator) = batch_closing_fixture();
+        // A permissionless seal landed before the worker read Closing: 300
+        // was accepted and served, only 100 is settled on chain, and a sealed
+        // channel can never settle more.
         onchain.channel.status = STATUS_SEALED;
+        assert!(state.cumulative > onchain.channel.settlement.settled);
         let candidate = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
             .await
             .unwrap()
             .candidate
             .unwrap();
-        assert_eq!(candidate.instructions.len(), 2);
-        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+        assert_eq!(candidate.kind, BatchCandidateKind::Payout);
+        assert!(distributes(&candidate.instructions));
+        assert_eq!(candidate.settled_on_chain, 100);
+        assert_eq!(candidate.forfeited_accepted, 200);
+        assert!(candidate.after.rent_unclaimed, "distributed");
 
-        // In-grace settle-and-seal plus distribute.
-        onchain.channel.status = STATUS_CLOSING;
-        let mut frozen = state;
-        frozen.freeze_watermark_at(frozen.cumulative);
-        let candidate = reconcile_closing_batch(frozen, &onchain, &operator, 1_010)
+        // Positive control: fully settled, the same payout forfeits nothing.
+        let mut settled = state;
+        settled.cumulative = onchain.channel.settlement.settled;
+        let candidate = reconcile_closing_batch(settled, &onchain, &operator, 0)
             .await
             .unwrap()
             .candidate
             .unwrap();
-        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+        assert_eq!(candidate.kind, BatchCandidateKind::Payout);
+        assert_eq!(candidate.forfeited_accepted, 0);
+        assert!(matches!(
+            candidate.store_action,
+            BatchStoreAction::MarkFinalized
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_distributed_observation_fences_the_record_it_refreshes() {
+        let (mut state, mut onchain, operator) = batch_closing_fixture();
+        state.cumulative = 100;
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        let reserve = |id: String, cumulative| {
+            let store = &store;
+            async move {
+                store
+                    .reserve_authorization(
+                        &id,
+                        None,
+                        authorization(&format!("voucher-{cumulative}"), 50, cumulative),
+                        Box::new(|_| Ok(None)),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        store.put_channel(&id, state.clone()).await.unwrap();
+
+        // The worker missed Closing and first reads the channel distributed.
+        onchain.channel.status = STATUS_DISTRIBUTED;
+        let observed = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
+            .await
+            .unwrap()
+            .observed
+            .unwrap();
+        update_batch_settled_watermark(&store, &id, observed, Some(40), 5)
+            .await
+            .unwrap();
+        let fenced = store.get_channel(&id).await.unwrap().unwrap();
+        assert_eq!(fenced.onchain_observed_at(), 5);
+        assert!(fenced.sealed, "a fresh snapshot of a distributed channel");
+        assert!(matches!(
+            reserve(id.clone(), 150).await,
+            BatchReservation::Closing
+        ));
+
+        // An open observation refreshes the snapshot and keeps admitting.
+        let open = channel_state();
+        let open_id = open.channel_id.clone();
+        store.put_channel(&open_id, open).await.unwrap();
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        update_batch_settled_watermark(
+            &store,
+            &open_id,
+            ChainObservation::of(&onchain, 5),
+            Some(40),
+            5,
+        )
+        .await
+        .unwrap();
+        assert!(!store.get_channel(&open_id).await.unwrap().unwrap().sealed);
+        assert!(matches!(
+            reserve(open_id, 50).await,
+            BatchReservation::Reserved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observations_go_through_the_kit_admission_snapshot() {
+        let (_, mut onchain, _) = batch_closing_fixture();
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let state = channel_state();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+        let read = || {
+            let (store, id) = (&store, id.clone());
+            async move { store.get_channel(&id).await.unwrap().unwrap() }
+        };
+
+        // An open read renews the snapshot the gateway admits on, not just
+        // `onchain_checked_at`.
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        let outcome = update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation::of(&onchain, 100),
+            Some(50),
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ObservationOutcome::Fresh);
+        let recorded = read().await;
+        assert_eq!(recorded.onchain_observed_at(), 100);
+        assert_eq!(recorded.onchain_observed_slot(), 50);
+        assert!(recorded.close_requested_at.is_none());
+
+        // A lagging node's open read never renews it.
+        let outcome = update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation::of(&onchain, 200),
+            Some(49),
+            200,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ObservationOutcome::Behind { recorded: 50 });
+        assert_eq!(read().await.onchain_observed_at(), 100);
+
+        // A closing read records the close even from a lagging node.
+        onchain.channel.status = STATUS_CLOSING;
+        onchain.channel.closure_started_at = 150;
+        update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation::of(&onchain, 300),
+            Some(48),
+            300,
+        )
+        .await
+        .unwrap();
+        let closing = read().await;
+        assert_eq!(closing.close_requested_at, Some(150));
+        assert!(!closing.sealed);
+
+        // A settlement-only update moves the watermark and nothing else.
+        update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation {
+                settled: 7,
+                lifecycle: None,
+            },
+            None,
+            400,
+        )
+        .await
+        .unwrap();
+        let settled = read().await;
+        assert!(settled.settled_on_chain >= 7);
+        assert_eq!(settled.onchain_observed_at(), 100);
     }
 
     #[tokio::test]
@@ -5743,6 +6499,7 @@ mod tests {
             )
             .unwrap()
             .unwrap()
+            .instructions
             .is_empty()
         );
 
@@ -5849,7 +6606,8 @@ mod tests {
             .unwrap();
         assert_eq!(candidate.kind, BatchCandidateKind::FinalizeClose);
         assert_eq!(candidate.settled_on_chain, 100);
-        assert_eq!(candidate.instructions.len(), 3);
+        // Seal then distribute; the worker never funds a refund account.
+        assert_eq!(candidate.instructions.len(), 2);
     }
 
     fn test_runtime() -> SettlementRuntime {
@@ -6010,7 +6768,10 @@ mod tests {
         let channel_id = active.channel_id_str();
         let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
         store
-            .put_channel(&channel_id, legacy_due_state(&channel_id, &active))
+            .put_channel(
+                &channel_id,
+                freshly_observed(legacy_due_state(&channel_id, &active)),
+            )
             .await
             .unwrap();
         let server = SessionServer::new(SessionConfig::default(), store.clone());

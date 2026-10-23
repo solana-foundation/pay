@@ -1427,6 +1427,8 @@ fn build_session_authorization(
             state.account_override.as_deref(),
             &state.authorization_url,
             None,
+            None,
+            None,
         )?;
 
     Ok((PaidHeaders::mpp(open_authorization), use_authorization))
@@ -2215,6 +2217,7 @@ mod tests {
     /// Spawn the payer with an in-memory accounts store so tests never
     /// touch (or create) the user's real `~/.config/pay/accounts.yml`.
     async fn spawn_payer_with(upstream: PayerUpstream, network_override: Option<&str>) -> String {
+        pay_core::test_rpc::install_blockhash_rpc();
         let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
         let state = Arc::new(
             PayerState::new(upstream, store, network_override.map(str::to_string), None).unwrap(),
