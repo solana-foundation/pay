@@ -235,17 +235,20 @@ pub struct DelegatedUsageAuthorization {
 /// request is authenticated before it is charged).
 ///
 /// [`SessionMpp`] creates one only after PayKit accepted the request's proof
-/// (`authenticate_use`). Every charge re-authenticates the same proof under
-/// its own idempotency key, `<request>:<n>`: a stream's successive charges
-/// are distinct requests to PayKit, and a retry of one charge after an
-/// ambiguous store result replays it instead of charging twice. The request
-/// key is generated per admitted request, never taken from the client: a
-/// client retry is a new request and is served (and charged) again.
+/// (`authenticate_use`). The request is one record in PayKit under its own
+/// idempotency key, charged up to its running total: each charge asks for
+/// what the request has been charged so far plus the new usage, so a retry
+/// of a charge after an ambiguous store result replays instead of charging
+/// twice, and a stream of charges stays one record rather than one per
+/// chunk. A request's charges run one at a time. The key is generated per
+/// admitted request, never taken from the client: a client retry is a new
+/// request and is served (and charged) again.
 pub struct DelegatedUse {
     payload: UsePayload,
     challenge_id: String,
     request_key: String,
-    charges: std::sync::atomic::AtomicU64,
+    /// What PayKit has charged this request so far.
+    charged: std::sync::atomic::AtomicU64,
 }
 
 impl DelegatedUse {
@@ -254,10 +257,12 @@ impl DelegatedUse {
         &self.payload.channel_id
     }
 
-    /// The idempotency key of this request's next charge.
-    fn next_charge_key(&self) -> String {
-        let n = self.charges.fetch_add(1, Ordering::SeqCst);
-        format!("{}:{n}", self.request_key)
+    /// The request's total once `amount` more is charged.
+    fn total_with(&self, amount: u64) -> Result<u64> {
+        self.charged
+            .load(Ordering::SeqCst)
+            .checked_add(amount)
+            .ok_or_else(|| Error::Mpp("delegated request total overflow".to_string()))
     }
 }
 
@@ -304,7 +309,7 @@ impl DelegatedUse {
             },
             challenge_id: "test-request".to_string(),
             request_key: format!("test-{}", uuid::Uuid::new_v4().simple()),
-            charges: std::sync::atomic::AtomicU64::new(0),
+            charged: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -2266,36 +2271,46 @@ impl SessionMpp {
             .authenticate_use(
                 &delegated.payload,
                 &delegated.challenge_id,
-                &delegated.next_charge_key(),
+                &delegated.request_key,
             )
             .await
             .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        let request_total = delegated.total_with(amount)?;
         let charge = self
             .server
-            .charge_operator_usage(&authenticated, signer.as_ref(), amount, move |state| {
-                if let Some(id) = &lease_id {
-                    if initial_cumulative != Some(state.cumulative) {
-                        return Err(pay_kit::mpp::Error::Other(
-                            "deployment reservation was already consumed".into(),
-                        ));
+            .charge_operator_request(
+                &authenticated,
+                signer.as_ref(),
+                request_total,
+                move |state| {
+                    if let Some(id) = &lease_id {
+                        if initial_cumulative != Some(state.cumulative) {
+                            return Err(pay_kit::mpp::Error::Other(
+                                "deployment reservation was already consumed".into(),
+                            ));
+                        }
+                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            return Err(pay_kit::mpp::Error::Other(
+                                "deployment request lifetime exceeded".into(),
+                            ));
+                        }
+                        pay_types::deployment_policy::require_reservation(
+                            state,
+                            id,
+                            amount,
+                            unix_millis(),
+                        )
+                        .map_err(|error| pay_kit::mpp::Error::Other(error.to_string()))?;
                     }
-                    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                        return Err(pay_kit::mpp::Error::Other(
-                            "deployment request lifetime exceeded".into(),
-                        ));
-                    }
-                    pay_types::deployment_policy::require_reservation(
-                        state,
-                        id,
-                        amount,
-                        unix_millis(),
-                    )
-                    .map_err(|error| pay_kit::mpp::Error::Other(error.to_string()))?;
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
             .await
             .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        delegated
+            .charged
+            .fetch_max(charge.request_total, Ordering::SeqCst);
         telemetry::record_payment_channel_voucher_cumulative(
             channel_id,
             self.currency(),
@@ -2307,7 +2322,7 @@ impl SessionMpp {
                 "mpp/session",
                 self.currency(),
                 self.network(),
-                amount,
+                charge.charged,
             );
         }
         self.record_committed_watermark(channel_id.to_string(), charge.cumulative);
@@ -3080,7 +3095,7 @@ impl SessionMpp {
             payload,
             challenge_id: challenge_id.to_string(),
             request_key,
-            charges: std::sync::atomic::AtomicU64::new(0),
+            charged: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
