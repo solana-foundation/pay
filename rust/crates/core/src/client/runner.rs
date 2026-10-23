@@ -1536,6 +1536,16 @@ fn payment_url(
     // Expands HTTPie's `:port/path` shorthand too, so the URL kept with an
     // activated subscription matches what the next request hits.
     let requested = resolve_request_url(args, tool).unwrap_or_default();
+    // A target without a scheme (`pay wget example.com/x`) cannot be placed,
+    // so neither can a redirect from it: the 402 may come from any origin.
+    if requested.is_empty() && chain.iter().any(|head| head.redirect_location().is_some()) {
+        return Err(Error::RequestValidation(
+            "the request was redirected before it asked for payment, and Pay cannot tell \
+             which origin asked because the URL has no scheme. Run it again with \
+             `https://` (or `http://`) in front of the URL."
+                .to_string(),
+        ));
+    }
     let answering = answering_url(&requested, chain);
     if answering != requested {
         ensure_replays_the_redirected_request(args, tool, chain, &answering)?;
@@ -3606,6 +3616,38 @@ mod pre_attach_tests {
             "{outcome:?}"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_redirected_402_for_a_url_without_a_scheme_is_not_paid() {
+        let chain = [
+            ResponseHead {
+                status: Some(302),
+                headers: vec![(
+                    "location".to_string(),
+                    "https://other.example/pay".to_string(),
+                )],
+            },
+            ResponseHead {
+                status: Some(402),
+                headers: vec![],
+            },
+        ];
+        let refused = payment_url(&s(&["-q", "example.com/x"]), ToolKind::Wget, &chain, "");
+        assert!(
+            matches!(&refused, Err(Error::RequestValidation(m)) if m.contains("no scheme")),
+            "{refused:?}"
+        );
+        // Without a redirect the 402 is the named URL's own: unchanged.
+        assert!(
+            payment_url(
+                &s(&["-q", "example.com/x"]),
+                ToolKind::Wget,
+                &chain[1..],
+                ""
+            )
+            .is_ok()
+        );
     }
 
     #[test]
