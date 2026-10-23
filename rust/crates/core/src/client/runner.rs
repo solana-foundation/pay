@@ -1539,6 +1539,14 @@ fn payment_url(
     let answering = answering_url(&requested, chain);
     if answering != requested {
         ensure_replays_the_redirected_request(args, tool, chain, &answering)?;
+        if retarget_args(args, tool, &requested, &answering).is_none() {
+            return Err(Error::RequestValidation(format!(
+                "the request was redirected to {answering}, which asked for payment, but \
+                 Pay cannot aim this command at {answering} without changing the request \
+                 (curl's `-G` builds the query from the request body). Send the request \
+                 to {answering} directly."
+            )));
+        }
     }
     if answering == named {
         return Ok(answering);
@@ -1763,6 +1771,9 @@ struct CommandLine<'a> {
 struct ParsedOption<'a> {
     name: OptionName<'a>,
     value: Option<&'a str>,
+    /// The arguments the option and its value occupy (a short-flag cluster
+    /// such as `-sG` is shared by every flag in it).
+    args: std::ops::RangeInclusive<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1791,6 +1802,7 @@ impl<'a> CommandLine<'a> {
         let mut targets = Vec::new();
         let mut i = 0;
         while i < args.len() {
+            let start = i;
             let arg = args[i].as_str();
             if arg == "--" {
                 targets.extend((i + 1..args.len()).map(|index| TargetArg {
@@ -1830,7 +1842,11 @@ impl<'a> CommandLine<'a> {
                         inline: inline_value.is_some(),
                     });
                 }
-                options.push(ParsedOption { name, value });
+                options.push(ParsedOption {
+                    name,
+                    value,
+                    args: start..=i.min(args.len() - 1),
+                });
             } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
                 let mut chars = shorts.char_indices();
                 while let Some((at, c)) = chars.next() {
@@ -1851,12 +1867,14 @@ impl<'a> CommandLine<'a> {
                         options.push(ParsedOption {
                             name: OptionName::Short(c),
                             value,
+                            args: start..=i.min(args.len() - 1),
                         });
                         break;
                     }
                     options.push(ParsedOption {
                         name: OptionName::Short(c),
                         value: None,
+                        args: start..=start,
                     });
                 }
             } else {
@@ -2536,8 +2554,15 @@ fn is_bodyless_read(args: &[String], tool: ToolKind) -> bool {
 
 /// `args` with the request URL `from` replaced by `to`, or `None` when the
 /// URL is not a single argument Pay can locate.
+///
+/// `to` is a URL the tool reached by following a redirect, query included,
+/// so the options that added to `from`'s query (curl's `--url-query`,
+/// HTTPie's `name==value` items) are dropped: applied again they would
+/// request `to?id=7&id=7`, not the resource that answered. curl's `-G` turns
+/// the request body into query parameters, and dropping it would leave the
+/// body to be sent instead, so a `-G` request is not retargeted at all.
 fn retarget_args(args: &[String], tool: ToolKind, from: &str, to: &str) -> Option<Vec<String>> {
-    let index = match transfer_options(tool) {
+    let (index, dropped) = match transfer_options(tool) {
         Some(spec) => {
             let line = CommandLine::parse(args, spec);
             let [target] = line.targets.as_slice() else {
@@ -2546,24 +2571,59 @@ fn retarget_args(args: &[String], tool: ToolKind, from: &str, to: &str) -> Optio
             if target.value != from {
                 return None;
             }
+            let mut dropped = Vec::new();
+            for option in &line.options {
+                match (tool, option.name) {
+                    (ToolKind::Curl, OptionName::Short('G') | OptionName::Long("get")) => {
+                        return None;
+                    }
+                    (ToolKind::Curl, OptionName::Long("url-query")) => {
+                        dropped.extend(option.args.clone());
+                    }
+                    _ => {}
+                }
+            }
             let mut retargeted = args.to_vec();
             retargeted[target.index] = if target.inline {
                 format!("--url={to}")
             } else {
                 to.to_string()
             };
-            return Some(retargeted);
+            return Some(without_args(retargeted, &dropped));
         }
-        None => args.iter().position(|arg| {
-            find_url_in_args(std::slice::from_ref(arg))
-                .or_else(|| httpie_url_shorthand(arg))
-                .as_deref()
-                == Some(from)
-        })?,
+        None => {
+            let index = args.iter().position(|arg| {
+                find_url_in_args(std::slice::from_ref(arg))
+                    .or_else(|| httpie_url_shorthand(arg))
+                    .as_deref()
+                    == Some(from)
+            })?;
+            let dropped: Vec<usize> = (index + 1..args.len())
+                .filter(|&at| is_httpie_query_item(&args[at]))
+                .collect();
+            (index, dropped)
+        }
     };
     let mut retargeted = args.to_vec();
     retargeted[index] = to.to_string();
-    Some(retargeted)
+    Some(without_args(retargeted, &dropped))
+}
+
+/// `args` without the arguments at `dropped`.
+fn without_args(args: Vec<String>, dropped: &[usize]) -> Vec<String> {
+    args.into_iter()
+        .enumerate()
+        .filter(|(at, _)| !dropped.contains(at))
+        .map(|(_, arg)| arg)
+        .collect()
+}
+
+/// An HTTPie request item that adds a query parameter: `name==value`.
+fn is_httpie_query_item(arg: &str) -> bool {
+    !arg.starts_with('-')
+        && arg
+            .split_once("==")
+            .is_some_and(|(name, _)| !name.contains(['=', ':']))
 }
 
 /// The paid request's args aimed at `resource_url`, the URL whose 402 the
@@ -3390,6 +3450,72 @@ mod pre_attach_tests {
     }
 
     #[test]
+    fn curl_pays_the_redirected_query_without_repeating_url_query() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                redirect_to("/paid?id=7"),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+                OK_RESPONSE.to_string(),
+            ],
+        );
+        let args = s(&["-sL", "--url-query", "id=7", &start]);
+        let RunOutcome::UnknownPaymentRequired { resource_url, .. } =
+            run_curl_inner(&args, &[]).unwrap()
+        else {
+            panic!("expected the 402 from /paid?id=7");
+        };
+        let paid = run_paid(ToolKind::Curl, &args, &resource_url, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(paid, RunOutcome::Completed { exit_code: 0, .. }));
+        let seen: Vec<(String, bool)> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let target = r.split_whitespace().nth(1).unwrap_or_default().to_string();
+                (target, r.contains(PAYMENT_SECRET))
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("/start?id=7".to_string(), false),
+                ("/paid?id=7".to_string(), false),
+                ("/paid?id=7".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn curl_refuses_to_pay_a_redirected_get_built_from_its_body() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /paid?id=7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+            ],
+        );
+        let outcome = run_curl_inner(&s(&["-sLG", "-d", "id=7", &start]), &[]);
+        assert!(
+            matches!(&outcome, Err(Error::RequestValidation(m)) if m.contains("-G")),
+            "{outcome:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn curl_pays_a_post_that_a_307_kept_a_post() {
         if check_command_exists("curl").is_err() {
             return;
@@ -3529,6 +3655,55 @@ mod pre_attach_tests {
         assert_eq!(
             paid_request_args(&s(&["-q", to]), ToolKind::Wget, to),
             s(&["-q", to])
+        );
+    }
+
+    #[test]
+    fn a_retargeted_request_keeps_the_query_of_the_url_it_reached() {
+        let to = "https://a.example/paid?id=7";
+        assert_eq!(
+            paid_request_args(
+                &s(&[
+                    "-sL",
+                    "--url-query",
+                    "id=7",
+                    "--url-query=b=2",
+                    "http://a.example/x"
+                ]),
+                ToolKind::Curl,
+                to
+            ),
+            s(&["-sL", to])
+        );
+        assert_eq!(
+            paid_request_args(
+                &s(&[
+                    "--follow",
+                    "http://a.example/x",
+                    "id==7",
+                    "Accept:x",
+                    "Q:a==b"
+                ]),
+                ToolKind::Httpie,
+                to
+            ),
+            s(&["--follow", to, "Accept:x", "Q:a==b"])
+        );
+        // `-G` moves the body into the query; Pay cannot retarget it.
+        assert_eq!(
+            retarget_args(
+                &s(&["-sG", "-d", "id=7", "http://a.example/x"]),
+                ToolKind::Curl,
+                "http://a.example/x",
+                to
+            ),
+            None
+        );
+        // Without a redirect, the caller's query options stay.
+        let named = "http://a.example/x";
+        assert_eq!(
+            paid_request_args(&s(&["--url-query", "id=7", named]), ToolKind::Curl, named),
+            s(&["--url-query", "id=7", named])
         );
     }
 
