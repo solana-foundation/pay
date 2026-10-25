@@ -348,6 +348,9 @@ struct SessionOperatorRuntime {
     /// Batched settlement worker, spawned lazily on first close (the signer is
     /// set after construction). Concurrent closes pack into shared txs.
     settlement_worker: Arc<tokio::sync::OnceCell<SettlementHandle>>,
+    /// Wakes the lifecycle runloop when a close defers its payout, so the
+    /// retry runs even with automatic close disabled.
+    payout_deferred: Arc<tokio::sync::Notify>,
 }
 
 impl SessionOperatorRuntime {
@@ -911,8 +914,9 @@ impl SessionOperatorRuntime {
                 }),
             )
             .await
-            .map(|_| ())
-            .map_err(|e| Error::Mpp(format!("Failed to record the deferred payout: {e}")))
+            .map_err(|e| Error::Mpp(format!("Failed to record the deferred payout: {e}")))?;
+        self.payout_deferred.notify_one();
+        Ok(())
     }
 
     /// Retry the payout of a channel a close sealed without distributing.
@@ -1315,6 +1319,8 @@ struct SessionLifecycleRunloop {
     /// Rotating offset into the active-channel set for the per-cycle settlement
     /// cap, so successive cycles cover different channels (bounded settle age).
     settlement_cursor: usize,
+    /// Whether a deferred payout may still be waiting for its retry.
+    deferred_payouts_pending: bool,
 }
 
 impl SessionLifecycleRunloop {
@@ -1332,6 +1338,7 @@ impl SessionLifecycleRunloop {
             reconciliation: SessionLifecycleReconciliation::Embedded,
             rx,
             settlement_cursor: 0,
+            deferred_payouts_pending: false,
         }
     }
 
@@ -1340,6 +1347,7 @@ impl SessionLifecycleRunloop {
         loop {
             if let Some((delay, close_due)) = self.next_wakeup() {
                 if accepting_commands {
+                    let payout_deferred = Arc::clone(&self.runtime.payout_deferred);
                     tokio::select! {
                         command = self.rx.recv() => {
                             if command.is_some() {
@@ -1350,6 +1358,9 @@ impl SessionLifecycleRunloop {
                                     break;
                                 }
                             }
+                        }
+                        _ = payout_deferred.notified() => {
+                            self.deferred_payouts_pending = true;
                         }
                         _ = tokio::time::sleep(delay) => {
                             self.run_due_work(close_due).await;
@@ -1363,11 +1374,18 @@ impl SessionLifecycleRunloop {
                     }
                 }
             } else if accepting_commands {
-                let command = self.rx.recv().await;
-                if command.is_some() {
-                    self.handle_command(command).await;
-                } else {
-                    break;
+                let payout_deferred = Arc::clone(&self.runtime.payout_deferred);
+                tokio::select! {
+                    command = self.rx.recv() => {
+                        if command.is_some() {
+                            self.handle_command(command).await;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = payout_deferred.notified() => {
+                        self.deferred_payouts_pending = true;
+                    }
                 }
             } else {
                 break;
@@ -1378,6 +1396,9 @@ impl SessionLifecycleRunloop {
     async fn run_due_work(&mut self, close_due: bool) {
         if close_due && self.reconciliation == SessionLifecycleReconciliation::Embedded {
             self.reconcile_persisted_ownership().await;
+            if self.deferred_payouts_pending {
+                self.retry_deferred_payouts().await;
+            }
             self.close_due_channels().await;
         }
         self.push_due_watermarks().await;
@@ -1409,6 +1430,9 @@ impl SessionLifecycleRunloop {
                 self.reconciliation = reconciliation;
                 if reconciliation == SessionLifecycleReconciliation::Embedded {
                     self.reconcile_persisted_ownership().await;
+                    // A persistent store may hold payouts deferred before a
+                    // restart; the first pass looks for them.
+                    self.deferred_payouts_pending = true;
                 }
             }
             Some(SessionLifecycleCommand::Touch {
@@ -1597,7 +1621,7 @@ impl SessionLifecycleRunloop {
 
     fn next_wakeup(&self) -> Option<(Duration, bool)> {
         let close = if self.reconciliation == SessionLifecycleReconciliation::Embedded
-            && self.close_delay.is_some()
+            && (self.close_delay.is_some() || self.deferred_payouts_pending)
         {
             Some(duration_until_next_boundary(self.close_batch_interval))
         } else {
@@ -1610,9 +1634,87 @@ impl SessionLifecycleRunloop {
     }
 
     /// Retry the payouts closes deferred because the payer's refund account
-    /// could not take the refund. Nothing else distributes them when the
-    /// lifecycle owns the channel (an in-memory store has no external
-    /// worker), so every pass tries again until they land.
+    /// could not take the refund. Nothing else distributes them in embedded
+    /// mode (an in-memory store has no external worker), so every pass tries
+    /// again until they land, whether or not automatic close is enabled.
+    async fn retry_deferred_payouts(&mut self) {
+        let states = match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(%error, "failed to enumerate deferred payment-channel payouts");
+                return;
+            }
+        };
+        let deferred = states
+            .into_iter()
+            .filter(|state| !state.sealed && distribution_deferred_at(state).is_some())
+            .map(|state| state.channel_id)
+            .collect::<Vec<_>>();
+        if deferred.is_empty() {
+            self.deferred_payouts_pending = false;
+            return;
+        }
+        let mut claimed = Vec::with_capacity(deferred.len());
+        for channel_id in deferred {
+            if self.claim_deferred_payout(&channel_id).await {
+                claimed.push(channel_id);
+            }
+        }
+        self.distribute_deferred_channels(claimed).await;
+    }
+
+    /// Lease a deferred payout to this runloop, so one replica retries it.
+    /// A record without a lifecycle (automatic close disabled) or with an
+    /// expired lease is taken over; an active lease of another gateway is not.
+    async fn claim_deferred_payout(&self, channel_id: &str) -> bool {
+        let now_ms = unix_millis();
+        let owner_id = self.owner.clone();
+        let leased_owner = self.leased_owner(now_ms);
+        let claimed = Arc::new(AtomicBool::new(false));
+        let claim = Arc::clone(&claimed);
+        let result = self
+            .runtime
+            .channel_store
+            .update_channel(
+                channel_id,
+                Box::new(move |current| {
+                    let mut current =
+                        current.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                    claim.store(false, Ordering::Release);
+                    if current.sealed || distribution_deferred_at(&current).is_none() {
+                        return Ok(current);
+                    }
+                    let claimable = current.lifecycle.as_ref().is_none_or(|lifecycle| {
+                        parse_lifecycle_owner_lease(&lifecycle.owner).is_none_or(
+                            |(current_owner, expires_at_ms)| {
+                                current_owner == owner_id || expires_at_ms <= now_ms
+                            },
+                        )
+                    });
+                    if claimable {
+                        let close_after = current
+                            .lifecycle
+                            .as_ref()
+                            .map_or(now_ms, |lifecycle| lifecycle.close_after);
+                        current.lifecycle = Some(ChannelLifecycle {
+                            owner: leased_owner,
+                            close_after,
+                        });
+                        claim.store(true, Ordering::Release);
+                    }
+                    Ok(current)
+                }),
+            )
+            .await;
+        match result {
+            Ok(_) => claimed.load(Ordering::Acquire),
+            Err(error) => {
+                tracing::debug!(channel_id, %error, "deferred payout lease changed; retrying next pass");
+                false
+            }
+        }
+    }
+
     async fn distribute_deferred_channels(&self, channel_ids: Vec<String>) {
         let retries = channel_ids.into_iter().map(|channel_id| {
             let runtime = self.runtime.clone();
@@ -1648,20 +1750,10 @@ impl SessionLifecycleRunloop {
                 return;
             }
         };
-        let deferred = states
-            .iter()
-            .filter(|state| !state.sealed && distribution_deferred_at(state).is_some())
-            .filter(|state| {
-                state
-                    .lifecycle
-                    .as_ref()
-                    .is_some_and(|lifecycle| self.owns_lifecycle(lifecycle))
-            })
-            .map(|state| state.channel_id.clone())
-            .collect::<Vec<_>>();
-        self.distribute_deferred_channels(deferred).await;
         let due = states
             .into_iter()
+            // Already sealed onchain; the payout retry finishes these.
+            .filter(|state| distribution_deferred_at(state).is_none())
             .filter(|state| !state.sealed && state.close_requested_at.is_none())
             .filter_map(|state| {
                 let owned = state
@@ -2092,6 +2184,7 @@ impl SessionMpp {
             delegated_voucher_lock,
             settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
+            payout_deferred: Arc::new(tokio::sync::Notify::new()),
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let runloop = SessionLifecycleRunloop::new(operator_runtime.clone(), rx);
@@ -6254,6 +6347,17 @@ mod tests {
     /// lands once the payer repairs the account; until then nothing is sent.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_deferred_payout_is_distributed_once_the_refund_account_is_repaired() {
+        deferred_payout_retry(Duration::from_millis(10)).await;
+    }
+
+    /// Automatic close disabled: a client close can still defer the payout,
+    /// and nothing but the lifecycle retries it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_payout_is_retried_with_automatic_close_disabled() {
+        deferred_payout_retry(Duration::ZERO).await;
+    }
+
+    async fn deferred_payout_retry(close_delay: Duration) {
         use axum::{Json, Router, routing::post};
         use base64::Engine as _;
         use pay_kit::mpp::program::payment_channels::generated::generated::{
@@ -6391,7 +6495,12 @@ mod tests {
                 .with_blockhash_cache(test_blockhash_cache())
                 .with_payment_channel_signer(Arc::clone(&signer)),
         );
-        session.start_lifecycle_runloop(Duration::from_millis(10));
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            close_delay,
+            Duration::from_millis(10),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::Embedded,
+        );
         let challenge = session.challenge(None).unwrap();
         let channel_id = channel.to_string();
         seed_channel(
@@ -6405,8 +6514,16 @@ mod tests {
             None,
         )
         .await;
-        // The embedded lifecycle owns the channel.
+        // With automatic close the embedded lifecycle owns the channel;
+        // without it the touch is a no-op and the record has no lifecycle.
         session.touch_channel(channel_id.clone()).await.unwrap();
+        assert_eq!(
+            stored_channel(&session, &channel_id)
+                .await
+                .lifecycle
+                .is_some(),
+            !close_delay.is_zero()
+        );
         let runtime = &session.operator_runtime;
         runtime
             .request_server_close(&channel_id, None)
