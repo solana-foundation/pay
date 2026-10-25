@@ -2678,6 +2678,8 @@ impl SessionMpp {
             .await
             .map_err(|error| Error::PaymentRejected(error.to_string()))?;
         let request_total = delegated.total_with(amount)?;
+        let charged_before = request_total - amount;
+        let request_key = delegated.request_key.clone();
         let charge = self
             .server
             .charge_operator_request(
@@ -2685,6 +2687,19 @@ impl SessionMpp {
                 signer.as_ref(),
                 request_total,
                 move |state| {
+                    // PayKit keeps only the latest requests' records. Once this
+                    // request's record is evicted, PayKit would charge its
+                    // whole running total again; refuse instead.
+                    if charged_before > 0
+                        && !state
+                            .processed_uses
+                            .iter()
+                            .any(|recorded| recorded.idempotency_key == request_key)
+                    {
+                        return Err(pay_kit::mpp::Error::Other(
+                            "the request's charge record was evicted".into(),
+                        ));
+                    }
                     if let Some(id) = &lease_id {
                         if initial_cumulative != Some(state.cumulative) {
                             return Err(pay_kit::mpp::Error::Other(
@@ -6323,6 +6338,67 @@ mod tests {
         let params = session.server.seal_params(&channel).await.unwrap();
         assert_eq!(params.settled, 100);
         assert_eq!(session.committed_watermark(&channel), Some(100));
+    }
+
+    /// PayKit keeps only the latest requests' charge records. A stream whose
+    /// record another replica's requests evicted must not be charged its
+    /// whole running total again when it resumes.
+    #[tokio::test]
+    async fn a_delegated_request_whose_record_was_evicted_is_not_charged_again() {
+        use pay_kit::mpp::server::session::MAX_PROCESSED_USES;
+
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let operator = signer.pubkey();
+        let mut config = test_session_config();
+        config.operator = operator.to_string();
+        config.voucher_signer = SessionVoucherSigner::Operator;
+        let session = SessionMpp::new(config, "test-secret")
+            .with_blockhash_cache(test_blockhash_cache())
+            .with_payment_channel_signer(Arc::clone(&signer));
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        seed_channel(
+            &session,
+            &channel,
+            CAP,
+            &operator.to_string(),
+            "operator",
+            &challenge.id,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await;
+
+        let stream = DelegatedUse::for_test(&session, &channel).await;
+        let streamed = session.authorize_delegated_usage(&stream, 100).await;
+        assert_eq!(streamed.unwrap().cumulative, 100);
+        // Positive control: while the record is kept the stream resumes.
+        let resumed = session.authorize_delegated_usage(&stream, 1).await;
+        assert_eq!(resumed.unwrap().cumulative, 101);
+
+        for _ in 0..MAX_PROCESSED_USES {
+            let other = DelegatedUse::for_test(&session, &channel).await;
+            session.authorize_delegated_usage(&other, 1).await.unwrap();
+        }
+        let watermark = 101 + MAX_PROCESSED_USES as u64;
+        assert_eq!(
+            stored_channel(&session, &channel).await.cumulative,
+            watermark
+        );
+
+        let error = session
+            .authorize_delegated_usage(&stream, 50)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("charge record was evicted"),
+            "got: {error}"
+        );
+        assert_eq!(
+            stored_channel(&session, &channel).await.cumulative,
+            watermark,
+            "nothing is charged once the record is gone"
+        );
     }
 
     #[tokio::test]
