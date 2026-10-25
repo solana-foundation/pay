@@ -249,7 +249,14 @@ mod tests {
         let credential = signed_credential(&server(&spec), plan_id).await;
         server(&spec).verify(&credential).unwrap();
 
-        spec.expires_at = Some(rfc3339_from_now(3600));
+        // A cutoff strictly before the credential's period end, however
+        // close the wall clock is to it.
+        let period_secs = 30 * 86_400;
+        let plan_created_at = spec.plan_created_at.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let period_end =
+            plan_created_at + ((now - plan_created_at) / period_secs + 1) * period_secs;
+        spec.expires_at = Some(rfc3339_from_now(((period_end - now) / 2).clamp(1, 3600)));
         server(&spec).verify(&credential).unwrap_err();
         spec.expires_at = Some(rfc3339_from_now(-1));
         server(&spec).verify(&credential).unwrap_err();
