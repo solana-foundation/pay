@@ -24,7 +24,10 @@ pub struct ValidatedProvider {
     pub spec: pay_types::registry::ProviderFrontmatter,
 }
 
-pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
+pub async fn run(
+    params: Params,
+    files: Option<&crate::context::LocalFiles>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let content = params.content.clone();
     let output_path = params.output_path.clone();
 
@@ -48,7 +51,13 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                 validated.spec.meta.service_url,
             );
 
-            if let Some(path) = output_path.as_deref() {
+            if let (Some(path), None) = (output_path.as_deref(), files) {
+                is_error = true;
+                response.push_str(&format!(
+                    "\nDid not write {path}: this hosted server has no access to your files. \
+                     Save the content above yourself.\n"
+                ));
+            } else if let (Some(path), Some(files)) = (output_path.as_deref(), files) {
                 let path_errors = validate_output_path(path, &validated.spec.name);
                 if !path_errors.is_empty() {
                     is_error = true;
@@ -62,13 +71,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                         recommended_paths(&validated.spec.name)
                     ));
                 } else {
-                    match std::fs::create_dir_all(
-                        std::path::Path::new(path)
-                            .parent()
-                            .unwrap_or(std::path::Path::new(".")),
-                    )
-                    .and_then(|_| std::fs::write(path, &params.content))
-                    {
+                    match files.write(Path::new(path), params.content.as_bytes()) {
                         Ok(_) => {
                             response.push_str(&format!("\nWrote to: {path}\n"));
                             response.push_str(&format!(
@@ -252,6 +255,33 @@ fn normal_components(path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hosted_create_skill_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers/acme/test-api/PAY.md");
+        let params = || Params {
+            content: valid_md().to_string(),
+            output_path: Some(path.to_string_lossy().into_owned()),
+        };
+
+        let result = run(params(), None).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("Did not write")
+        );
+        assert!(!path.exists());
+
+        // Control: on the user's machine the validated file is written.
+        let files = crate::context::LocalFiles::on_user_machine();
+        let result = run(params(), Some(&files)).await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), valid_md());
+    }
 
     fn valid_md() -> &'static str {
         "---\nname: test-api\ntitle: \"Test API\"\ndescription: \"A test API for unit tests — validates that the create_skill tool works correctly end to end\"\nuse_case: \"testing validation logic, verifying CI checks work correctly\"\ncategory: devtools\nservice_url: https://test.example.com\nendpoints:\n  - method: POST\n    path: \"v1/run\"\n    description: \"Run a test suite against the target service and return results\"\n---\n\nSome markdown body.\n"

@@ -136,7 +136,7 @@ pub async fn run(
     peer: Option<Peer<RoleServer>>,
     scope: &CallScope,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    if !scope.body_files {
+    if scope.local_files.is_none() {
         return Ok(super::tool_error(
             "sell_inference serves inference from the machine the agent runs on, and this \
              hosted session has none. Run `pay mcp` locally to sell inference.",

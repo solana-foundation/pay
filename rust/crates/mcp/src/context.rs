@@ -7,7 +7,9 @@
 //! use, the overrides, and how approval works. [`LocalContext`] reproduces
 //! the laptop behaviour; pay-connect supplies a tenant context.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pay_core::accounts::{AccountsStore, FileAccountsStore};
 use pay_core::signer::AuthOverride;
@@ -34,9 +36,9 @@ pub struct CallScope {
     pub approval: Arc<dyn ApprovalPolicy>,
     /// Optional fail-closed payment permissions configured for local MCP.
     pub payment_permissions: Option<Arc<crate::McpPermissions>>,
-    /// Whether `curl` may read a local file as the request body. Only a
-    /// process on the user's own machine has files to read.
-    pub body_files: bool,
+    /// The user's own filesystem, present only when the server runs on the
+    /// user's machine. Without it no tool reads or writes files.
+    pub local_files: Option<LocalFiles>,
     /// Network destinations `curl` may reach. Hosted contexts must use the
     /// public-only policy; local contexts retain localhost/dev access.
     pub outbound_policy: pay_core::client::fetch::OutboundPolicy,
@@ -70,6 +72,50 @@ impl CallScope {
         self.rpc_url_override
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url)
+    }
+}
+
+/// Access to the filesystem of the machine the user sits at. Tools read
+/// request bodies and leave response artefacts only through this, so a
+/// hosted context, which has none, cannot touch the server's disk.
+#[derive(Debug, Clone)]
+pub struct LocalFiles {
+    _private: (),
+}
+
+impl LocalFiles {
+    /// Only for a server running on the user's own machine.
+    pub fn on_user_machine() -> Self {
+        Self { _private: () }
+    }
+
+    /// Write `bytes` to a new file in the temp directory and return its path.
+    pub(crate) fn write_temp(
+        &self,
+        prefix: &str,
+        extension: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        use std::io::Write;
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}-{nanos}-{sequence}{extension}"));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(bytes)?;
+        Ok(path)
+    }
+
+    /// Write `bytes` to `path`, creating parent directories.
+    pub(crate) fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(path, bytes)
     }
 }
 
@@ -184,7 +230,7 @@ impl PayContext for LocalContext {
             rpc_url_override: env_non_empty("PAY_RPC_URL"),
             approval: Arc::new(LocalApproval),
             payment_permissions: self.permissions.clone(),
-            body_files: true,
+            local_files: Some(LocalFiles::on_user_machine()),
             outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         })
     }
@@ -203,7 +249,7 @@ mod tests {
             rpc_url_override: Some("http://127.0.0.1:8899".to_string()),
             approval: Arc::new(LocalApproval),
             payment_permissions: None,
-            body_files: true,
+            local_files: Some(LocalFiles::on_user_machine()),
             outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         };
         assert_eq!(

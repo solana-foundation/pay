@@ -80,7 +80,9 @@ struct TopupResponse {
     account: String,
     funding_address: String,
     target_url: String,
-    png_path: String,
+    /// Absent on a hosted server, which keeps no files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    png_path: Option<String>,
     mime_type: &'static str,
     amount_usdc: Option<f64>,
     instructions: &'static str,
@@ -150,9 +152,12 @@ pub async fn run(
         Ok(png) => png,
         Err(err) => return Ok(super::tool_error(format!("Failed to encode QR PNG: {err}"))),
     };
-    let path = match write_qr_png(params.method, &account.address, &png) {
-        Ok(path) => path,
-        Err(err) => return Ok(super::tool_error(format!("Failed to write QR PNG: {err}"))),
+    let png_path = match scope.local_files.as_ref() {
+        Some(files) => match write_qr_png(files, params.method, &account.address, &png) {
+            Ok(path) => Some(path.to_string_lossy().to_string()),
+            Err(err) => return Ok(super::tool_error(format!("Failed to write QR PNG: {err}"))),
+        },
+        None => None,
     };
 
     let response = TopupResponse {
@@ -161,7 +166,7 @@ pub async fn run(
         account: account.label,
         funding_address: account.address,
         target_url,
-        png_path: path.to_string_lossy().to_string(),
+        png_path,
         mime_type: "image/png",
         amount_usdc: response_amount,
         instructions,
@@ -247,6 +252,7 @@ fn format_usdc_amount(amount: f64) -> String {
 }
 
 fn write_qr_png(
+    files: &crate::context::LocalFiles,
     method: TopupMethod,
     account: &str,
     png: &[u8],
@@ -256,14 +262,11 @@ fn write_qr_png(
         .filter(|c| c.is_ascii_alphanumeric())
         .take(12)
         .collect();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path =
-        std::env::temp_dir().join(format!("pay-topup-{}-{}-{ts}.png", method.as_str(), prefix));
-    std::fs::write(&path, png)?;
-    Ok(path)
+    files.write_temp(
+        &format!("pay-topup-{}-{prefix}", method.as_str()),
+        ".png",
+        png,
+    )
 }
 
 fn encode_qr_png(data: &str, pixels_per_module: u32) -> Result<Vec<u8>, String> {
@@ -327,6 +330,45 @@ fn write_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope(local_files: Option<crate::context::LocalFiles>) -> crate::context::CallScope {
+        crate::context::CallScope {
+            accounts: std::sync::Arc::new(pay_core::accounts::MemoryAccountsStore::new()),
+            network_override: None,
+            account_override: None,
+            rpc_url_override: None,
+            approval: std::sync::Arc::new(crate::context::LocalApproval),
+            payment_permissions: None,
+            local_files,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::PublicInternetOnly,
+        }
+    }
+
+    async fn topup_json(scope: &crate::context::CallScope) -> serde_json::Value {
+        let params = Params {
+            method: TopupMethod::MobileWallet,
+            onramp: None,
+            account: Some("11111111111111111111111111111111".to_string()),
+            amount_usdc: None,
+            pixels_per_module: None,
+        };
+        let result = run(params, scope).await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(result.content[1].as_image().is_some());
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn hosted_topup_writes_no_png_file() {
+        let json = topup_json(&scope(None)).await;
+        assert!(json.get("png_path").is_none(), "{json}");
+
+        // Control: locally the PNG is also saved for the user to open.
+        let json = topup_json(&scope(Some(crate::context::LocalFiles::on_user_machine()))).await;
+        let path = json["png_path"].as_str().expect("png_path");
+        assert!(std::fs::read(path).unwrap().starts_with(b"\x89PNG"));
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn mobile_wallet_url_matches_tui_topup_shape() {

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use pay_core::accounts::MemoryAccountsStore;
-use pay_mcp::{ApprovalPolicy, CallScope, PayContext, PayMcp};
+use pay_mcp::{ApprovalPolicy, CallScope, LocalFiles, PayContext, PayMcp};
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ErrorCode},
@@ -28,7 +28,9 @@ impl ApprovalPolicy for NoPayment {
     }
 }
 
-struct TestContext;
+struct TestContext {
+    hosted: bool,
+}
 
 impl PayContext for TestContext {
     fn scope(&self, _: &RequestContext<RoleServer>) -> Result<CallScope, rmcp::ErrorData> {
@@ -39,7 +41,7 @@ impl PayContext for TestContext {
             rpc_url_override: None,
             approval: Arc::new(NoPayment),
             payment_permissions: None,
-            body_files: false,
+            local_files: (!self.hosted).then(LocalFiles::on_user_machine),
             outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         })
     }
@@ -56,6 +58,8 @@ struct HttpCase {
     content_type: String,
     body: Vec<u8>,
     fault: Option<String>,
+    #[serde(default)]
+    hosted: bool,
 }
 
 impl HttpCase {
@@ -65,6 +69,7 @@ impl HttpCase {
             content_type: content_type.to_string(),
             body: body.to_vec(),
             fault: None,
+            hosted: false,
         }
     }
 }
@@ -86,6 +91,8 @@ struct WorkerResult {
     status: ExitStatus,
     timed_out: bool,
     output: String,
+    /// Files the worker left in its temporary directory.
+    leftover_files: Vec<String>,
 }
 
 fn worker_command(case: &HttpCase) -> Command {
@@ -146,7 +153,13 @@ fn run_worker(mut command: Command, timeout: Duration) -> WorkerResult {
     };
     let status = worker.0.wait().unwrap();
     drop(worker);
-    let output = std::fs::read_to_string(log_path).unwrap();
+    let output = std::fs::read_to_string(&log_path).unwrap();
+    let leftover_files = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| *path != log_path)
+        .map(|path| path.display().to_string())
+        .collect();
     directory
         .close()
         .expect("remove all worker files after reaping");
@@ -154,6 +167,7 @@ fn run_worker(mut command: Command, timeout: Duration) -> WorkerResult {
         status,
         timed_out,
         output,
+        leftover_files,
     }
 }
 
@@ -221,7 +235,12 @@ async fn call_http(case: &HttpCase) -> CallToolResult {
     let (server_transport, client_transport) = tokio::io::duplex(65536);
     // Poll both initialization futures together; there is no detached startup task.
     let (server, client) = tokio::join!(
-        PayMcp::with_context(Arc::new(TestContext)).serve(server_transport),
+        if case.hosted {
+            PayMcp::with_hosted_context(Arc::new(TestContext { hosted: true }))
+        } else {
+            PayMcp::with_context(Arc::new(TestContext { hosted: false }))
+        }
+        .serve(server_transport),
         ().serve(client_transport),
     );
     let server = server.unwrap();
@@ -284,7 +303,7 @@ async fn check_http(case: &HttpCase) {
     );
     let wire = serde_json::to_value(&result).unwrap();
     assert_eq!(wire["isError"], expected_error);
-    let expected_blocks = if case.content_type == "application/pdf" {
+    let expected_blocks = if case.content_type == "application/pdf" && !case.hosted {
         2
     } else {
         1
@@ -295,6 +314,13 @@ async fn check_http(case: &HttpCase) {
         let image = content.as_image().unwrap();
         assert_eq!(image.mime_type, case.content_type);
         assert_eq!(STANDARD.decode(&image.data).unwrap(), case.body);
+    } else if case.hosted
+        && (case.content_type == "application/octet-stream"
+            || case.content_type == "application/pdf")
+    {
+        let text = &content.as_text().unwrap().text;
+        assert!(text.contains("omitted"), "{text}");
+        assert!(!text.contains(" written to "), "{text}");
     } else if case.content_type == "application/octet-stream"
         || case.content_type == "application/pdf"
     {
@@ -394,6 +420,21 @@ fn supervisor_reaps_stalled_and_panicking_requests() {
                 result.output
             );
         }
+    }
+}
+
+#[test]
+fn hosted_binary_responses_leave_no_files() {
+    for (mime, body) in [
+        ("application/octet-stream", &b"\x00\xff\xfe\x80"[..]),
+        ("application/pdf", &b"%PDF-1.7\x00\xff"[..]),
+    ] {
+        let mut case = HttpCase::new(200, mime, body);
+        case.hosted = true;
+        let result = run_worker(worker_command(&case), TEST_TIMEOUT);
+        let leftover_files = result.leftover_files.clone();
+        assert_worker_succeeded(result);
+        assert!(leftover_files.is_empty(), "{mime}: {leftover_files:?}");
     }
 }
 

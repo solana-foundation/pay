@@ -856,8 +856,9 @@ impl PayContext for CloudContext {
             // Fail closed on challenge-selected terms: mainnet stablecoins
             // only, before any payment is built or signed.
             payment_permissions: Some(Arc::new(record.payment_permissions())),
-            // The server has no access to the caller's files.
-            body_files: false,
+            // The server has no access to the caller's files, and must not
+            // leave tenant response artefacts on its own disk.
+            local_files: None,
             // Arbitrary public APIs remain available, but tenant-controlled
             // requests cannot reach Cloud Run metadata, loopback, or private
             // services from this privileged process.

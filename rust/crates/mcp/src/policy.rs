@@ -588,7 +588,7 @@ mod tests {
                 ledger,
             }),
             payment_permissions: None,
-            body_files: false,
+            local_files: None,
             outbound_policy: pay_core::client::fetch::OutboundPolicy::PublicInternetOnly,
         }
     }

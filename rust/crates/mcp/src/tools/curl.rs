@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::context::LocalFiles;
+
 /// Reusable MPP session authorizations for one MCP server connection.
 ///
 /// The `PayMcp` instance is created for one stdio MCP connection. Keys are
@@ -230,12 +232,6 @@ pub async fn run(
             "Pass either `body` or `body_file`, not both.",
         ));
     }
-    if params.body_file.is_some() && !scope.body_files {
-        return Ok(super::tool_error(
-            "`body_file` is not available on this server: it has no access to your files. \
-             Pass the body inline with `body`.",
-        ));
-    }
 
     let method = match normalize_http_method(params.method.as_deref()) {
         Ok(method) => method,
@@ -254,10 +250,18 @@ pub async fn run(
                 )));
             }
         },
-        (None, Some(path)) => match approved_body_file(&peer, &path, &method, &params.url).await {
-            Ok(body) => (Some(body.body), Some(body.content_type)),
-            Err(error) => return Ok(super::tool_error(error)),
-        },
+        (None, Some(path)) => {
+            let Some(files) = scope.local_files.as_ref() else {
+                return Ok(super::tool_error(
+                    "`body_file` is not available on this server: it has no access to your files. \
+                     Pass the body inline with `body`.",
+                ));
+            };
+            match approved_body_file(files, &peer, &path, &method, &params.url).await {
+                Ok(body) => (Some(body.body), Some(body.content_type)),
+                Err(error) => return Ok(super::tool_error(error)),
+            }
+        }
         (None, None) => (None, None),
         (Some(_), Some(_)) => unreachable!("body/body_file conflict returned above"),
     };
@@ -271,6 +275,7 @@ pub async fn run(
         RedirectPolicy::Follow
     };
 
+    let files = scope.local_files.clone();
     let response = tokio::task::spawn_blocking(move || {
         do_paid_fetch(
             &method,
@@ -287,7 +292,7 @@ pub async fn run(
     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
     match response {
-        Ok(response) => Ok(response.into_tool_result()),
+        Ok(response) => Ok(response.into_tool_result(files.as_ref())),
         Err(err) => Ok(pay_error_to_tool_result(err)),
     }
 }
@@ -300,6 +305,7 @@ struct ApprovedBodyFile {
 /// Resolve a local body file, obtain user approval, then snapshot the approved
 /// file. A changed file is rejected rather than silently sent after approval.
 async fn approved_body_file(
+    _files: &crate::context::LocalFiles,
     peer: &rmcp::Peer<rmcp::service::RoleServer>,
     requested_path: &str,
     method: &str,
@@ -526,10 +532,15 @@ fn destination_label(url: &str) -> String {
 ///   `inlineData`, OpenAI `b64_json`, data: URLs) into files and caps the
 ///   inline size so a multi-megabyte JSON envelope never floods the context
 /// - empty body → `Content::text(empty_message)`
+///
+/// Without [`LocalFiles`] (hosted) nothing is written to disk: files are
+/// omitted with a note, and inline work is bounded by
+/// [`MAX_HOSTED_INLINE_BYTES`].
 fn body_to_mcp_content(
     body: Vec<u8>,
     content_type: Option<&str>,
     empty_message: &str,
+    files: Option<&LocalFiles>,
 ) -> Vec<Content> {
     if body.is_empty() {
         return vec![Content::text(empty_message.to_string())];
@@ -537,13 +548,19 @@ fn body_to_mcp_content(
 
     let mime = mime_from_content_type(content_type);
 
-    if mime.starts_with("image/") {
+    if mime.starts_with("image/") && (files.is_some() || body.len() <= MAX_HOSTED_INLINE_BYTES) {
         let encoded = general_purpose::STANDARD.encode(&body);
         return vec![Content::image(encoded, mime)];
     }
 
     if is_binary_content_type(&mime) {
-        return match write_body_to_tempfile(&body, &mime) {
+        let Some(files) = files else {
+            return vec![Content::text(format!(
+                "Binary response ({} bytes, {mime}) omitted: this hosted server cannot hand files to your client.",
+                body.len()
+            ))];
+        };
+        return match write_body_to_tempfile(files, &body, &mime) {
             Ok(path) => {
                 let note = Content::text(format!(
                     "Binary response ({} bytes, {mime}) written to {path}",
@@ -567,7 +584,9 @@ fn body_to_mcp_content(
         };
     }
 
-    text_body_to_content(String::from_utf8_lossy(&body).into_owned())
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+    text_body_to_content(text, files)
 }
 
 fn mime_from_content_type(content_type: Option<&str>) -> String {
@@ -594,20 +613,8 @@ fn is_binary_content_type(mime: &str) -> bool {
     true
 }
 
-fn write_body_to_tempfile(body: &[u8], mime: &str) -> std::io::Result<String> {
-    use std::io::Write;
-    let extension = extension_for_mime(mime);
-    let mut path = std::env::temp_dir();
-    let name = format!(
-        "pay-curl-{}{extension}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    path.push(name);
-    let mut file = std::fs::File::create(&path)?;
-    file.write_all(body)?;
+fn write_body_to_tempfile(files: &LocalFiles, body: &[u8], mime: &str) -> std::io::Result<String> {
+    let path = files.write_temp("pay-curl", &extension_for_mime(mime), body)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -633,11 +640,14 @@ const TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 /// Minimum *decoded* size for a base64 string embedded in JSON to be worth
 /// extracting to a file. Smaller blobs (icons, thumbnails) stay inline.
 const MIN_BASE64_EXTRACT_BYTES: usize = 8 * 1024;
+/// Hosted bound on a body we inline as an image or parse for embedded media.
+/// Parsing into `serde_json::Value` can cost ~20x the body size.
+const MAX_HOSTED_INLINE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Media decoded out of a JSON envelope and written to disk.
+/// Media decoded out of a JSON envelope, written to disk when local.
 struct ExtractedMedia {
     mime: String,
-    path: String,
+    path: Option<String>,
     /// Standard-base64 re-encoding of the decoded bytes, for `Content::image`.
     encoded: String,
     bytes: usize,
@@ -651,13 +661,14 @@ struct ExtractedMedia {
 /// JSON with a `<mime, N bytes → /path>` placeholder. Images are additionally
 /// surfaced as `Content::image` so the model can see them. Whatever text
 /// remains is size-capped by [`text_content_capped`].
-fn text_body_to_content(text: String) -> Vec<Content> {
-    if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+fn text_body_to_content(text: String, files: Option<&LocalFiles>) -> Vec<Content> {
+    let scan = files.is_some() || text.len() <= MAX_HOSTED_INLINE_BYTES;
+    if scan && let Ok(mut value) = serde_json::from_str::<Value>(&text) {
         let mut extracted = Vec::new();
-        extract_media_from_json(&mut value, &mut extracted);
+        extract_media_from_json(&mut value, &mut extracted, files);
         if !extracted.is_empty() {
             let slimmed = serde_json::to_string(&value).unwrap_or(text);
-            let mut content = vec![text_content_capped(slimmed)];
+            let mut content = vec![text_content_capped(slimmed, files)];
             for media in &extracted {
                 if let Some(block) = media_as_content_block(media) {
                     content.push(block);
@@ -666,7 +677,7 @@ fn text_body_to_content(text: String) -> Vec<Content> {
             return content;
         }
     }
-    vec![text_content_capped(text)]
+    vec![text_content_capped(text, files)]
 }
 
 /// Surface extracted media as a native MCP content block.
@@ -685,11 +696,10 @@ fn media_as_content_block(media: &ExtractedMedia) -> Option<Content> {
         || media.mime.starts_with("video/")
         || media.mime == "application/pdf"
     {
-        return Some(resource_link_for_file(
-            &media.path,
-            &media.mime,
-            media.bytes,
-        ));
+        return media
+            .path
+            .as_deref()
+            .map(|path| resource_link_for_file(path, &media.mime, media.bytes));
     }
     None
 }
@@ -711,12 +721,19 @@ fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> Content {
 /// Return the text as inline `Content::text`, or — when it exceeds
 /// [`MAX_TEXT_INLINE_BYTES`] — spill the full body to a tempfile and return a
 /// short preview plus the path, so a huge response can't flood the context.
-fn text_content_capped(text: String) -> Content {
+fn text_content_capped(text: String, files: Option<&LocalFiles>) -> Content {
     if text.len() <= MAX_TEXT_INLINE_BYTES {
         return Content::text(text);
     }
     let preview: String = text.chars().take(TEXT_PREVIEW_BYTES).collect();
-    match write_body_to_tempfile(text.as_bytes(), "text/plain") {
+    let Some(files) = files else {
+        return Content::text(format!(
+            "Large text response ({} bytes) truncated. First {} chars:\n{preview}",
+            text.len(),
+            preview.len()
+        ));
+    };
+    match write_body_to_tempfile(files, text.as_bytes(), "text/plain") {
         Ok(path) => Content::text(format!(
             "Large text response ({} bytes) written to {path}. First {} chars:\n{preview}",
             text.len(),
@@ -732,7 +749,11 @@ fn text_content_capped(text: String) -> Content {
 
 /// Recursively walk a JSON value, extracting large base64 media strings to
 /// files and replacing each with a `<mime, N bytes → /path>` placeholder.
-fn extract_media_from_json(value: &mut Value, out: &mut Vec<ExtractedMedia>) {
+fn extract_media_from_json(
+    value: &mut Value,
+    out: &mut Vec<ExtractedMedia>,
+    files: Option<&LocalFiles>,
+) {
     match value {
         Value::Object(map) => {
             let sibling_mime = mime_hint_from_object(map);
@@ -743,21 +764,21 @@ fn extract_media_from_json(value: &mut Value, out: &mut Vec<ExtractedMedia>) {
                 };
                 if let Value::String(s) = slot
                     && let Some(media) =
-                        try_extract_base64_media(s.as_str(), sibling_mime.as_deref())
+                        try_extract_base64_media(s.as_str(), sibling_mime.as_deref(), files)
                 {
-                    *slot = Value::String(format!(
-                        "<{}, {} bytes → {}>",
-                        media.mime, media.bytes, media.path
-                    ));
+                    *slot = Value::String(match &media.path {
+                        Some(path) => format!("<{}, {} bytes → {path}>", media.mime, media.bytes),
+                        None => format!("<{}, {} bytes>", media.mime, media.bytes),
+                    });
                     out.push(media);
                     continue;
                 }
-                extract_media_from_json(slot, out);
+                extract_media_from_json(slot, out, files);
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                extract_media_from_json(item, out);
+                extract_media_from_json(item, out, files);
             }
         }
         _ => {}
@@ -788,7 +809,11 @@ fn mime_hint_from_object(map: &serde_json::Map<String, Value>) -> Option<String>
 /// file. Returns `None` for ordinary strings — only large blobs that decode as
 /// base64 *and* are identifiable as media (by magic bytes, a data: URL prefix,
 /// or a sibling MIME hint) are extracted.
-fn try_extract_base64_media(s: &str, hint: Option<&str>) -> Option<ExtractedMedia> {
+fn try_extract_base64_media(
+    s: &str,
+    hint: Option<&str>,
+    files: Option<&LocalFiles>,
+) -> Option<ExtractedMedia> {
     // Cheap length gate: decoded ≈ 3/4 of encoded, so a sub-threshold string
     // can't possibly yield enough bytes. Avoids decoding every short field.
     if s.len() < MIN_BASE64_EXTRACT_BYTES {
@@ -821,7 +846,10 @@ fn try_extract_base64_media(s: &str, hint: Option<&str>) -> Option<ExtractedMedi
         .or_else(|| hint.map(str::to_string))
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let path = write_body_to_tempfile(&decoded, &mime).ok()?;
+    let path = match files {
+        Some(files) => Some(write_body_to_tempfile(files, &decoded, &mime).ok()?),
+        None => None,
+    };
     Some(ExtractedMedia {
         encoded: general_purpose::STANDARD.encode(&decoded),
         bytes: decoded.len(),
@@ -917,7 +945,7 @@ struct PaidFetchResult {
 }
 
 impl PaidFetchResult {
-    fn into_tool_result(self) -> CallToolResult {
+    fn into_tool_result(self, files: Option<&LocalFiles>) -> CallToolResult {
         let is_error = self.exit_code != 0;
         let content = body_to_mcp_content(
             self.body,
@@ -927,6 +955,7 @@ impl PaidFetchResult {
             } else {
                 "Request completed."
             },
+            files,
         );
         if is_error {
             CallToolResult::error(content)
@@ -1829,6 +1858,10 @@ mod tests {
     }
     use super::*;
 
+    fn local() -> Option<&'static LocalFiles> {
+        Some(Box::leak(Box::new(LocalFiles::on_user_machine())))
+    }
+
     #[test]
     fn interpret_retry_preserves_exit_code_and_response() {
         use pay_core::client::runner::RunOutcome;
@@ -1858,7 +1891,7 @@ mod tests {
                 } else {
                     "Bad Gateway"
                 };
-                let result = response.into_tool_result();
+                let result = response.into_tool_result(local());
                 assert_eq!(result.is_error, Some(exit_code != 0));
                 assert_eq!(result.content[0].as_text().unwrap().text, expected_text);
             }
@@ -1877,7 +1910,7 @@ mod tests {
         .unwrap();
         assert_eq!(response.body, body);
         assert_eq!(response.content_type.as_deref(), Some("image/png"));
-        let result = response.into_tool_result();
+        let result = response.into_tool_result(local());
         assert_eq!(result.is_error, Some(true));
         let image = result.content[0].as_image().unwrap();
         assert_eq!(image.mime_type, "image/png");
@@ -2179,7 +2212,7 @@ mod tests {
             rpc_url_override: None,
             approval: Arc::new(crate::context::LocalApproval),
             payment_permissions: None,
-            body_files: true,
+            local_files: Some(crate::context::LocalFiles::on_user_machine()),
             outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         };
         let result = do_paid_fetch(
@@ -2395,7 +2428,7 @@ mod tests {
     #[test]
     fn body_to_mcp_content_routes_text_as_text() {
         let body = b"plain string".to_vec();
-        let content = body_to_mcp_content(body, Some("text/plain"), "empty");
+        let content = body_to_mcp_content(body, Some("text/plain"), "empty", local());
         assert_eq!(content.len(), 1);
         let text = content[0].as_text().expect("text content").text.clone();
         assert_eq!(text, "plain string");
@@ -2404,7 +2437,7 @@ mod tests {
     #[test]
     fn body_to_mcp_content_routes_json_as_text() {
         let body = br#"{"ok":true}"#.to_vec();
-        let content = body_to_mcp_content(body, Some("application/json"), "empty");
+        let content = body_to_mcp_content(body, Some("application/json"), "empty", local());
         let text = content[0].as_text().expect("text content").text.clone();
         assert_eq!(text, r#"{"ok":true}"#);
     }
@@ -2412,7 +2445,8 @@ mod tests {
     #[test]
     fn body_to_mcp_content_strips_charset_parameter() {
         let body = b"hello".to_vec();
-        let content = body_to_mcp_content(body, Some("text/plain; charset=utf-8"), "empty");
+        let content =
+            body_to_mcp_content(body, Some("text/plain; charset=utf-8"), "empty", local());
         let text = content[0].as_text().expect("text content").text.clone();
         assert_eq!(text, "hello");
     }
@@ -2421,7 +2455,7 @@ mod tests {
     fn body_to_mcp_content_routes_image_as_base64_image() {
         // Real PNG signature so encoding is meaningful.
         let body: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        let content = body_to_mcp_content(body.clone(), Some("image/png"), "empty");
+        let content = body_to_mcp_content(body.clone(), Some("image/png"), "empty", local());
         assert_eq!(content.len(), 1);
         let image = content[0].as_image().expect("image content");
         assert_eq!(image.mime_type, "image/png");
@@ -2432,7 +2466,7 @@ mod tests {
     #[test]
     fn body_to_mcp_content_spills_pdf_to_tempfile() {
         let body: Vec<u8> = b"%PDF-1.4 fake content with \xFF\xFE bytes".to_vec();
-        let content = body_to_mcp_content(body.clone(), Some("application/pdf"), "empty");
+        let content = body_to_mcp_content(body.clone(), Some("application/pdf"), "empty", local());
         let text = content[0].as_text().expect("text content").text.clone();
         // Text content should describe the spill and contain a path
         assert!(text.contains("Binary response"));
@@ -2447,7 +2481,12 @@ mod tests {
     #[test]
     fn body_to_mcp_content_octet_stream_spills_to_tempfile() {
         let body: Vec<u8> = vec![0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD];
-        let content = body_to_mcp_content(body.clone(), Some("application/octet-stream"), "empty");
+        let content = body_to_mcp_content(
+            body.clone(),
+            Some("application/octet-stream"),
+            "empty",
+            local(),
+        );
         let text = content[0].as_text().expect("text content").text.clone();
         let path = text.split(" written to ").nth(1).expect("path in message");
         let on_disk = std::fs::read(path).expect("tempfile readable");
@@ -2457,7 +2496,12 @@ mod tests {
 
     #[test]
     fn body_to_mcp_content_empty_body_returns_message() {
-        let content = body_to_mcp_content(vec![], Some("application/json"), "Request completed.");
+        let content = body_to_mcp_content(
+            vec![],
+            Some("application/json"),
+            "Request completed.",
+            local(),
+        );
         let text = content[0].as_text().expect("text content").text.clone();
         assert_eq!(text, "Request completed.");
     }
@@ -2467,7 +2511,7 @@ mod tests {
         // No content-type → treat as octet-stream (safer than mangling
         // potential binary payload through UTF-8 lossy decode).
         let body: Vec<u8> = vec![0xFF, 0xFE, 0x00];
-        let content = body_to_mcp_content(body.clone(), None, "empty");
+        let content = body_to_mcp_content(body.clone(), None, "empty", local());
         let text = content[0].as_text().expect("text content").text.clone();
         assert!(text.contains("Binary response"));
         let path = text.split(" written to ").nth(1).expect("path in message");
@@ -2482,7 +2526,7 @@ mod tests {
         // it as text and replace bad sequences (data is lost, but caller
         // chose the text route by labeling it text/plain).
         let body: Vec<u8> = vec![b'h', b'i', 0xFF, 0xFE];
-        let content = body_to_mcp_content(body, Some("text/plain"), "empty");
+        let content = body_to_mcp_content(body, Some("text/plain"), "empty", local());
         let text = content[0].as_text().expect("text content").text.clone();
         assert!(text.starts_with("hi"));
         assert!(text.contains('\u{FFFD}'));
@@ -2546,7 +2590,7 @@ mod tests {
                 ]}
             }]
         });
-        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), local());
 
         // Slimmed JSON text + an inline image the model can see.
         assert!(content.len() >= 2);
@@ -2568,7 +2612,7 @@ mod tests {
         // No mime hint — extraction must rely on PNG magic bytes.
         let (raw, b64) = media_b64(PNG_SIG, 9000);
         let body = serde_json::json!({ "data": [{ "b64_json": b64 }] });
-        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), local());
 
         let text = content[0].as_text().expect("text").text.clone();
         assert!(text.contains("image/png") && !text.contains(&b64));
@@ -2581,7 +2625,7 @@ mod tests {
     fn json_data_url_image_extracts() {
         let (_, b64) = media_b64(PNG_SIG, 9000);
         let body = serde_json::json!({ "image": format!("data:image/png;base64,{b64}") });
-        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), local());
 
         let text = content[0].as_text().expect("text").text.clone();
         assert!(text.contains("image/png"));
@@ -2594,7 +2638,7 @@ mod tests {
         // MP3 ID3 header → audio/mpeg, surfaced as a resource_link (not inline).
         let (_, b64) = media_b64(b"ID3\x03\x00\x00\x00", 9000);
         let body = serde_json::json!({ "audio": { "mimeType": "audio/mpeg", "data": b64 } });
-        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), local());
 
         let text = content[0].as_text().expect("text").text.clone();
         assert!(text.contains("audio/mpeg"));
@@ -2614,7 +2658,7 @@ mod tests {
         // Below MIN_BASE64_EXTRACT_BYTES → left untouched in the JSON.
         let small = general_purpose::STANDARD.encode(PNG_SIG);
         let body = serde_json::json!({ "inlineData": { "mimeType": "image/png", "data": small } });
-        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), local());
         assert_eq!(content.len(), 1);
         assert!(content[0].as_text().unwrap().text.contains(&small));
     }
@@ -2625,7 +2669,7 @@ mod tests {
         // be written to a file (could be a signature, token, opaque blob).
         let b64 = general_purpose::STANDARD.encode(vec![0x01u8; 9000]);
         let body = serde_json::json!({ "signature": b64 });
-        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), local());
         assert_eq!(content.len(), 1);
         assert!(content[0].as_text().unwrap().text.contains(&b64));
     }
@@ -2633,7 +2677,7 @@ mod tests {
     #[test]
     fn large_plain_text_spills_with_preview() {
         let big = "x".repeat(MAX_TEXT_INLINE_BYTES + 100);
-        let content = text_body_to_content(big.clone());
+        let content = text_body_to_content(big.clone(), local());
         assert_eq!(content.len(), 1);
         let text = content[0].as_text().unwrap().text.clone();
         assert!(text.contains("Large text response"));
@@ -2651,7 +2695,7 @@ mod tests {
     fn top_level_pdf_gets_resource_link() {
         let mut body = b"%PDF-1.4".to_vec();
         body.resize(64, 0x20);
-        let content = body_to_mcp_content(body.clone(), Some("application/pdf"), "empty");
+        let content = body_to_mcp_content(body.clone(), Some("application/pdf"), "empty", local());
         let note = content[0].as_text().expect("text note").text.clone();
         let path = note.split(" written to ").nth(1).expect("path").to_string();
         let link = content
@@ -2661,6 +2705,84 @@ mod tests {
         assert_eq!(link.mime_type.as_deref(), Some("application/pdf"));
         assert_eq!(link.size, Some(body.len() as u64));
         let _ = std::fs::remove_file(path);
+    }
+
+    // Hosted servers (no `LocalFiles`) must keep response handling off disk
+    // and bounded in memory.
+
+    #[test]
+    fn hosted_binary_response_is_omitted_not_spilled() {
+        let body = vec![0x00, 0x01, 0xFF];
+        let content = body_to_mcp_content(body, Some("application/octet-stream"), "empty", None);
+        assert_eq!(content.len(), 1);
+        let text = &content[0].as_text().unwrap().text;
+        assert!(
+            text.contains("3 bytes") && text.contains("omitted"),
+            "{text}"
+        );
+        assert!(!text.contains(" written to "), "{text}");
+    }
+
+    #[test]
+    fn hosted_large_text_is_truncated_not_spilled() {
+        let big = "x".repeat(MAX_TEXT_INLINE_BYTES + 100);
+        let content = text_body_to_content(big.clone(), None);
+        let text = &content[0].as_text().unwrap().text;
+        assert!(
+            text.contains("truncated") && !text.contains(" written to "),
+            "{text}"
+        );
+        assert!(text.len() < TEXT_PREVIEW_BYTES * 2);
+    }
+
+    #[test]
+    fn hosted_json_image_is_inlined_without_a_file() {
+        let (raw, b64) = media_b64(PNG_SIG, 9000);
+        let audio = media_b64(b"ID3\x03\x00\x00\x00", 9000).1;
+        let body = serde_json::json!({
+            "image": { "mimeType": "image/png", "data": b64 },
+            "audio": { "mimeType": "audio/mpeg", "data": audio },
+        });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap(), None);
+        let text = &content[0].as_text().unwrap().text;
+        assert!(text.contains("<image/png, 9000 bytes>"), "{text}");
+        assert!(text.contains("<audio/mpeg, 9000 bytes>"), "{text}");
+        assert!(!text.contains('→'), "{text}");
+        let image = content.iter().find_map(|c| c.as_image()).expect("image");
+        assert_eq!(general_purpose::STANDARD.decode(&image.data).unwrap(), raw);
+        assert!(content.iter().all(|c| c.as_resource_link().is_none()));
+    }
+
+    #[test]
+    fn hosted_oversized_json_is_not_parsed() {
+        let (_, b64) = media_b64(PNG_SIG, 9000);
+        let padding = "a".repeat(MAX_HOSTED_INLINE_BYTES);
+        let body = serde_json::to_string(&serde_json::json!({
+            "image": { "mimeType": "image/png", "data": b64 },
+            "padding": padding,
+        }))
+        .unwrap();
+
+        let hosted = text_body_to_content(body.clone(), None);
+        assert_eq!(hosted.len(), 1);
+        assert!(hosted[0].as_text().unwrap().text.contains("truncated"));
+
+        // Control: locally the same body is scanned and its image extracted.
+        let local = text_body_to_content(body, local());
+        let text = local[0].as_text().unwrap().text.clone();
+        assert!(local.iter().any(|c| c.as_image().is_some()));
+        let _ = std::fs::remove_file(path_from_placeholder(&text));
+    }
+
+    #[test]
+    fn hosted_oversized_image_is_omitted() {
+        let mut body = PNG_SIG.to_vec();
+        body.resize(MAX_HOSTED_INLINE_BYTES + 1, 0);
+        let content = body_to_mcp_content(body.clone(), Some("image/png"), "empty", None);
+        assert!(content[0].as_text().unwrap().text.contains("omitted"));
+        body.truncate(MAX_HOSTED_INLINE_BYTES);
+        let content = body_to_mcp_content(body, Some("image/png"), "empty", None);
+        assert!(content[0].as_image().is_some());
     }
 
     #[test]

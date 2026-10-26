@@ -245,8 +245,15 @@ For detailed authoring guidance, use the Pay skill reference
     async fn create_skill(
         &self,
         Parameters(params): Parameters<tools::create_skill::Params>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::create_skill::run(params).await
+        // Validation needs no identity; writing needs the caller's files.
+        let files = self
+            .context
+            .scope(&ctx)
+            .ok()
+            .and_then(|scope| scope.local_files);
+        tools::create_skill::run(params, files.as_ref()).await
     }
 }
 
