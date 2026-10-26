@@ -4,7 +4,8 @@
 //! from the 401 on `/mcp`, register themselves (RFC 7591), send the user
 //! through `/oauth/authorize` with PKCE, and exchange the code for a bearer
 //! at `/oauth/token`. Tokens are opaque random strings stored hashed: a
-//! one-hour access token and a thirty-day refresh token, rotated on use.
+//! one-hour access token and a thirty-day refresh token (a day for a
+//! guest), rotated on use.
 //!
 //! What "the user" is here is still thin: approving a request mints an
 //! opaque subject. The tenant store binds that subject to a wallet next.
@@ -29,6 +30,15 @@ use crate::protocol::{ApiError, is_base64url_alphabet, random_token, sha256_hex}
 
 pub const ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 pub const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Refresh lifetime of a grant no login session stands behind (a guest's):
+/// an idle guest reconnects in one click, and a burst of free guest grants
+/// holds its rows for a day, not a month.
+pub const GUEST_REFRESH_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Most guest grant families held at once. Guests cost nothing to mint, so
+/// they share this slice of the token table and never take the rest.
+pub const GUEST_FAMILIES: usize = MAX_ROWS / 8;
+/// Most grant families one subject holds; its oldest makes way for a new one.
+pub const FAMILIES_PER_SUBJECT: usize = 32;
 /// A code must be exchanged within this window after approval.
 pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// A pending authorization waits this long for the user to decide. Long
@@ -577,6 +587,30 @@ impl Store {
         family: &str,
     ) -> Result<TokenResponse, TokenError> {
         tokens.retain(|_, token| now <= token.expires_at);
+        let guest = session.is_none();
+        if guest
+            && tokens
+                .values()
+                .filter(|token| token.kind == TokenKind::Refresh && token.session.is_none())
+                .count()
+                >= GUEST_FAMILIES
+        {
+            return Err(TokenError::temporarily_unavailable(
+                "Too many guest connections right now. Sign in to connect, or try again later.",
+            ));
+        }
+        // A subject at its quota gives up its own oldest grant, never
+        // anyone else's.
+        let own = tokens
+            .values()
+            .filter(|token| token.kind == TokenKind::Refresh && token.subject == subject);
+        if own.clone().count() >= FAMILIES_PER_SUBJECT
+            && let Some(oldest) = own
+                .min_by_key(|token| token.expires_at)
+                .map(|token| token.family.clone())
+        {
+            tokens.retain(|_, token| token.family != oldest);
+        }
         if tokens.len() > MAX_ROWS.saturating_sub(2) {
             return Err(TokenError::temporarily_unavailable(
                 "The token store is full. Try again later.",
@@ -584,9 +618,14 @@ impl Store {
         }
         let access_token = random_token();
         let refresh_token = format!("{family}.{}", random_token());
+        let refresh_ttl = if guest {
+            GUEST_REFRESH_TTL
+        } else {
+            REFRESH_TTL
+        };
         for (token, kind, ttl) in [
             (&access_token, TokenKind::Access, ACCESS_TTL),
-            (&refresh_token, TokenKind::Refresh, REFRESH_TTL),
+            (&refresh_token, TokenKind::Refresh, refresh_ttl),
         ] {
             tokens.insert(
                 sha256_hex(token),
@@ -2014,6 +2053,98 @@ mod tests {
         );
     }
 
+    /// A grant for `subject`, approved in `session` (none for a guest).
+    fn grant(
+        store: &Store,
+        client: &Client,
+        subject: &str,
+        session: Option<&str>,
+    ) -> Result<TokenResponse, TokenError> {
+        let mut request = pending_for(client);
+        request.created_at = store.now();
+        let id = request.id.clone();
+        store.create_pending(request).unwrap();
+        let (_, code) = store
+            .approve_in_session(&id, subject, session, || true)
+            .unwrap();
+        store.exchange_code(&client.client_id, &code, VERIFIER, None)
+    }
+
+    /// Mint guest grants until the store refuses one; how many it took.
+    fn fill_with_guests(store: &Store, client: &Client) -> usize {
+        (0..MAX_ROWS)
+            .take_while(|i| grant(store, client, &format!("guest_{i}"), None).is_ok())
+            .count()
+    }
+
+    /// Free guest grants fill only their own slice of the token table: a
+    /// signed-in user still connects, and live guests still refresh.
+    #[test]
+    fn guest_grants_cannot_crowd_out_signed_in_users() {
+        let now = std::sync::Arc::new(Mutex::new(Instant::now()));
+        let clock_now = now.clone();
+        let store = Store::with_clock(
+            "https://cloud.test",
+            std::sync::Arc::new(move || *clock_now.lock().unwrap()),
+        );
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let first_guest = grant(&store, &client, "guest_first", None).unwrap();
+
+        assert_eq!(fill_with_guests(&store, &client), GUEST_FAMILIES - 1);
+        assert_eq!(
+            grant(&store, &client, "guest_late", None)
+                .unwrap_err()
+                .error,
+            "temporarily_unavailable"
+        );
+        let user = grant(&store, &client, "sub_user", Some("sess_user")).unwrap();
+        assert!(store.authenticate(&user.access_token).is_some());
+        let rotated = store
+            .refresh(&client.client_id, &first_guest.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&rotated.access_token).is_some());
+
+        // Guest rows lapse after a day; a signed-in user's last a month.
+        *now.lock().unwrap() += GUEST_REFRESH_TTL + Duration::from_secs(1);
+        assert!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .is_err()
+        );
+        let user = store
+            .refresh(&client.client_id, &user.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&user.access_token).is_some());
+        assert!(grant(&store, &client, "guest_late", None).is_ok());
+    }
+
+    /// One account looping approvals recycles its own grants only.
+    #[test]
+    fn a_subject_at_its_quota_gives_up_only_its_own_oldest_grant() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let bystander = grant(&store, &client, "sub_b", Some("sess_b")).unwrap();
+        let mut own: Vec<TokenResponse> = (0..=FAMILIES_PER_SUBJECT)
+            .map(|_| grant(&store, &client, "sub_a", Some("sess_a")).unwrap())
+            .collect();
+        assert!(
+            store
+                .refresh(&client.client_id, &own[0].refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&own[0].access_token).is_none());
+        own.remove(0);
+        for pair in &own {
+            assert!(store.authenticate(&pair.access_token).is_some());
+        }
+        assert!(store.authenticate(&bystander.access_token).is_some());
+        assert!(
+            store
+                .refresh(&client.client_id, &bystander.refresh_token)
+                .is_ok()
+        );
+    }
+
     /// A session signed out while its approval was still in flight gets no
     /// code: liveness is checked as the code is stored.
     #[test]
@@ -3394,6 +3525,48 @@ mod tests {
                 json["access_token"].as_str().unwrap().to_string(),
                 json["refresh_token"].as_str().unwrap().to_string(),
             )
+        }
+
+        /// connect/02: a burst of free guest grants cannot lock signed-in
+        /// users out of the token endpoint, and the guest path says why.
+        #[tokio::test]
+        async fn a_guest_burst_leaves_room_for_privy_sign_ins() {
+            let (app, state, fake, _) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let store = state.oauth().unwrap();
+            let client = store.client(&client_id).unwrap();
+            assert_eq!(fill_with_guests(store, &client), GUEST_FAMILIES);
+
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let approved = post_json_as(
+                &app,
+                &approve_path(&request_id),
+                json!({ "guest": true }),
+                None,
+            )
+            .await;
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let refused = post_form(
+                &app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                ],
+            )
+            .await;
+            assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(refused.json()["error"], "temporarily_unavailable");
+
+            let (access, _) = privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            assert!(topup_text(&app, &access).await.contains(ADDRESS));
         }
 
         #[tokio::test]
