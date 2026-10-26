@@ -1074,9 +1074,10 @@ pub fn build_batch_payment_checked(
     // Opening and topping up move additional funds into escrow, so both must
     // go through wallet approval. A voucher/authorization only spends capacity
     // covered by the already-approved deposit and can reuse its resident
-    // signer for the lifetime of this host process.
+    // signer for the lifetime of this host process, but only for an origin
+    // that already passed approval: another origin needs its own.
     let cached_signer = if escrow_amount.is_none() {
-        cache.signer(requirements)?
+        cache.signer(requirements, resource_url)?
     } else {
         None
     };
@@ -1188,7 +1189,7 @@ pub fn build_batch_payment_checked(
     };
 
     cache.insert(requirements, channel)?;
-    cache.insert_signer(requirements, signer.clone())?;
+    cache.insert_signer(requirements, resource_url, signer.clone())?;
     let header = batch_client::encode_payment_header(requirements, payload)
         .map_err(|e| Error::Mpp(format!("Failed to encode batch payment: {e}")))?;
     cache.register_submission(requirements, &submission)?;
@@ -1462,6 +1463,119 @@ mod tests {
             crate::client::runner::RunOutcome::X402BatchChallenge { challenge, .. } => *challenge,
             other => panic!("expected a batch challenge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cached_batch_signer_needs_fresh_approval_for_another_origin() {
+        use std::sync::{Arc, Mutex};
+        struct Recording(Arc<Mutex<usize>>);
+        impl crate::keystore::AuthGate for Recording {
+            fn authenticate(
+                &self,
+                intent: &crate::keystore::AuthIntent,
+            ) -> pay_keystore::Result<()> {
+                assert!(intent.moves_money());
+                *self.0.lock().unwrap() += 1;
+                Err(pay_keystore::Error::AuthDenied(
+                    "refused in test".to_string(),
+                ))
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+        const KEYPAIR: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        const MERCHANT: &str = "https://merchant.example/v1/data";
+        crate::test_rpc::install_blockhash_rpc();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(&path, serde_json::to_string(&KEYPAIR.to_vec()).unwrap()).unwrap();
+        let memory = pay_kit::solana_keychain::MemorySigner::from_bytes(&KEYPAIR).unwrap();
+        let signer = Arc::new(crate::signer::ResolvedSigner::local(
+            &crate::backend::Ephemeral,
+            memory,
+        ));
+        let payer = signer.pubkey().to_string();
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some(payer.clone()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = MemoryAccountsStore::with_file(file);
+
+        // A channel funded (and approved) for the merchant's origin.
+        let challenge = batch_challenge_with_min_deposit("0");
+        let requirements = &challenge.requirements;
+        let cache = crate::client::batch::BatchChannelCache::default();
+        cache
+            .insert(
+                requirements,
+                pay_kit::x402::client::batch_settlement::BatchChannel::new(
+                    solana_pubkey::Pubkey::new_unique(),
+                    pay_kit::x402::batch_settlement::BatchChannelConfig {
+                        payer: payer.clone(),
+                        payer_authorizer: payer.clone(),
+                        receiver: requirements.pay_to.clone(),
+                        receiver_authorizer: None,
+                        token: requirements.asset.clone(),
+                        withdraw_delay: requirements.extra.withdraw_delay,
+                        salt: "1".to_string(),
+                        open_slot: 1,
+                        voucher_signer: None,
+                    },
+                    0,
+                    1_000_000,
+                ),
+            )
+            .unwrap();
+        cache
+            .insert_signer(requirements, Some(MERCHANT), Arc::clone(&signer))
+            .unwrap();
+
+        let prompts = Arc::new(Mutex::new(0));
+        let build = |resource_url: &str| {
+            build_batch_payment_checked(
+                &challenge,
+                &store,
+                &cache,
+                None,
+                Some("mainnet"),
+                Some("default"),
+                Some(resource_url),
+                Some(Box::new(Recording(prompts.clone()))),
+                &|escrow| panic!("covered voucher must not escrow {escrow}"),
+            )
+        };
+
+        // Another origin copying the merchant's public terms is asked for
+        // approval rather than spending the escrow silently.
+        let err = build("https://attacker.example/x").expect_err("refused approval");
+        assert!(matches!(err, Error::PaymentRejected(_)), "{err}");
+        assert_eq!(*prompts.lock().unwrap(), 1);
+
+        // Control: the approved origin reuses the resident signer without a
+        // prompt (the build then stops at the test RPC's terms lookup).
+        let _ = build(MERCHANT);
+        assert_eq!(*prompts.lock().unwrap(), 1);
     }
 
     #[test]

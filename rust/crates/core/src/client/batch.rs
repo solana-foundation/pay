@@ -17,13 +17,14 @@
 //! charges remain separate from this confirmed watermark until signed evidence
 //! arrives. Missing receipts never manufacture spend or trigger extra funding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pay_kit::x402::batch_settlement::{
     BatchAuthorization, BatchPayload, BatchRequirements, BatchSettlementResponse, BatchVoucher,
 };
 use pay_kit::x402::client::batch_settlement::BatchChannel;
+use pay_kit::x402::solana_keychain::SolanaSigner;
 
 // Re-exported so hosts (the MCP server, a proxy) can hold and confirm
 // batch-settlement state without taking a direct pay-kit dependency.
@@ -135,7 +136,21 @@ pub struct BatchChannelCache {
     /// Signers for funded channels remain resident for the host process. The
     /// escrow open/top-up is still approval-gated; requests spending capacity
     /// that was already approved must not reopen the keystore every time.
-    signers: Arc<Mutex<HashMap<String, Arc<crate::signer::ResolvedSigner>>>>,
+    signers: Arc<Mutex<HashMap<String, ResidentSigner>>>,
+}
+
+/// A funded channel's signer and the origins whose requests were approved to
+/// spend from it. Channel terms are public, so another origin advertising the
+/// same terms must not spend the escrow without its own approval.
+struct ResidentSigner {
+    signer: Arc<crate::signer::ResolvedSigner>,
+    origins: HashSet<String>,
+}
+
+/// `scheme://host:port` of `url`, or `None` when it has no tuple origin.
+fn origin_of(url: Option<&str>) -> Option<String> {
+    let origin = url::Url::parse(url?).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
 struct CachedChannel {
@@ -263,27 +278,48 @@ impl BatchChannelCache {
             .is_some_and(|entry| entry.pending_funding.is_some()))
     }
 
+    /// The resident signer for this offer, only for an origin that already
+    /// passed approval on it.
     pub(crate) fn signer(
         &self,
         requirements: &BatchRequirements,
+        resource_url: Option<&str>,
     ) -> Result<Option<Arc<crate::signer::ResolvedSigner>>> {
+        let Some(origin) = origin_of(resource_url) else {
+            return Ok(None);
+        };
         let signers = self
             .signers
             .lock()
             .map_err(|_| Error::Mpp("batch-settlement signer cache lock poisoned".to_string()))?;
-        Ok(signers.get(&cache_key(requirements)).cloned())
+        Ok(signers
+            .get(&cache_key(requirements))
+            .filter(|resident| resident.origins.contains(&origin))
+            .map(|resident| Arc::clone(&resident.signer)))
     }
 
+    /// Keep `signer` for this offer and admit `resource_url`'s origin to it.
     pub(crate) fn insert_signer(
         &self,
         requirements: &BatchRequirements,
+        resource_url: Option<&str>,
         signer: Arc<crate::signer::ResolvedSigner>,
     ) -> Result<()> {
         let mut signers = self
             .signers
             .lock()
             .map_err(|_| Error::Mpp("batch-settlement signer cache lock poisoned".to_string()))?;
-        signers.insert(cache_key(requirements), signer);
+        let key = cache_key(requirements);
+        let mut origins = signers
+            .remove(&key)
+            .filter(|resident| {
+                SolanaSigner::pubkey(resident.signer.as_ref())
+                    == SolanaSigner::pubkey(signer.as_ref())
+            })
+            .map(|resident| resident.origins)
+            .unwrap_or_default();
+        origins.extend(origin_of(resource_url));
+        signers.insert(key, ResidentSigner { signer, origins });
         Ok(())
     }
 
@@ -739,7 +775,6 @@ fn decode_settlement(headers: &[(String, String)]) -> Option<BatchSettlementResp
 mod tests {
     use super::*;
     use pay_kit::x402::batch_settlement::{BatchChannelConfig, BatchExtra};
-    use pay_kit::x402::solana_keychain::SolanaSigner;
 
     fn requirements(pay_to: &str, fee_payer: &str) -> BatchRequirements {
         BatchRequirements {
@@ -1713,6 +1748,44 @@ mod tests {
         attempt
     }
 
+    const MERCHANT: &str = "https://merchant.example/v1";
+
+    #[test]
+    fn resident_signer_serves_only_approved_origins() {
+        let signer = |seed: u8| {
+            let memory = pay_kit::solana_keychain::MemorySigner::from_bytes(
+                &solana_keypair::Keypair::new_from_array([seed; 32]).to_bytes(),
+            )
+            .unwrap();
+            Arc::new(crate::signer::ResolvedSigner::local(
+                &crate::backend::Ephemeral,
+                memory,
+            ))
+        };
+        let cache = BatchChannelCache::new();
+        let requirements = requirements("payTo1", "feePayer1");
+        let reused = |url: Option<&str>| cache.signer(&requirements, url).unwrap().is_some();
+
+        cache
+            .insert_signer(&requirements, Some(MERCHANT), signer(1))
+            .unwrap();
+        assert!(reused(Some("https://merchant.example/other?q=1")));
+        assert!(!reused(Some("https://attacker.example/v1")));
+        assert!(!reused(Some("http://merchant.example/v1")));
+        assert!(!reused(Some("https://merchant.example:8443/v1")));
+        assert!(!reused(None));
+
+        // A request approved for another origin admits it alongside the first.
+        cache
+            .insert_signer(&requirements, Some("https://second.example/"), signer(1))
+            .unwrap();
+        assert!(reused(Some(MERCHANT)) && reused(Some("https://second.example/x")));
+
+        // A different payer starts over; no origin is admitted without a URL.
+        cache.insert_signer(&requirements, None, signer(2)).unwrap();
+        assert!(!reused(Some(MERCHANT)) && !reused(None));
+    }
+
     #[test]
     fn funded_channel_signer_is_reused_only_for_the_same_payer() {
         const KEYPAIR: [u8; 64] = [
@@ -1730,7 +1803,7 @@ mod tests {
         let requirements = requirements("payTo1", "feePayer1");
 
         cache
-            .insert_signer(&requirements, Arc::clone(&signer))
+            .insert_signer(&requirements, Some(MERCHANT), Arc::clone(&signer))
             .unwrap();
         cache
             .insert(
@@ -1753,7 +1826,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        let reused = cache.signer(&requirements).unwrap().unwrap();
+        let reused = cache
+            .signer(&requirements, Some(MERCHANT))
+            .unwrap()
+            .unwrap();
         assert!(Arc::ptr_eq(&signer, &reused));
 
         assert!(
@@ -1763,6 +1839,11 @@ mod tests {
                 .is_none()
         );
         assert!(cache.get(&requirements).unwrap().is_none());
-        assert!(cache.signer(&requirements).unwrap().is_none());
+        assert!(
+            cache
+                .signer(&requirements, Some(MERCHANT))
+                .unwrap()
+                .is_none()
+        );
     }
 }
