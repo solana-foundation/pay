@@ -54,6 +54,8 @@ pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest a worker's long-poll may ask to wait.
 pub const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+/// Largest create or reprice body; endpoint terms are a few hundred bytes.
+const MAX_TERMS_BYTES: usize = 64 * 1024;
 /// Largest body of one worker push; workers split their output to fit.
 const MAX_PUSH_BYTES: usize = pay_core::sell_inference::MAX_WORKER_PUSH_BYTES;
 const OWNER_TOKEN_PREFIX: &str = "pso_";
@@ -612,8 +614,17 @@ pub struct Fail {
 /// Seller and buyer routes.
 pub fn router(state: Arc<SellState>) -> Router {
     Router::new()
-        .route("/v1/endpoints", post(create))
-        .route("/v1/endpoints/{id}", get(view).patch(update).delete(delete))
+        .route(
+            "/v1/endpoints",
+            post(create).layer(DefaultBodyLimit::max(MAX_TERMS_BYTES)),
+        )
+        .route(
+            "/v1/endpoints/{id}",
+            get(view)
+                .patch(update)
+                .delete(delete)
+                .layer(DefaultBodyLimit::max(MAX_TERMS_BYTES)),
+        )
         .route("/v1/endpoints/{id}/queue/next", get(next_request))
         .route(
             "/v1/endpoints/{id}/requests/{request}/chunks",
@@ -2531,6 +2542,47 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn endpoint_terms_are_small_and_currencies_a_set() {
+        let state = state();
+        let app = router(state.clone());
+        let create = |currencies: Value| {
+            let mut body = per_request(0.02);
+            body["currencies"] = currencies;
+            send(
+                &app,
+                Method::POST,
+                "/v1/endpoints",
+                Some("creator"),
+                Some(body),
+            )
+        };
+
+        let (status, _, err) = create(json!(["USDC", "usdc"])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err.to_string().contains("more than once"), "{err}");
+        let (status, _, _) = create(json!(vec!["USDC"; 20_000])).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(state.registry.is_empty());
+
+        let (status, _, view) = create(json!(["USDC", "USDT"])).await;
+        assert_eq!(status, StatusCode::CREATED, "{view}");
+        assert_eq!(view["currencies"], json!(["USDC", "USDT"]));
+        let mut models = serde_json::Map::new();
+        for i in 0..5_000 {
+            models.insert(format!("model-{i}"), json!({ "in": 1.0, "out": 1.0 }));
+        }
+        let (status, _, _) = send(
+            &app,
+            Method::PATCH,
+            &format!("/v1/endpoints/{}", view["id"].as_str().unwrap()),
+            Some(view["owner_token"].as_str().unwrap()),
+            Some(json!({ "pricing": { "per_token": { "models": models, "max_usd": 0.1 } } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test(flavor = "multi_thread")]

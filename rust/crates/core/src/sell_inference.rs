@@ -172,6 +172,22 @@ impl SellInference {
         if self.currencies.is_empty() {
             errs.push("at least one currency is required".into());
         }
+        // Each currency gets its own backends, so the list is a set of
+        // supported stablecoins: at most one entry each.
+        let mut seen = Vec::with_capacity(pay_types::Stablecoin::ALL.len());
+        for symbol in &self.currencies {
+            match pay_types::Stablecoin::parse_symbol(symbol) {
+                None => {
+                    errs.push(format!("unsupported currency `{symbol}`"));
+                    break;
+                }
+                Some(coin) if seen.contains(&coin) => {
+                    errs.push(format!("currency {coin} is listed more than once"));
+                    break;
+                }
+                Some(coin) => seen.push(coin),
+            }
+        }
         if self.model.is_empty() {
             errs.push("model is required".into());
         }
@@ -594,6 +610,29 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("model \"x\" input rate"))
         );
+    }
+
+    #[test]
+    fn currencies_are_distinct_supported_stablecoins() {
+        let mut ok = sale(SellPricing::PerRequest { usd: 0.02 });
+        ok.currencies = vec!["usdc".into(), "USDT".into()];
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+
+        for (currencies, needle) in [
+            (vec!["USDC", "usdc"], "listed more than once"),
+            (vec!["USDC"; 1_000], "listed more than once"),
+            (vec!["USDC", "DOGE"], "unsupported currency `DOGE`"),
+        ] {
+            let mut bad = ok.clone();
+            bad.currencies = currencies.into_iter().map(str::to_string).collect();
+            let errs = bad.validate();
+            assert_eq!(
+                errs.len(),
+                1,
+                "one problem per list, however long: {errs:?}"
+            );
+            assert!(errs[0].contains(needle), "{errs:?}");
+        }
     }
 
     fn sale_with_rates(rates: PricingConfig) -> SellInference {
