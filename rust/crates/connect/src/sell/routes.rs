@@ -1030,7 +1030,17 @@ async fn dispatch(
                 );
             }
         };
-        let admission = match admission_for(&live.sale, &body) {
+        let head = match ChatHead::parse(&body) {
+            Ok(head) => head,
+            Err(error) => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    &format!("invalid request body: {error}"),
+                );
+            }
+        };
+        let admission = match admission_for(&live.sale, &head) {
             Ok(admission) => admission,
             Err(error) => {
                 return openai_error(
@@ -1040,10 +1050,7 @@ async fn dispatch(
                 );
             }
         };
-        streaming = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|body| body.get("stream").and_then(Value::as_bool))
-            .unwrap_or(false);
+        streaming = head.stream;
         if !entry.try_reserve(admission.expected_usd) {
             return openai_error(
                 StatusCode::GONE,
@@ -1094,25 +1101,112 @@ async fn models(State(state): State<Arc<BuyerState>>) -> Json<Value> {
     }))
 }
 
-/// Park the request and relay the worker's answer.
-fn admission_for(sale: &SellInference, body: &[u8]) -> Result<Admission, serde_json::Error> {
-    let json = serde_json::from_slice::<Value>(body)?;
-    let model = json
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+/// The fields of a chat request read before it is paid for. Everything
+/// else (`messages` above all) is skipped by the parser, never built, so an
+/// unpaid body costs its own bytes and no more. Fields read as
+/// `Value::get(..).and_then(Value::as_*)` would: a wrong type is absent,
+/// and a repeated key keeps its last value.
+#[derive(Debug, Default, PartialEq)]
+struct ChatHead {
+    model: Option<String>,
+    stream: bool,
+}
+
+impl ChatHead {
+    fn parse(body: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(body)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatHead {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Head;
+        impl<'de> serde::de::Visitor<'de> for Head {
+            type Value = ChatHead;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a chat completion request object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ChatHead, A::Error> {
+                let mut head = ChatHead::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match (key.as_ref(), map.next_value::<Scalar>()?) {
+                        ("model", Scalar::Str(model)) => head.model = Some(model),
+                        ("model", _) => head.model = None,
+                        ("stream", Scalar::Bool(stream)) => head.stream = stream,
+                        ("stream", _) => head.stream = false,
+                        _ => {}
+                    }
+                }
+                Ok(head)
+            }
+        }
+        deserializer.deserialize_map(Head)
+    }
+}
+
+/// A JSON value kept only if it is a string or a bool; arrays and objects
+/// are walked and dropped.
+enum Scalar {
+    Str(String),
+    Bool(bool),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess};
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Scalar;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Scalar, E> {
+                Ok(Scalar::Str(v.to_string()))
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Scalar, E> {
+                Ok(Scalar::Bool(v))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Scalar, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Scalar::Other)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Scalar, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Scalar::Other)
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// The terms a request is admitted under.
+fn admission_for(sale: &SellInference, head: &ChatHead) -> Result<Admission, &'static str> {
     // The gate prices this exact model string; never let accounting resolve
     // a different rate for a whitespace variant of it.
-    if model.as_deref().is_some_and(|m| m.trim() != m) {
-        return Err(serde::de::Error::custom(
-            "model must not have leading or trailing whitespace",
-        ));
+    if head.model.as_deref().is_some_and(|m| m.trim() != m) {
+        return Err("model must not have leading or trailing whitespace");
     }
     let pricing = sale.pricing.clone();
     Ok(Admission {
         expected_usd: pricing.max_usd(),
         pricing,
-        model,
+        model: head.model.clone(),
     })
 }
 
@@ -1132,8 +1226,8 @@ async fn chat_completions(
             "This endpoint is no longer available.",
         );
     };
-    let stream = match serde_json::from_slice::<Value>(&body) {
-        Ok(json) => json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+    let head = match ChatHead::parse(&body) {
+        Ok(head) => head,
         Err(e) => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -1142,13 +1236,14 @@ async fn chat_completions(
             );
         }
     };
+    let stream = head.stream;
     let admission = match reserved {
         Some(Extension(reserved)) => {
             reserved.claimed.store(true, Ordering::Release);
             reserved.admission
         }
         None => {
-            let admission = match admission_for(&state.sale, &body) {
+            let admission = match admission_for(&state.sale, &head) {
                 Ok(admission) => admission,
                 Err(error) => {
                     return openai_error(
@@ -2542,6 +2637,44 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn the_chat_head_reads_model_and_stream_as_the_body_says() {
+        let head = |body: &str| ChatHead::parse(body.as_bytes()).map_err(|e| e.to_string());
+        for body in [
+            r#"{"model":"agent","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"other","stream":false,"model":"agent","stream":true}"#,
+            r#"{"messages":[[1,{"model":"x"}]],"model":"ag\u0065nt","stream":true}"#,
+        ] {
+            let value: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(value["model"], "agent", "{body}");
+            assert_eq!(
+                head(body),
+                Ok(ChatHead {
+                    model: Some("agent".into()),
+                    stream: true,
+                }),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{}"#,
+            r#"{"model":7,"stream":"yes"}"#,
+            r#"{"model":["agent"],"stream":{"on":true}}"#,
+            r#"{"model":"agent","model":null,"stream":true,"stream":1}"#,
+        ] {
+            assert_eq!(head(body), Ok(ChatHead::default()), "{body}");
+        }
+        for body in [
+            "",
+            "[]",
+            r#"["agent",true]"#,
+            r#"{"model":"agent"} x"#,
+            "{\"a\":[0,]}",
+        ] {
+            assert!(head(body).is_err(), "{body}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
