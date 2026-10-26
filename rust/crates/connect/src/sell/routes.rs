@@ -2789,6 +2789,36 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
     }
 
+    /// Every sponsored session open fronts operator rent until the channel
+    /// closes; a seller cannot stretch the close or shrink the deposit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_terms_that_lock_operator_rent_are_refused() {
+        let state = state();
+        let app = router(state.clone());
+        for (field, value) in [
+            ("session_idle_close_secs", json!(2_592_000)),
+            ("session_cap_usd", json!(0.000_001)),
+        ] {
+            let mut body = per_request(0.02);
+            body[field] = value;
+            let (status, _, err) = send(
+                &app,
+                Method::POST,
+                "/v1/endpoints",
+                Some("creator"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+            assert!(err.to_string().contains(field), "{err}");
+        }
+
+        let mut body = per_request(0.02);
+        body["session_idle_close_secs"] = json!(3_600);
+        body["session_cap_usd"] = json!(1.0);
+        create_endpoint(&app, body).await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn reaching_the_cap_closes_the_endpoint_for_buyers_and_then_the_worker() {
         let state = state();

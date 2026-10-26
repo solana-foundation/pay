@@ -116,7 +116,7 @@ pub struct Params {
     #[serde(default)]
     pub description: Option<String>,
     /// Idle seconds before a buyer's session channel closes and settles to
-    /// the recipient. Defaults to ten minutes.
+    /// the recipient. Defaults to ten minutes; at most an hour.
     #[serde(default)]
     pub session_idle_close_secs: Option<u32>,
     /// Endpoint to act on for status, reprice and stop. Defaults to the

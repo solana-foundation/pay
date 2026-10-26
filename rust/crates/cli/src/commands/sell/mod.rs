@@ -148,7 +148,7 @@ pub struct CreateCommand {
     pub description: Option<String>,
 
     /// Idle seconds before a buyer's MPP session channel closes and its
-    /// vouchers settle to you. Default: ten minutes.
+    /// vouchers settle to you. Default: ten minutes; at most an hour.
     #[arg(long, value_name = "SECS")]
     pub session_idle_close_secs: Option<u32>,
 

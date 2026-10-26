@@ -823,9 +823,21 @@ impl SessionOperatorRuntime {
         };
         let channel_account = channel_account
             .ok_or_else(|| Error::Mpp(format!("payment channel {channel_id} is not on chain")))?;
-        let clearance = self
-            .distribute_clearance(&tx_pipeline, params, &channel_account, &token_program)
-            .await?;
+        // A distribute inside the open-slot window leaves the PDA rent behind;
+        // seal now and let the payout retry distribute once the window passes.
+        let clearance = match &onchain {
+            Some(channel)
+                if !self
+                    .past_open_slot_window(&tx_pipeline, channel.open_slot)
+                    .await? =>
+            {
+                None
+            }
+            _ => {
+                self.distribute_clearance(&tx_pipeline, params, &channel_account, &token_program)
+                    .await?
+            }
+        };
         let instructions = close_instructions(
             params,
             &authorized_signer,
@@ -941,10 +953,18 @@ impl SessionOperatorRuntime {
             Some(data) => {
                 let channel = self.decode_payment_channel(&data)?;
                 if channel.status == ChannelStatus::Distributed as u8 {
-                    true
+                    self.reclaim_distributed(channel_id, &channel, signer)
+                        .await?
                 } else if channel.status != ChannelStatus::Sealed as u8 {
                     return Ok(false);
                 } else {
+                    let tx_pipeline = self.transaction_pipeline().await?;
+                    if !self
+                        .past_open_slot_window(&tx_pipeline, channel.open_slot)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     let params = self
                         .server
                         .seal_params(channel_id)
@@ -957,7 +977,6 @@ impl SessionOperatorRuntime {
                                 self.token_program
                             ))
                         })?;
-                    let tx_pipeline = self.transaction_pipeline().await?;
                     let Some(clearance) = self
                         .distribute_clearance(&tx_pipeline, &params, &data, &token_program)
                         .await?
@@ -998,6 +1017,61 @@ impl SessionOperatorRuntime {
         }
         Ok(finished)
     }
+
+    async fn past_open_slot_window(&self, pipeline: &TxPipeline, open_slot: u64) -> Result<bool> {
+        let slot = pipeline
+            .current_slot()
+            .await
+            .map_err(|error| Error::Mpp(format!("failed to read the current slot: {error}")))?;
+        Ok(open_slot_window_passed(open_slot, slot))
+    }
+
+    /// Return the PDA rent a `distribute` inside the open-slot window left
+    /// behind: ours waits past it, but `distribute` is permissionless.
+    /// Returns whether nothing is left to do for this channel.
+    async fn reclaim_distributed(
+        &self,
+        channel_id: &str,
+        channel: &pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel,
+        signer: Arc<dyn TransactionSigner>,
+    ) -> Result<bool> {
+        let rent_payer = solana_pubkey::Pubkey::from(channel.rent_payer.to_bytes());
+        if rent_payer != signer.pubkey() {
+            // Someone else's rent: not ours to spend fees on.
+            return Ok(true);
+        }
+        let tx_pipeline = self.transaction_pipeline().await?;
+        if !self
+            .past_open_slot_window(&tx_pipeline, channel.open_slot)
+            .await?
+        {
+            return Ok(false);
+        }
+        let program_id = self
+            .config
+            .channel_deployment()
+            .map_err(|error| Error::Mpp(format!("invalid channel deployment: {error}")))?
+            .program_id;
+        let channel_key = solana_pubkey::Pubkey::from_str(channel_id)
+            .map_err(|e| Error::Mpp(format!("invalid payment channel: {e}")))?;
+        let reclaim = pay_kit::mpp::program::payment_channels::build_reclaim_instruction(
+            &channel_key,
+            &rent_payer,
+            &program_id,
+        );
+        let signature = self
+            .settle_and_confirm(signer, tx_pipeline, channel_id.to_string(), vec![reclaim])
+            .await?;
+        tracing::info!(channel_id, %signature, "reclaimed payment-channel rent");
+        Ok(true)
+    }
+}
+
+/// Whether a `distribute` at `slot` frees the channel PDA. The program
+/// deallocates it only past `open_slot + OPEN_SLOT_WINDOW`; earlier it stays
+/// `Distributed` until a `reclaim`, allowed only past the same window.
+fn open_slot_window_passed(open_slot: u64, slot: u64) -> bool {
+    slot > open_slot.saturating_add(pay_kit::mpp::program::payment_channels::OPEN_SLOT_WINDOW)
 }
 
 /// A confirmed close: its transaction, and whether it also distributed.
@@ -1335,6 +1409,14 @@ impl WatermarkSettlement {
 const LIFECYCLE_OWNER_LEASE_PREFIX: &str = "embedded-v1:";
 const MIN_LIFECYCLE_OWNER_LEASE: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
+const CLOSE_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const CLOSE_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const MAX_CLOSE_RETRY_BACKOFF: Duration = Duration::from_secs(3_600);
+#[cfg(test)]
+const MAX_CLOSE_RETRY_BACKOFF: Duration = Duration::from_millis(40);
+#[cfg(not(test))]
 const DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const DELEGATED_ACTIVITY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
@@ -1373,6 +1455,15 @@ struct SessionLifecycleRunloop {
     settlement_cursor: usize,
     /// Whether a deferred payout may still be waiting for its retry.
     deferred_payouts_pending: bool,
+    /// Claimed closes that failed: when each is next retried, and the backoff
+    /// that doubles per failure.
+    close_retries: HashMap<String, CloseRetry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CloseRetry {
+    next_at_ms: u64,
+    backoff: Duration,
 }
 
 impl SessionLifecycleRunloop {
@@ -1391,6 +1482,7 @@ impl SessionLifecycleRunloop {
             rx,
             settlement_cursor: 0,
             deferred_payouts_pending: false,
+            close_retries: HashMap::new(),
         }
     }
 
@@ -1804,11 +1896,19 @@ impl SessionLifecycleRunloop {
                 return;
             }
         };
-        let due = states
+        let states = states
             .into_iter()
             // Already sealed onchain; the payout retry finishes these.
             .filter(|state| distribution_deferred_at(state).is_none())
-            .filter(|state| !state.sealed && state.close_requested_at.is_none())
+            .filter(|state| !state.sealed)
+            .collect::<Vec<_>>();
+        self.close_retries.retain(|channel_id, _| {
+            states
+                .iter()
+                .any(|state| &state.channel_id == channel_id && state.close_requested_at.is_some())
+        });
+        let due = states
+            .into_iter()
             .filter_map(|state| {
                 let owned = state
                     .lifecycle
@@ -1825,8 +1925,16 @@ impl SessionLifecycleRunloop {
                     now_ms,
                     "payment-channel idle-close check"
                 );
-                (owned && close_after.is_some_and(|close_after| close_after <= now_ms))
-                    .then_some((state.channel_id, state.lifecycle))
+                let due = match state.close_requested_at {
+                    // Claimed but never sealed: the close failed, or is still
+                    // in flight and holds the capacity slot below. Retry.
+                    Some(requested_at) => match self.close_retries.get(&state.channel_id) {
+                        Some(retry) => retry.next_at_ms <= now_ms,
+                        None => close_retry_due(requested_at, now_ms),
+                    },
+                    None => close_after.is_some_and(|close_after| close_after <= now_ms),
+                };
+                (owned && due).then_some((state.channel_id, state.lifecycle))
             })
             .collect::<Vec<_>>();
 
@@ -1851,6 +1959,9 @@ impl SessionLifecycleRunloop {
 
         for (channel_id, close_result) in futures_util::future::join_all(closing).await {
             self.runtime.release_capacity(&channel_id);
+            if close_result.is_ok() {
+                self.close_retries.remove(&channel_id);
+            }
             match close_result {
                 Ok(SessionCloseResult::Closed { settled }) => {
                     tracing::info!(channel_id, settled, "operator auto-closed payment channel");
@@ -1862,10 +1973,24 @@ impl SessionLifecycleRunloop {
                     tracing::debug!(channel_id, "payment channel re-armed since the idle scan");
                 }
                 Err(error) => {
+                    let backoff = self
+                        .close_retries
+                        .get(&channel_id)
+                        .map_or(CLOSE_RETRY_BACKOFF, |retry| {
+                            retry.backoff.saturating_mul(2).min(MAX_CLOSE_RETRY_BACKOFF)
+                        });
                     tracing::warn!(
                         channel_id,
                         error = %error,
+                        retry_in_ms = duration_millis(backoff),
                         "operator auto-close failed; retrying after delay"
+                    );
+                    self.close_retries.insert(
+                        channel_id.clone(),
+                        CloseRetry {
+                            next_at_ms: unix_millis().saturating_add(duration_millis(backoff)),
+                            backoff,
+                        },
                     );
                     if let Err(touch_error) = self.persist_touch(&channel_id, unix_millis()).await {
                         tracing::warn!(
@@ -1977,6 +2102,15 @@ impl SessionLifecycleRunloop {
 
         self.next_settlement = Some(now + interval);
     }
+}
+
+/// Whether a close claimed at `requested_at_secs` that has not sealed is
+/// retried at `now_ms`.
+fn close_retry_due(requested_at_secs: u64, now_ms: u64) -> bool {
+    requested_at_secs
+        .saturating_mul(1_000)
+        .saturating_add(duration_millis(CLOSE_RETRY_BACKOFF))
+        <= now_ms
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -6586,7 +6720,9 @@ mod tests {
                             "context": {"slot": 50},
                             "value": {"blockhash": blockhash, "lastValidBlockHeight": 1_000}
                         }),
-                        "getSlot" | "getBlockHeight" => serde_json::json!(50),
+                        // Past the open-slot window, so the payout may distribute.
+                        "getSlot" => serde_json::json!(2_000),
+                        "getBlockHeight" => serde_json::json!(50),
                         "sendTransaction" => {
                             sent.fetch_add(1, Ordering::SeqCst);
                             serde_json::json!(
@@ -6854,6 +6990,427 @@ mod tests {
             WatermarkSettlement::every(Duration::ZERO, MinSettleDelta::ANY),
             WatermarkSettlement::DISABLED
         );
+    }
+
+    type MockAccount = (solana_pubkey::Pubkey, Vec<u8>);
+
+    /// A JSON-RPC node serving payment-channel accounts at a settable slot,
+    /// recording every transaction sent.
+    struct ChannelRpc {
+        url: String,
+        slot: Arc<std::sync::atomic::AtomicU64>,
+        /// Address → (owner, data).
+        accounts: Arc<Mutex<HashMap<String, MockAccount>>>,
+        sent: Arc<Mutex<Vec<solana_transaction::versioned::VersionedTransaction>>>,
+    }
+
+    impl ChannelRpc {
+        async fn start() -> Self {
+            use axum::{Json, Router, routing::post};
+            use base64::Engine as _;
+
+            let rpc = ChannelRpc {
+                url: String::new(),
+                slot: Arc::new(std::sync::atomic::AtomicU64::new(50)),
+                accounts: Arc::default(),
+                sent: Arc::default(),
+            };
+            let (slot, accounts, sent) = (
+                Arc::clone(&rpc.slot),
+                Arc::clone(&rpc.accounts),
+                Arc::clone(&rpc.sent),
+            );
+            let blockhash = solana_hash::Hash::new_unique().to_string();
+            let app = Router::new().route(
+                "/",
+                post(move |Json(call): Json<serde_json::Value>| {
+                    let (slot, accounts, sent) =
+                        (slot.clone(), accounts.clone(), sent.clone());
+                    let blockhash = blockhash.clone();
+                    async move {
+                        let slot = slot.load(Ordering::SeqCst);
+                        let result = match call["method"].as_str().unwrap_or_default() {
+                            "getMultipleAccounts" => {
+                                let accounts = accounts.lock().unwrap();
+                                let value = call["params"][0]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|address| match accounts.get(address.as_str().unwrap()) {
+                                        Some((owner, data)) => serde_json::json!({
+                                            "data": [
+                                                base64::engine::general_purpose::STANDARD
+                                                    .encode(data),
+                                                "base64"
+                                            ],
+                                            "executable": false, "lamports": 1_000_000u64,
+                                            "owner": owner.to_string(), "rentEpoch": 0,
+                                            "space": data.len()
+                                        }),
+                                        None => serde_json::Value::Null,
+                                    })
+                                    .collect::<Vec<_>>();
+                                Some(serde_json::json!({"context": {"slot": slot}, "value": value}))
+                            }
+                            "getLatestBlockhash" => Some(serde_json::json!({
+                                "context": {"slot": slot},
+                                "value": {"blockhash": blockhash, "lastValidBlockHeight": 1_000}
+                            })),
+                            "getSlot" => Some(serde_json::json!(slot)),
+                            "getBlockHeight" => Some(serde_json::json!(50)),
+                            "sendTransaction" => {
+                                let tx = pay_kit::mpp::program::payment_channels::decode_transaction(
+                                    call["params"][0].as_str().unwrap(),
+                                )
+                                .unwrap();
+                                let signature = tx.signatures[0].to_string();
+                                sent.lock().unwrap().push(tx);
+                                Some(serde_json::json!(signature))
+                            }
+                            "getSignatureStatuses" => Some(serde_json::json!({
+                                "context": {"slot": slot},
+                                "value": [{
+                                    "slot": slot, "confirmations": null, "err": null,
+                                    "confirmationStatus": "finalized", "status": {"Ok": null}
+                                }]
+                            })),
+                            _ => None,
+                        };
+                        Json(match result {
+                            Some(result) => {
+                                serde_json::json!({"jsonrpc": "2.0", "id": call["id"], "result": result})
+                            }
+                            None => serde_json::json!({
+                                "jsonrpc": "2.0", "id": call["id"],
+                                "error": {"code": -32601, "message": "not served"}
+                            }),
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            ChannelRpc { url, ..rpc }
+        }
+
+        fn put(
+            &self,
+            address: &solana_pubkey::Pubkey,
+            owner: &solana_pubkey::Pubkey,
+            data: Vec<u8>,
+        ) {
+            self.accounts
+                .lock()
+                .unwrap()
+                .insert(address.to_string(), (*owner, data));
+        }
+
+        /// Move the cluster to `slot`, past the pipeline's slot cache.
+        async fn set_slot(&self, slot: u64) {
+            self.slot.store(slot, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        }
+
+        fn sent(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+
+        /// Whether a sent transaction carries `instruction`.
+        fn sent_instruction(&self, instruction: &solana_instruction::Instruction) -> bool {
+            self.sent.lock().unwrap().iter().any(|tx| {
+                let keys = tx.message.static_account_keys();
+                tx.message.instructions().iter().any(|ix| {
+                    ix.data == instruction.data
+                        && keys.get(usize::from(ix.program_id_index))
+                            == Some(&instruction.program_id)
+                        && ix
+                            .accounts
+                            .iter()
+                            .map(|index| keys.get(usize::from(*index)))
+                            .eq(instruction.accounts.iter().map(|meta| Some(&meta.pubkey)))
+                })
+            })
+        }
+    }
+
+    struct ChannelFixture {
+        operator: solana_pubkey::Pubkey,
+        payer: solana_pubkey::Pubkey,
+        rent_payer: solana_pubkey::Pubkey,
+        mint: solana_pubkey::Pubkey,
+    }
+
+    impl ChannelFixture {
+        fn account(&self, status: ChannelStatus) -> Vec<u8> {
+            use pay_kit::core::payment_channels::to_address;
+            use pay_kit::mpp::program::payment_channels::generated::generated::{
+                accounts::Channel, types::SettlementWatermarks,
+            };
+            borsh::to_vec(&Channel {
+                discriminator: 1,
+                version: 1,
+                bump: 255,
+                status: status as u8,
+                salt: 7,
+                deposit: CAP,
+                settlement: SettlementWatermarks {
+                    settled: 0,
+                    payout_watermark: 0,
+                },
+                closure_started_at: 0,
+                payer_withdrawn_at: 0,
+                grace_period: 900,
+                distribution_hash: pay_kit::mpp::program::payment_channels::distribution_hash(&[]),
+                payer: to_address(&self.payer),
+                payee: to_address(&self.operator),
+                authorized_signer: to_address(&self.operator),
+                mint: to_address(&self.mint),
+                rent_payer: to_address(&self.rent_payer),
+                open_slot: 42,
+            })
+            .unwrap()
+        }
+    }
+
+    const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+    /// An operator-signed session on `rpc`, with its lifecycle not started.
+    fn channel_rpc_session(
+        rpc: &ChannelRpc,
+        signer: &Arc<dyn TransactionSigner>,
+        mint: &solana_pubkey::Pubkey,
+    ) -> Arc<SessionMpp> {
+        let mut config = test_session_config();
+        config.operator = signer.pubkey().to_string();
+        config.recipient = signer.pubkey().to_string();
+        config.currency = mint.to_string();
+        config.token_program = Some(solana_pubkey::Pubkey::from_str(TOKEN_PROGRAM).unwrap());
+        config.voucher_signer = SessionVoucherSigner::Operator;
+        config.rpc_url = Some(rpc.url.clone());
+        Arc::new(
+            SessionMpp::new(config, "test-secret")
+                .with_blockhash_cache(test_blockhash_cache())
+                .with_payment_channel_signer(Arc::clone(signer)),
+        )
+    }
+
+    /// A close within the open-slot window would distribute while the program
+    /// cannot yet free the channel PDA, stranding its rent. It seals only, and
+    /// the payout retry distributes once the window has passed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_early_close_distributes_only_after_the_open_slot_window() {
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let rpc = ChannelRpc::start().await;
+        let token_program = solana_pubkey::Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+        let program = pay_kit::core::payment_channels::default_program_id();
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let fixture = ChannelFixture {
+            operator: signer.pubkey(),
+            payer,
+            rent_payer: payer,
+            mint: solana_pubkey::Pubkey::new_unique(),
+        };
+        let refund_account = pay_kit::core::payment_channels::find_associated_token_address(
+            &fixture.payer,
+            &fixture.mint,
+            &token_program,
+        )
+        .0;
+        let mut token_account = vec![0u8; 165];
+        token_account[..32].copy_from_slice(fixture.mint.as_ref());
+        token_account[32..64].copy_from_slice(fixture.payer.as_ref());
+        token_account[108] = 1;
+        rpc.put(&refund_account, &token_program, token_account);
+        let session = channel_rpc_session(&rpc, &signer, &fixture.mint);
+        let runtime = &session.operator_runtime;
+
+        // Positive control first: past the window, the close distributes.
+        for (slot, distributes_at_close) in [(2_000, true), (50, false)] {
+            rpc.set_slot(slot).await;
+            let channel = solana_pubkey::Pubkey::new_unique();
+            let channel_id = channel.to_string();
+            rpc.put(&channel, &program, fixture.account(ChannelStatus::Open));
+            let challenge = session.challenge(None).unwrap();
+            seed_channel(
+                &session,
+                &channel_id,
+                CAP,
+                &fixture.operator.to_string(),
+                "operator",
+                &challenge.id,
+                &fixture.payer.to_string(),
+                None,
+            )
+            .await;
+            runtime
+                .request_server_close(&channel_id, None)
+                .await
+                .unwrap();
+            let params = session.server.seal_params(&channel_id).await.unwrap();
+            let settlement = runtime
+                .submit_payment_channel_settlement(&params)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(settlement.distributed, distributes_at_close, "slot {slot}");
+            if distributes_at_close {
+                continue;
+            }
+
+            runtime
+                .finish_close(&channel_id, &settlement)
+                .await
+                .unwrap();
+            rpc.put(&channel, &program, fixture.account(ChannelStatus::Sealed));
+            let sent = rpc.sent();
+            assert!(!runtime.distribute_deferred(&channel_id).await.unwrap());
+            assert_eq!(rpc.sent(), sent, "nothing distributes inside the window");
+
+            rpc.set_slot(2_000).await;
+            assert!(runtime.distribute_deferred(&channel_id).await.unwrap());
+            assert_eq!(rpc.sent(), sent + 1);
+            assert!(stored_channel(&session, &channel_id).await.sealed);
+        }
+    }
+
+    /// `distribute` is permissionless, so a channel can still end up
+    /// `Distributed` inside the window. Its PDA rent is reclaimed once the
+    /// window passes, and only when it is the operator's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_channel_distributed_inside_the_window_has_its_rent_reclaimed() {
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let rpc = ChannelRpc::start().await;
+        let program = pay_kit::core::payment_channels::default_program_id();
+        let mint = solana_pubkey::Pubkey::new_unique();
+        let session = channel_rpc_session(&rpc, &signer, &mint);
+        let runtime = &session.operator_runtime;
+
+        for (rent_payer, reclaimed) in [
+            (signer.pubkey(), true),
+            (solana_pubkey::Pubkey::new_unique(), false),
+        ] {
+            rpc.set_slot(50).await;
+            let channel = solana_pubkey::Pubkey::new_unique();
+            let channel_id = channel.to_string();
+            let fixture = ChannelFixture {
+                operator: signer.pubkey(),
+                payer: solana_pubkey::Pubkey::new_unique(),
+                rent_payer,
+                mint,
+            };
+            rpc.put(
+                &channel,
+                &program,
+                fixture.account(ChannelStatus::Distributed),
+            );
+            let challenge = session.challenge(None).unwrap();
+            seed_channel(
+                &session,
+                &channel_id,
+                CAP,
+                &fixture.operator.to_string(),
+                "operator",
+                &challenge.id,
+                &fixture.payer.to_string(),
+                None,
+            )
+            .await;
+            let reclaim = pay_kit::mpp::program::payment_channels::build_reclaim_instruction(
+                &channel,
+                &rent_payer,
+                &program,
+            );
+            let sent = rpc.sent();
+
+            if reclaimed {
+                assert!(!runtime.distribute_deferred(&channel_id).await.unwrap());
+                assert_eq!(rpc.sent(), sent, "reclaim fails inside the window");
+                rpc.set_slot(2_000).await;
+            }
+            assert!(runtime.distribute_deferred(&channel_id).await.unwrap());
+            assert_eq!(rpc.sent_instruction(&reclaim), reclaimed);
+            assert_eq!(rpc.sent(), sent + usize::from(reclaimed));
+        }
+    }
+
+    /// A close that fails after it was claimed is retried with backoff
+    /// rather than left open, holding the operator's rent, forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_idle_close_is_retried() {
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let rpc = ChannelRpc::start().await;
+        let program = pay_kit::core::payment_channels::default_program_id();
+        let mint = solana_pubkey::Pubkey::new_unique();
+        let session = channel_rpc_session(&rpc, &signer, &mint);
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let channel_id = channel.to_string();
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let challenge = session.challenge(None).unwrap();
+        seed_channel(
+            &session,
+            &channel_id,
+            CAP,
+            &signer.pubkey().to_string(),
+            "operator",
+            &challenge.id,
+            &payer.to_string(),
+            None,
+        )
+        .await;
+
+        // The first close attempts fail: chain disagrees with the record.
+        let fixture = ChannelFixture {
+            operator: signer.pubkey(),
+            payer,
+            rent_payer: solana_pubkey::Pubkey::new_unique(),
+            mint,
+        };
+        rpc.put(&channel, &program, fixture.account(ChannelStatus::Open));
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            WatermarkSettlement::DISABLED,
+            SessionLifecycleReconciliation::Embedded,
+        );
+        session.touch_channel(channel_id.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stored_channel(&session, &channel_id)
+                .await
+                .close_requested_at
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the idle close is claimed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!stored_channel(&session, &channel_id).await.sealed);
+
+        // The channel is closed on-chain since: the retry notices and
+        // finishes the record.
+        rpc.put(&channel, &program, vec![2]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stored_channel(&session, &channel_id).await.sealed {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failed close is retried");
+    }
+
+    #[test]
+    fn the_open_slot_window_and_close_retries_are_bounded() {
+        let window = pay_kit::mpp::program::payment_channels::OPEN_SLOT_WINDOW;
+        assert!(!open_slot_window_passed(42, 42 + window));
+        assert!(open_slot_window_passed(42, 43 + window));
+        assert!(!open_slot_window_passed(u64::MAX, u64::MAX));
+        assert!(!close_retry_due(10, 10_000));
+        assert!(close_retry_due(
+            10,
+            10_000 + duration_millis(CLOSE_RETRY_BACKOFF)
+        ));
     }
 
     #[test]
