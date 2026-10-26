@@ -3175,6 +3175,69 @@ mod tests {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     }
 
+    /// Guest grants are free to mint, so they must not hold the sell
+    /// registry's shared endpoint slots.
+    #[cfg(feature = "sell")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_token_cannot_create_a_sell_endpoint() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(sk.as_bytes());
+        keypair[32..].copy_from_slice(sk.verifying_key().as_bytes());
+        let signer = pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).unwrap();
+        let operator = crate::sell::Operator::new(
+            std::sync::Arc::new(signer),
+            "http://127.0.0.1:1",
+            "0123456789abcdef0123456789abcdef",
+        );
+        operator
+            .blockhashes
+            .set("11111111111111111111111111111111".into(), 1_000, 1);
+        let app = crate::router(
+            AppState::new("https://cloud.test")
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                .with_sell(operator),
+        );
+        let client_id = register_grok(&app).await;
+        let id = start_authorization(&app, &client_id, None).await;
+        let approved = post_json(
+            &app,
+            &format!("/api/oauth/authorize/{id}/approve"),
+            json!({"guest": true}),
+        )
+        .await;
+        let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+        let code = redirect
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let tokens = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
+                ("code", &code),
+                ("code_verifier", VERIFIER),
+                ("redirect_uri", GROK_REDIRECT),
+            ],
+        )
+        .await;
+        let access = tokens.json()["access_token"].as_str().unwrap().to_string();
+
+        let create = json!({
+            "pricing": { "per_request_usd": 0.02 }, "model": "agent", "network": "devnet",
+            "earn_cap_usd": 0.01, "recipient": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+        });
+        let created =
+            post_json_with(&app, "/v1/endpoints", create.clone(), None, Some(&access)).await;
+        assert_eq!(created.status, StatusCode::FORBIDDEN, "{}", created.body);
+        assert_eq!(created.json()["error"], "wallet_required");
+        let unknown = post_json_with(&app, "/v1/endpoints", create, None, Some("nope")).await;
+        assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "{}", unknown.body);
+    }
+
     // ── Privy login on the consent page ────────────────────────────────
 
     #[cfg(feature = "privy")]

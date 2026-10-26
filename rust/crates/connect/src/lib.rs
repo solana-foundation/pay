@@ -475,7 +475,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Who may create a `sell_inference` endpoint: a linked CLI's token, or a
-/// connector bearer. Either way the tenant's wallet is the default payee.
+/// connector bearer, of a tenant with a wallet, its default payee.
 #[cfg(feature = "sell")]
 struct Creators {
     cli: Arc<cli::Store>,
@@ -485,17 +485,22 @@ struct Creators {
 
 #[cfg(feature = "sell")]
 impl sell::routes::CreatorAuth for Creators {
-    fn authenticate(&self, bearer: &str) -> Option<sell::routes::Creator> {
+    fn authenticate(
+        &self,
+        bearer: &str,
+    ) -> Result<sell::routes::Creator, sell::routes::CreatorError> {
         let subject = self
             .cli
             .authenticate(bearer)
-            .or_else(|| self.mcp.as_ref()?.authenticate(bearer).map(|t| t.id))?;
+            .or_else(|| self.mcp.as_ref()?.authenticate(bearer).map(|t| t.id))
+            .ok_or(sell::routes::CreatorError::Unauthenticated)?;
         let wallet = self
             .tenants
             .get(&subject)
-            .filter(|t| !t.pubkey.is_empty())
-            .map(|t| t.pubkey.clone());
-        Some(sell::routes::Creator { subject, wallet })
+            .map(|t| t.pubkey.clone())
+            .filter(|pubkey| !pubkey.is_empty())
+            .ok_or(sell::routes::CreatorError::NoWallet)?;
+        Ok(sell::routes::Creator { subject, wallet })
     }
 }
 

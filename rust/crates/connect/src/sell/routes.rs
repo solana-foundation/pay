@@ -58,16 +58,39 @@ const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PUSH_BYTES: usize = pay_core::sell_inference::MAX_WORKER_PUSH_BYTES;
 const OWNER_TOKEN_PREFIX: &str = "pso_";
 
-/// Who may create endpoints: the bearer of a connector or CLI token.
+/// Who may create endpoints: the bearer of a connector or CLI token whose
+/// account has a wallet. Endpoint slots are shared by every seller, so they
+/// go to accounts, never to identities anyone can mint, like a guest's.
 pub trait CreatorAuth: Send + Sync {
-    fn authenticate(&self, bearer: &str) -> Option<Creator>;
+    fn authenticate(&self, bearer: &str) -> Result<Creator, CreatorError>;
 }
 
-/// An authenticated creator and, when known, the wallet to pay by default.
+/// An authenticated creator with a wallet, the default payee.
 #[derive(Debug, Clone)]
 pub struct Creator {
     pub subject: String,
-    pub wallet: Option<String>,
+    pub wallet: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatorError {
+    /// No such token.
+    Unauthenticated,
+    /// A real token for an account with no wallet yet (a guest).
+    NoWallet,
+}
+
+impl From<CreatorError> for ApiError {
+    fn from(error: CreatorError) -> Self {
+        match error {
+            CreatorError::Unauthenticated => unauthorized(),
+            CreatorError::NoWallet => ApiError::new(
+                StatusCode::FORBIDDEN,
+                "wallet_required",
+                "Sign in with a pay wallet to sell; guest connections cannot create endpoints.",
+            ),
+        }
+    }
 }
 
 /// Shared state of the sell routes.
@@ -109,11 +132,19 @@ impl EndpointRegistry {
         self.lock().get(id).cloned()
     }
 
-    fn insert(&self, entry: Arc<EndpointEntry>) -> Result<(), ApiError> {
-        let mut endpoints = self.lock();
+    /// Whether `owner` may add an endpoint now. Checked before building
+    /// one, and again, atomically, by [`Self::insert`].
+    fn admits(&self, owner: &str) -> Result<(), ApiError> {
+        Self::room_for(&self.lock(), owner)
+    }
+
+    fn room_for(
+        endpoints: &HashMap<String, Arc<EndpointEntry>>,
+        owner: &str,
+    ) -> Result<(), ApiError> {
         if let Some(open) = endpoints
             .values()
-            .find(|e| e.owner == entry.owner && !e.is_closed())
+            .find(|e| e.owner == owner && !e.is_closed())
         {
             // One open endpoint per seller bounds what the platform fronts.
             return Err(ApiError::new(
@@ -133,6 +164,12 @@ impl EndpointRegistry {
                 "This server holds as many endpoints as it can; try again later.",
             ));
         }
+        Ok(())
+    }
+
+    fn insert(&self, entry: Arc<EndpointEntry>) -> Result<(), ApiError> {
+        let mut endpoints = self.lock();
+        Self::room_for(&endpoints, &entry.owner)?;
         endpoints.insert(entry.id.clone(), entry);
         Ok(())
     }
@@ -690,9 +727,9 @@ async fn create(
     headers: HeaderMap,
     Json(input): Json<CreateEndpoint>,
 ) -> Result<(StatusCode, Json<EndpointView>), ApiError> {
-    let creator = bearer(&headers)
-        .and_then(|token| state.creators.authenticate(token))
-        .ok_or_else(unauthorized)?;
+    let token = bearer(&headers).ok_or_else(unauthorized)?;
+    let creator = state.creators.authenticate(token)?;
+    state.registry.admits(&creator.subject)?;
     if !input.earn_cap_usd.is_finite()
         || input.earn_cap_usd < MIN_EARN_CAP_USD
         || input.earn_cap_usd > MAX_EARN_CAP_USD
@@ -705,12 +742,7 @@ async fn create(
             ),
         ));
     }
-    let recipient = input.recipient.or(creator.wallet).ok_or_else(|| {
-        ApiError::bad_request(
-            "recipient_required",
-            "Pass `recipient`, or connect a wallet so the endpoint can pay you.",
-        )
-    })?;
+    let recipient = input.recipient.unwrap_or(creator.wallet);
     let id = uuid::Uuid::new_v4().to_string();
     let model = input.model.trim().to_string();
     let sale = SellInference {
@@ -1318,17 +1350,14 @@ mod tests {
     struct FixedCreators;
 
     impl CreatorAuth for FixedCreators {
-        fn authenticate(&self, bearer: &str) -> Option<Creator> {
+        fn authenticate(&self, bearer: &str) -> Result<Creator, CreatorError> {
             match bearer {
-                "creator" => Some(Creator {
+                "creator" => Ok(Creator {
                     subject: "sub_creator".into(),
-                    wallet: Some(CREATOR_WALLET.into()),
+                    wallet: CREATOR_WALLET.into(),
                 }),
-                "guest" => Some(Creator {
-                    subject: "guest_1".into(),
-                    wallet: None,
-                }),
-                _ => None,
+                "guest" => Err(CreatorError::NoWallet),
+                _ => Err(CreatorError::Unauthenticated),
             }
         }
     }
@@ -1433,17 +1462,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-        // A guest has no wallet and names no recipient.
+        // A guest holds no endpoint slot, even naming a payee.
+        let mut guest = per_request(0.02);
+        guest["recipient"] = json!(CREATOR_WALLET);
         let (status, _, body) = send(
             &app,
             Method::POST,
             "/v1/endpoints",
             Some("guest"),
-            Some(per_request(0.02)),
+            Some(guest),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"], "recipient_required");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "wallet_required");
+        assert!(state.registry.is_empty());
 
         let (status, _, view) = send(
             &app,
@@ -2539,6 +2571,18 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT, "{err}");
         assert_eq!(err["error"], "endpoint_exists");
         assert_eq!(err["details"]["endpoint_id"], id);
+        // The slot is checked before anything is built for the endpoint.
+        let mut unbuildable = per_request(0.02);
+        unbuildable["currencies"] = json!(["NOPE"]);
+        let (status, _, err) = send(
+            &app,
+            Method::POST,
+            "/v1/endpoints",
+            Some("creator"),
+            Some(unbuildable),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
 
         // Stopping frees the slot.
         send(
