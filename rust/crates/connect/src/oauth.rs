@@ -1232,11 +1232,20 @@ pub async fn approve(
         let subject = format!("{}{}", crate::tenants::GUEST_PREFIX, &random_token()[..24]);
         let (request, code) = store.approve(&id, &subject).ok_or_else(unknown_request)?;
         tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved for a guest");
-        return Ok(Json(DecisionResponse {
+        let mut response = Json(DecisionResponse {
             redirect: Some(code_redirect(&request, &code)),
             fund: None,
         })
-        .into_response());
+        .into_response();
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            state.tenants().guest_cookie(
+                &headers,
+                &subject,
+                state.public_url().starts_with("https://"),
+            ),
+        );
+        return Ok(response);
     }
     let (subject, fresh_login, bound, session) = match bearer {
         Some(token) => {
@@ -1737,23 +1746,34 @@ pub struct LinkView {
     pub privy: Option<PrivyLogin>,
 }
 
-fn unknown_link() -> ApiError {
-    ApiError::new(
-        StatusCode::NOT_FOUND,
-        "unknown_link",
-        "This link is unknown, used, or expired. Ask your MCP client to pay again to get a fresh one.",
-    )
+fn link_refused(why: crate::tenants::LinkRefused) -> ApiError {
+    match why {
+        crate::tenants::LinkRefused::Unknown => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_link",
+            "This link is unknown, used, or expired. Ask your MCP client to pay again to get a fresh one.",
+        ),
+        crate::tenants::LinkRefused::OtherBrowser => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "other_browser",
+            "This link belongs to a connection made in another browser. Open it in the browser \
+             where you connected your MCP client, or reconnect there and sign in. If someone sent \
+             you this link, do not use it: it would let them spend from your wallet.",
+        ),
+    }
 }
 
-/// `GET /api/oauth/link/{ticket}`: is this ticket live, and how to sign in.
+/// `GET /api/oauth/link/{ticket}`: is this ticket live for this browser (the
+/// one that approved its guest), and how to sign in.
 pub async fn link_view(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let subject = state
         .tenants()
-        .peek_link(&ticket)
-        .ok_or_else(unknown_link)?;
+        .peek_link(&ticket, &headers)
+        .map_err(link_refused)?;
     let mut response = Json(LinkView {
         guest: state.tenants().get(&subject).is_none(),
         privy: privy_login(&state),
@@ -1786,9 +1806,10 @@ pub struct LinkCompleteBody {
 }
 
 /// `POST /api/oauth/link/{ticket}` with `Authorization: Bearer <privy
-/// access token>`: attach the signed-in user's wallet to the guest
-/// connection the ticket names. The guest's existing tokens now pay from
-/// that wallet; the browser is remembered as that user.
+/// access token>`, from the browser that approved the guest: attach the
+/// signed-in user's wallet to the guest connection the ticket names. The
+/// guest's existing tokens now pay from that wallet; the browser is
+/// remembered as that user.
 pub async fn link_complete(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
@@ -1820,8 +1841,8 @@ pub async fn link_complete(
     // every error, so a provider failure can be retried safely.
     let claim = state
         .tenants()
-        .claim_link(&ticket)
-        .ok_or_else(unknown_link)?;
+        .claim_link(&ticket, &headers)
+        .map_err(link_refused)?;
     let guest = claim.subject().to_string();
     let PrivyApproval {
         subject,
@@ -4404,10 +4425,8 @@ mod tests {
             )
             .await;
             assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
-            assert!(
-                approved.headers.get(header::SET_COOKIE).is_none(),
-                "guests get no cookie"
-            );
+            let guest_cookie = cookie_of(&approved);
+            assert!(guest_cookie.starts_with("pay_guest="), "{guest_cookie}");
             assert!(state.tenants().is_empty(), "no wallet bound");
             let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
             let code = redirect
@@ -4445,11 +4464,16 @@ mod tests {
                 .next()
                 .unwrap()
                 .to_string();
-            let view = get(&app, &format!("/api/oauth/link/{ticket}")).await;
+            let view = get_as(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                Some(&guest_cookie),
+            )
+            .await;
             assert_eq!(view.status, StatusCode::OK, "{}", view.body);
             assert_eq!(view.json()["guest"], true);
             assert_eq!(view.json()["privy"]["app_id"], "app_test");
-            let link_cookie = cookie_of(&view);
+            let link_cookie = format!("{}; {guest_cookie}", cookie_of(&view));
 
             // No sign-in, no link.
             let anon = post_json_as(
@@ -4497,7 +4521,12 @@ mod tests {
 
             // The guest's token now pays from that wallet; the ticket is spent.
             assert!(topup_text(&app, &access).await.contains(ADDRESS));
-            let spent = get(&app, &format!("/api/oauth/link/{ticket}")).await;
+            let spent = get_as(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                Some(&guest_cookie),
+            )
+            .await;
             assert_eq!(spent.status, StatusCode::NOT_FOUND);
 
             // It belongs to the session that attached the wallet now.
@@ -4505,6 +4534,73 @@ mod tests {
                 post_json_with(&app, "/api/session/logout", json!({}), None, Some(&token)).await;
             assert_eq!(out.status, StatusCode::NO_CONTENT);
             assert!(state.oauth().unwrap().authenticate(&access).is_none());
+        }
+
+        /// connect/07: a guest's wallet-link URL forwarded to someone else
+        /// is refused in their browser, so their sign-in cannot attach their
+        /// wallet to the sender's connection.
+        #[tokio::test]
+        async fn a_forwarded_link_cannot_attach_the_openers_wallet() {
+            let (app, state, fake, mock) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let approved = post_json_as(
+                &app,
+                &approve_path(&request_id),
+                json!({ "guest": true }),
+                None,
+            )
+            .await;
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let tokens = post_form(
+                &app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                ],
+            )
+            .await;
+            let access = tokens.json()["access_token"].as_str().unwrap().to_string();
+            let refused = topup_message(&app, &access).await;
+            let message = refused["error"]["message"].as_str().unwrap().to_string();
+            let ticket = message
+                .split("?link=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string();
+
+            // The victim's browser: never approved that guest.
+            let path = format!("/api/oauth/link/{ticket}");
+            let view = get(&app, &path).await;
+            assert_eq!(view.status, StatusCode::FORBIDDEN, "{}", view.body);
+            assert_eq!(view.json()["error"], "other_browser");
+            let link_cookie = state.tenants().link_cookie(&ticket, true);
+            let link_cookie = link_cookie.to_str().unwrap().split(';').next().unwrap();
+            let linked = post_json_with(
+                &app,
+                &path,
+                json!({ "confirm": true }),
+                Some(link_cookie),
+                Some(&fake.token_for(USER)),
+            )
+            .await;
+            assert_eq!(linked.status, StatusCode::FORBIDDEN, "{}", linked.body);
+            assert_eq!(linked.json()["error"], "other_browser");
+            assert!(state.tenants().is_empty(), "nothing bound to the guest");
+            assert_eq!(mock.created.lock().unwrap().len(), 0);
+            let still = topup_message(&app, &access).await;
+            assert!(still["error"].is_object(), "the guest still cannot pay");
         }
 
         /// The subject cookie is a shortcut to a Privy login, not a login of

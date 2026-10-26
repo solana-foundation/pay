@@ -114,7 +114,10 @@ Done on `feat/pay-connect`:
   the host connects normally. Catalog tools need no wallet; the first tool
   call that would pay (`curl`, `get_balance`, `topup`) fails with a message
   carrying a one-time link, `{pages}/connect?link=<ticket>` (30-minute
-  ticket, hash stored in the `TenantRegistry`). That page signs the user in
+  ticket, hash stored in the `TenantRegistry`). The ticket works only in the
+  browser that approved the guest (signed `pay_guest` cookie, last four
+  guests), so a forwarded link cannot attach someone else's wallet; anywhere
+  else it answers `403 other_browser`. That page signs the user in
   with Privy and `POST /api/oauth/link/{ticket}` attaches the wallet to the
   guest subject (and binds it under the Privy subject, cookie set), so the
   host's existing tokens start paying. An empty wallet continues to the

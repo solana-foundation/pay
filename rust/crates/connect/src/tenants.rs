@@ -46,6 +46,19 @@ const LINK_LIMITS: crate::capacity::Limits = crate::capacity::Limits {
     anonymous: crate::capacity::Anonymous::EvictOldest,
 };
 
+/// Guests one browser remembers approving, newest last.
+const GUESTS_PER_BROWSER: usize = 4;
+
+/// Why a link ticket cannot be used here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRefused {
+    /// Unknown, used, being used, or expired.
+    Unknown,
+    /// Live, but its guest was approved in another browser: whoever sent
+    /// the link would get the wallet.
+    OtherBrowser,
+}
+
 /// Subjects minted for guests: connected, no wallet yet.
 pub const GUEST_PREFIX: &str = "guest_";
 
@@ -462,25 +475,76 @@ impl TenantRegistry {
         Some(ticket)
     }
 
-    /// The subject a live ticket is for, without consuming it.
-    pub fn peek_link(&self, ticket: &str) -> Option<String> {
-        let links = self.links.lock().unwrap();
-        let t = links.get(&crate::protocol::sha256_hex(ticket))?;
-        (!t.claimed && Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL)
-            .then(|| t.subject.clone())
+    /// Remember that this browser approved guest `subject`, beside the
+    /// last few guests it approved before: only this browser can later
+    /// attach a wallet to that guest's connection.
+    pub fn guest_cookie(
+        &self,
+        headers: &axum::http::HeaderMap,
+        subject: &str,
+        secure: bool,
+    ) -> axum::http::HeaderValue {
+        let mut guests = self.guests_from_cookie(headers);
+        guests.retain(|guest| guest != subject);
+        guests.push(subject.to_string());
+        let keep = guests.len().saturating_sub(GUESTS_PER_BROWSER);
+        cookie::set(
+            cookie::GUEST_NAME,
+            &self.sign_cookie_value(b"guest", &guests[keep..].join("~")),
+            secure,
+        )
     }
 
-    /// Reserve a live ticket before external provisioning. Dropping the
-    /// claim releases it for a retry; committing consumes it.
-    pub(crate) fn claim_link<'a>(&'a self, ticket: &str) -> Option<LinkClaim<'a>> {
+    fn guests_from_cookie(&self, headers: &axum::http::HeaderMap) -> Vec<String> {
+        cookie::value(headers, cookie::GUEST_NAME)
+            .and_then(|signed| self.verify_cookie_value(b"guest", &signed))
+            .map(|value| value.split('~').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The subject a live ticket is for, without consuming it, when this
+    /// browser is the one that approved that guest.
+    pub fn peek_link(
+        &self,
+        ticket: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<String, LinkRefused> {
+        let subject = {
+            let links = self.links.lock().unwrap();
+            let t = links
+                .get(&crate::protocol::sha256_hex(ticket))
+                .ok_or(LinkRefused::Unknown)?;
+            if t.claimed || Instant::now().saturating_duration_since(t.created_at) > LINK_TTL {
+                return Err(LinkRefused::Unknown);
+            }
+            t.subject.clone()
+        };
+        self.guests_from_cookie(headers)
+            .contains(&subject)
+            .then_some(subject)
+            .ok_or(LinkRefused::OtherBrowser)
+    }
+
+    /// Reserve a live ticket before external provisioning, when this
+    /// browser approved its guest. Dropping the claim releases it for a
+    /// retry; committing consumes it.
+    pub(crate) fn claim_link<'a>(
+        &'a self,
+        ticket: &str,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<LinkClaim<'a>, LinkRefused> {
+        let guests = self.guests_from_cookie(headers);
         let key = crate::protocol::sha256_hex(ticket);
         let mut links = self.links.lock().unwrap();
-        let entry = links.get_mut(&key)?;
+        let entry = links.get_mut(&key).ok_or(LinkRefused::Unknown)?;
         if entry.claimed || Instant::now().saturating_duration_since(entry.created_at) > LINK_TTL {
-            return None;
+            return Err(LinkRefused::Unknown);
+        }
+        if !guests.contains(&entry.subject) {
+            return Err(LinkRefused::OtherBrowser);
         }
         entry.claimed = true;
-        Some(LinkClaim {
+        Ok(LinkClaim {
             registry: self,
             key,
             subject: entry.subject.clone(),
@@ -664,6 +728,7 @@ pub mod cookie {
 
     pub const SUBJECT_NAME: &str = "pay_subject";
     pub const LINK_NAME: &str = "pay_link";
+    pub const GUEST_NAME: &str = "pay_guest";
     const ONE_YEAR: u64 = 365 * 24 * 60 * 60;
 
     /// The subject the request's cookie names, if any.
@@ -993,21 +1058,92 @@ mod tests {
         assert!(registry.update_credentials("sub_x", |_| {}).is_none());
     }
 
+    /// The headers of a browser holding `registry`'s guest cookie for
+    /// `subjects`, approved in that order.
+    fn browser_of(registry: &TenantRegistry, subjects: &[&str]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for subject in subjects {
+            let set = registry.guest_cookie(&headers, subject, true);
+            let pair = set.to_str().unwrap().split(';').next().unwrap().to_string();
+            headers.insert(axum::http::header::COOKIE, pair.parse().unwrap());
+        }
+        headers
+    }
+
     #[test]
     fn link_tickets_are_single_use_and_name_their_subject() {
         let registry = TenantRegistry::new();
+        let browser = browser_of(&registry, &["guest_1"]);
         let ticket = registry.mint_link("guest_1").unwrap();
         assert!(ticket.len() >= 32);
-        assert_eq!(registry.peek_link(&ticket).as_deref(), Some("guest_1"));
-        let claim = registry.claim_link(&ticket).unwrap();
+        assert_eq!(
+            registry.peek_link(&ticket, &browser).as_deref(),
+            Ok("guest_1")
+        );
+        let claim = registry.claim_link(&ticket, &browser).unwrap();
         assert_eq!(claim.subject(), "guest_1");
-        assert!(registry.peek_link(&ticket).is_none(), "claimed");
+        assert_eq!(
+            registry.peek_link(&ticket, &browser),
+            Err(LinkRefused::Unknown),
+            "claimed"
+        );
         drop(claim);
-        assert!(registry.peek_link(&ticket).is_some(), "released for retry");
-        registry.claim_link(&ticket).unwrap().commit();
-        assert!(registry.peek_link(&ticket).is_none(), "consumed");
-        assert!(registry.claim_link("nope").is_none());
+        assert!(
+            registry.peek_link(&ticket, &browser).is_ok(),
+            "released for retry"
+        );
+        registry.claim_link(&ticket, &browser).unwrap().commit();
+        assert_eq!(
+            registry.peek_link(&ticket, &browser),
+            Err(LinkRefused::Unknown),
+            "consumed"
+        );
+        assert!(registry.claim_link("nope", &browser).is_err());
         assert!(is_guest("guest_abc") && !is_guest("sub_abc"));
+    }
+
+    /// connect/07: a ticket is good only in the browser that approved its
+    /// guest, so whoever forwards it cannot have someone else link a wallet.
+    #[test]
+    fn a_link_ticket_works_only_in_the_guests_own_browser() {
+        let registry = TenantRegistry::new();
+        let ticket = registry.mint_link("guest_attacker").unwrap();
+        let victim = browser_of(&registry, &["guest_victim"]);
+        for headers in [axum::http::HeaderMap::new(), victim] {
+            assert_eq!(
+                registry.peek_link(&ticket, &headers),
+                Err(LinkRefused::OtherBrowser)
+            );
+            assert!(matches!(
+                registry.claim_link(&ticket, &headers),
+                Err(LinkRefused::OtherBrowser)
+            ));
+        }
+        // A forged cookie naming the guest proves nothing.
+        let mut forged = axum::http::HeaderMap::new();
+        forged.insert(
+            axum::http::header::COOKIE,
+            "pay_guest=guest_attacker.00".parse().unwrap(),
+        );
+        assert_eq!(
+            registry.peek_link(&ticket, &forged),
+            Err(LinkRefused::OtherBrowser)
+        );
+
+        // Control: the approving browser links, among its last few guests.
+        let own = browser_of(
+            &registry,
+            &["guest_attacker", "guest_2", "guest_3", "guest_4"],
+        );
+        assert!(registry.claim_link(&ticket, &own).is_ok());
+        let one_too_many = browser_of(
+            &registry,
+            &["guest_attacker", "guest_2", "guest_3", "guest_4", "guest_5"],
+        );
+        assert_eq!(
+            registry.guests_from_cookie(&one_too_many),
+            ["guest_2", "guest_3", "guest_4", "guest_5"]
+        );
     }
 
     #[test]
@@ -1023,15 +1159,23 @@ mod tests {
     #[test]
     fn a_burst_of_link_tickets_cannot_lock_out_other_guests() {
         let registry = TenantRegistry::new();
+        let browser = browser_of(&registry, &["guest_linking", "guest_first", "guest_late"]);
         let claimed = registry.mint_link("guest_linking").unwrap();
-        let claim = registry.claim_link(&claimed).unwrap();
+        let claim = registry.claim_link(&claimed, &browser).unwrap();
         let first = registry.mint_link("guest_first").unwrap();
         for i in 0..LINK_LIMITS.rows {
             registry.mint_link(&format!("guest_burst_{i}")).unwrap();
         }
         let late = registry.mint_link("guest_late").expect("room is made");
-        assert_eq!(registry.peek_link(&late).as_deref(), Some("guest_late"));
-        assert!(registry.peek_link(&first).is_none(), "the oldest went");
+        assert_eq!(
+            registry.peek_link(&late, &browser).as_deref(),
+            Ok("guest_late")
+        );
+        assert_eq!(
+            registry.peek_link(&first, &browser),
+            Err(LinkRefused::Unknown),
+            "the oldest went"
+        );
         claim.commit();
         assert_eq!(registry.links.lock().unwrap().len(), LINK_LIMITS.rows - 1);
     }
