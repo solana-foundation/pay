@@ -137,11 +137,13 @@ impl WalletProbe for PayApiProbe {
 
 #[cfg(all(feature = "mcp", feature = "privy"))]
 fn default_spend_history() -> Arc<dyn tenants::SpendHistory> {
-    Arc::new(privy::OnChainSpendHistory::new(
+    // The public RPC rate-limits a history scan within a dozen reads.
+    let rpc = pay_core::config::payment_rpc_url().unwrap_or_else(|| {
         pay_core::client::subscription::default_rpc_url_for_network(
             pay_core::accounts::MAINNET_NETWORK,
-        ),
-    ))
+        )
+    });
+    Arc::new(privy::OnChainSpendHistory::new(rpc))
 }
 
 /// Without Privy no wallet is ever bound, so nothing is read.

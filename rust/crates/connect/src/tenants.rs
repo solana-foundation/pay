@@ -145,7 +145,8 @@ struct LinkTicket {
 #[async_trait::async_trait]
 pub trait SpendHistory: Send + Sync {
     /// USD minor units `wallet` paid out in stablecoins during the current
-    /// UTC day. An error means unavailable, and binding fails closed;
+    /// UTC day. An error means unavailable: binding still succeeds, with
+    /// today's allowance held until a later read counts it.
     /// [`UNCOUNTABLE_SPEND`] means binding succeeds with nothing left today.
     async fn spent_today(&self, wallet: &str) -> Result<u64, String>;
 }
@@ -170,10 +171,33 @@ pub struct TenantRegistry {
     tenants: Mutex<HashMap<String, Arc<TenantRecord>>>,
     links: Mutex<HashMap<String, LinkTicket>>,
     provisioning: Mutex<HashSet<String>>,
-    /// Ledger keys whose spend before this process started is recorded.
-    seeded: Mutex<HashSet<String>>,
+    /// Ledger keys whose spend before this process started is accounted for.
+    seeded: Mutex<HashMap<String, Seed>>,
     ledger: Arc<dyn SpendLedger>,
     cookie_key: [u8; 32],
+}
+
+/// How a wallet's spend before this process started is accounted for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seed {
+    /// Read from its history; the in-process ledger covers the rest.
+    Counted,
+    /// History was unavailable: the ledger refuses every reservation, on any
+    /// day, until a later read counts it.
+    Held,
+}
+
+/// What [`TenantRegistry::seed_spend`] did. Neither outcome refuses the
+/// binding: anyone can make a wallet's history unreadable by naming it in
+/// transactions, so an unreadable history withholds spend, not sign-in.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Seeded {
+    Counted,
+    /// Nothing can be spent until a later sign-in reads the history.
+    Held {
+        why: String,
+    },
 }
 
 /// An allowance reservation that is automatically released unless a wallet
@@ -256,24 +280,33 @@ impl TenantRegistry {
 
     /// Record what `tenant`'s wallet already spent today before this process
     /// saw it, once per wallet. The in-process ledger covers the rest.
-    pub async fn seed_spend(
-        &self,
-        tenant: &TenantRecord,
-        history: &dyn SpendHistory,
-    ) -> Result<(), String> {
+    pub async fn seed_spend(&self, tenant: &TenantRecord, history: &dyn SpendHistory) -> Seeded {
         let key = tenant.ledger_key();
-        if self.seeded.lock().unwrap().contains(&key) {
-            return Ok(());
+        if matches!(self.seeded.lock().unwrap().get(&key), Some(Seed::Counted)) {
+            return Seeded::Counted;
         }
-        let mut spent = history.spent_today(&tenant.pubkey).await?;
-        if spent == UNCOUNTABLE_SPEND {
-            // Exactly the cap: nothing more today, and a refusal that reads.
-            spent = tenant.policy.daily_cap.unwrap_or(UNCOUNTABLE_SPEND);
+        let cap = tenant.policy.daily_cap.unwrap_or(UNCOUNTABLE_SPEND);
+        let read = history.spent_today(&tenant.pubkey).await;
+        let mut seeded = self.seeded.lock().unwrap();
+        if seeded.get(&key) == Some(&Seed::Counted) {
+            return Seeded::Counted;
         }
-        if self.seeded.lock().unwrap().insert(key.clone()) {
-            let _ = self.ledger.check_and_record(&key, spent, None);
+        match read {
+            Ok(mut spent) => {
+                if spent == UNCOUNTABLE_SPEND {
+                    // Exactly the cap: nothing more today, and a refusal that reads.
+                    spent = cap;
+                }
+                self.ledger.count(&key, spent);
+                seeded.insert(key, Seed::Counted);
+                Seeded::Counted
+            }
+            Err(why) => {
+                self.ledger.hold(&key);
+                seeded.insert(key, Seed::Held);
+                Seeded::Held { why }
+            }
         }
-        Ok(())
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
@@ -1056,21 +1089,21 @@ mod tests {
 
         // After it: the chain says $5 left the wallet today.
         let after = TenantRegistry::new();
-        after
-            .seed_spend(&tenant, &FixedHistory(50_000))
-            .await
-            .unwrap();
+        assert_eq!(
+            after.seed_spend(&tenant, &FixedHistory(50_000)).await,
+            Seeded::Counted
+        );
         assert!(after.reserve_cli_transaction(&tenant, 1).is_err());
         // Seeding happens once; a later login does not double count.
         let partial = TenantRegistry::new();
-        partial
-            .seed_spend(&tenant, &FixedHistory(30_000))
-            .await
-            .unwrap();
-        partial
-            .seed_spend(&tenant, &FixedHistory(30_000))
-            .await
-            .unwrap();
+        assert_eq!(
+            partial.seed_spend(&tenant, &FixedHistory(30_000)).await,
+            Seeded::Counted
+        );
+        assert_eq!(
+            partial.seed_spend(&tenant, &FixedHistory(30_000)).await,
+            Seeded::Counted
+        );
         partial
             .reserve_cli_transaction(&tenant, 10_000)
             .unwrap()
@@ -1083,7 +1116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_history_seeds_nothing_and_retries() {
+    async fn an_unknown_history_holds_the_day_and_retries() {
         struct Down;
         #[async_trait::async_trait]
         impl SpendHistory for Down {
@@ -1093,12 +1126,73 @@ mod tests {
         }
         let registry = TenantRegistry::new();
         let tenant = record("sub_1");
-        assert!(registry.seed_spend(&tenant, &Down).await.is_err());
-        registry
-            .seed_spend(&tenant, &FixedHistory(50_000))
-            .await
-            .unwrap();
+        // Unreadable history binds, but nothing can be spent on it.
+        assert!(matches!(
+            registry.seed_spend(&tenant, &Down).await,
+            Seeded::Held { .. }
+        ));
         assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        assert!(matches!(
+            registry.seed_spend(&tenant, &Down).await,
+            Seeded::Held { .. }
+        ));
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        // A later read replaces the hold with the real count.
+        assert_eq!(
+            registry.seed_spend(&tenant, &FixedHistory(30_000)).await,
+            Seeded::Counted
+        );
+        for _ in 0..2 {
+            registry
+                .reserve_cli_transaction(&tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        // Counted once: a later outage changes nothing.
+        assert_eq!(registry.seed_spend(&tenant, &Down).await, Seeded::Counted);
+    }
+
+    #[tokio::test]
+    async fn a_held_wallet_stays_held_across_midnight() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Down;
+        #[async_trait::async_trait]
+        impl SpendHistory for Down {
+            async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                Err("rpc down".into())
+            }
+        }
+        let day = Arc::new(AtomicU64::new(100));
+        let clock_day = day.clone();
+        let ledger = Arc::new(MemoryLedger::with_clock(Arc::new(move || {
+            clock_day.load(Ordering::SeqCst)
+        })));
+        let registry = TenantRegistry::with_ledger(ledger);
+        let mut tenant = record("sub_1");
+        tenant.policy = SpendPolicy {
+            per_call_ceiling: Some(50_000),
+            daily_cap: Some(50_000),
+        };
+        assert!(matches!(
+            registry.seed_spend(&tenant, &Down).await,
+            Seeded::Held { .. }
+        ));
+
+        // A new day does not reset an unknown history into a full allowance.
+        day.store(101, Ordering::SeqCst);
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+
+        // Only a read lifts it, and what it counted applies at once.
+        assert_eq!(
+            registry.seed_spend(&tenant, &FixedHistory(40_000)).await,
+            Seeded::Counted
+        );
+        assert!(registry.reserve_cli_transaction(&tenant, 20_000).is_err());
+        registry
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
     }
 
     #[test]

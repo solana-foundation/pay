@@ -935,6 +935,9 @@ pub struct OnChainSpendHistory {
 /// today is reported as unknown rather than undercounted.
 const HISTORY_PAGES: usize = 4;
 const HISTORY_PAGE: usize = 1_000;
+/// Newest message version [`ConfirmedTransaction`] reads. Anyone can name a
+/// wallet in a transaction of any live version.
+const MAX_TRANSACTION_VERSION: u8 = 1;
 
 impl OnChainSpendHistory {
     pub fn new(rpc_url: impl Into<String>) -> Self {
@@ -1072,7 +1075,7 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
                 .rpc(
                     "getTransaction",
                     json!([signature, { "encoding": "json", "commitment": "confirmed",
-                                        "maxSupportedTransactionVersion": 0 }]),
+                                        "maxSupportedTransactionVersion": MAX_TRANSACTION_VERSION }]),
                 )
                 .await?;
             let tx: ConfirmedTransaction = serde_json::from_value(tx)
@@ -2256,19 +2259,24 @@ pub(crate) mod tests {
             recipients: crate::tenants::DEFAULT_RECIPIENTS,
         };
         let registry = TenantRegistry::new();
-        registry.seed_spend(&tenant, &history).await.unwrap();
+        assert_eq!(
+            registry.seed_spend(&tenant, &history).await,
+            crate::tenants::Seeded::Counted
+        );
         assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
         let fresh = TenantRegistry::new();
-        fresh
-            .seed_spend(&tenant, &crate::tenants::FixedHistory(0))
-            .await
-            .unwrap();
+        assert_eq!(
+            fresh
+                .seed_spend(&tenant, &crate::tenants::FixedHistory(0))
+                .await,
+            crate::tenants::Seeded::Counted
+        );
         assert!(fresh.reserve_cli_transaction(&tenant, 1).is_ok());
     }
 
     #[tokio::test]
-    async fn unavailable_transaction_history_leaves_the_wallet_unseeded() {
-        use crate::tenants::{SpendHistory, TenantRegistry};
+    async fn unavailable_transaction_history_holds_the_day_until_read() {
+        use crate::tenants::{Seeded, SpendHistory, TenantRegistry};
         use pay_kit::mpp::protocol::solana::mints;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2315,19 +2323,84 @@ pub(crate) mod tests {
             let history = spend_rpc(missing.clone()).await;
             let error = history.spent_today(ADDRESS).await.unwrap_err();
             assert!(error.contains("history unavailable"), "{missing}: {error}");
-            assert!(registry.seed_spend(&tenant, &history).await.is_err());
+            assert!(matches!(
+                registry.seed_spend(&tenant, &history).await,
+                Seeded::Held { .. }
+            ));
+            assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
         }
-        // A failed seed left the wallet unseeded: complete history still lands.
+        // The hold gives way to complete history once it reads.
         let full = spend_rpc(
             json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
             "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
-                                   "uiTokenAmount": { "amount": "5000000" } }],
+                                   "uiTokenAmount": { "amount": "3000000" } }],
             "postTokenBalances": [] } }),
         )
         .await;
-        assert_eq!(full.spent_today(ADDRESS).await.unwrap(), 50_000);
-        registry.seed_spend(&tenant, &full).await.unwrap();
+        assert_eq!(full.spent_today(ADDRESS).await.unwrap(), 30_000);
+        assert_eq!(registry.seed_spend(&tenant, &full).await, Seeded::Counted);
+        for _ in 0..2 {
+            registry
+                .reserve_cli_transaction(&tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
         assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+    }
+
+    /// Anyone can name a wallet in a v1 transaction; the node refuses it to
+    /// a reader that asks for at most v0, as mainnet does.
+    #[tokio::test]
+    async fn on_chain_history_reads_v1_transactions() {
+        use crate::tenants::SpendHistory;
+        use pay_kit::mpp::protocol::solana::mints;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let v1_debit = json!({ "version": 1,
+            "transaction": { "signatures": ["v1"], "message": {
+                "header": { "numRequiredSignatures": 1, "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": 0 },
+                "accountKeys": [ADDRESS], "recentBlockhash": "11111111111111111111111111111111",
+                "instructions": [], "transactionConfig": {} } },
+            "meta": { "err": null,
+                "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                       "uiTokenAmount": { "amount": "2000000" } }],
+                "postTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                        "uiTokenAmount": { "amount": "500000" } }] } });
+        let rpc = move |Json(request): Json<serde_json::Value>| {
+            let v1_debit = v1_debit.clone();
+            async move {
+                let reply = match request["method"].as_str().unwrap() {
+                    "getTokenAccountsByOwner" => json!({ "result": { "value": [] } }),
+                    "getSignaturesForAddress" => {
+                        json!({ "result": [{ "signature": "v1", "blockTime": now, "err": null }] })
+                    }
+                    "getTransaction" => {
+                        match request["params"][1]["maxSupportedTransactionVersion"].as_u64() {
+                            Some(max) if max >= 1 => json!({ "result": v1_debit }),
+                            _ => json!({ "error": { "code": -32015,
+                                "message": "Transaction version (1) is not supported by the requesting client." } }),
+                        }
+                    }
+                    other => panic!("{other}"),
+                };
+                let mut reply = reply;
+                reply["jsonrpc"] = json!("2.0");
+                reply["id"] = json!(1);
+                Json(reply)
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(rpc)))
+                .await
+                .unwrap();
+        });
+        let history = OnChainSpendHistory::new(format!("http://{addr}/"));
+        assert_eq!(history.spent_today(ADDRESS).await, Ok(15_000));
     }
 
     #[tokio::test]

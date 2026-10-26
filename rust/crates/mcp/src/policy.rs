@@ -6,7 +6,7 @@
 //! client can also show a prompt, the policy runs first and the prompt
 //! second: a cap is a hard limit, a prompt is a courtesy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pay_core::keystore::{AuthGate, AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
@@ -63,18 +63,32 @@ pub struct Recorded {
 pub trait SpendLedger: Send + Sync {
     fn spent_today(&self, subject: &str) -> u64;
     /// Atomically check `cap` and reserve `amount` for today. Returns the
-    /// day charged and resulting total, or the would-be total when it
-    /// exceeds the cap.
+    /// day charged and resulting total, or why it was refused.
     fn check_and_record(
         &self,
         subject: &str,
         amount: u64,
         cap: Option<u64>,
-    ) -> Result<Recorded, u64>;
+    ) -> Result<Recorded, Refused>;
     /// Release a reservation charged to `day` that did not result in a
     /// signature. A reservation from an earlier day no longer counts against
     /// any cap and is left alone.
     fn release(&self, subject: &str, day: u64, amount: u64);
+    /// Refuse every reservation for `subject`, on any day, until
+    /// [`SpendLedger::count`] lifts the hold.
+    fn hold(&self, subject: &str);
+    /// Lift any hold and charge `spent` to today in one step, so no
+    /// reservation can land in between.
+    fn count(&self, subject: &str, spent: u64);
+}
+
+/// Why [`SpendLedger::check_and_record`] refused a reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The would-be total for today exceeds the cap.
+    OverCap { total: u64 },
+    /// Spend before this ledger saw the subject is unknown.
+    Held,
 }
 
 /// Day counter, so a ledger can be driven in tests.
@@ -89,8 +103,14 @@ fn utc_day_now() -> u64 {
 
 /// In-memory ledger, one running total per subject per UTC day.
 pub struct MemoryLedger {
-    totals: Mutex<HashMap<String, (u64, u64)>>,
+    book: Mutex<Book>,
     clock: Clock,
+}
+
+#[derive(Default)]
+struct Book {
+    totals: HashMap<String, (u64, u64)>,
+    held: HashSet<String>,
 }
 
 impl Default for MemoryLedger {
@@ -106,7 +126,7 @@ impl MemoryLedger {
 
     pub fn with_clock(clock: Clock) -> Self {
         Self {
-            totals: Mutex::default(),
+            book: Mutex::default(),
             clock,
         }
     }
@@ -115,7 +135,7 @@ impl MemoryLedger {
 impl SpendLedger for MemoryLedger {
     fn spent_today(&self, subject: &str) -> u64 {
         let today = (self.clock)();
-        match self.totals.lock().unwrap().get(subject) {
+        match self.book.lock().unwrap().totals.get(subject) {
             Some((day, total)) if *day == today => *total,
             _ => 0,
         }
@@ -126,16 +146,19 @@ impl SpendLedger for MemoryLedger {
         subject: &str,
         amount: u64,
         cap: Option<u64>,
-    ) -> Result<Recorded, u64> {
+    ) -> Result<Recorded, Refused> {
         let today = (self.clock)();
-        let mut totals = self.totals.lock().unwrap();
-        let entry = totals.entry(subject.to_string()).or_insert((today, 0));
+        let mut book = self.book.lock().unwrap();
+        if book.held.contains(subject) {
+            return Err(Refused::Held);
+        }
+        let entry = book.totals.entry(subject.to_string()).or_insert((today, 0));
         if entry.0 != today {
             *entry = (today, 0);
         }
         let next = entry.1.saturating_add(amount);
         if cap.is_some_and(|cap| next > cap) {
-            return Err(next);
+            return Err(Refused::OverCap { total: next });
         }
         entry.1 = next;
         Ok(Recorded {
@@ -145,12 +168,27 @@ impl SpendLedger for MemoryLedger {
     }
 
     fn release(&self, subject: &str, day: u64, amount: u64) {
-        let mut totals = self.totals.lock().unwrap();
-        if let Some((current, total)) = totals.get_mut(subject)
+        let mut book = self.book.lock().unwrap();
+        if let Some((current, total)) = book.totals.get_mut(subject)
             && *current == day
         {
             *total = total.saturating_sub(amount);
         }
+    }
+
+    fn hold(&self, subject: &str) {
+        self.book.lock().unwrap().held.insert(subject.to_string());
+    }
+
+    fn count(&self, subject: &str, spent: u64) {
+        let today = (self.clock)();
+        let mut book = self.book.lock().unwrap();
+        book.held.remove(subject);
+        let entry = book.totals.entry(subject.to_string()).or_insert((today, 0));
+        if entry.0 != today {
+            *entry = (today, 0);
+        }
+        entry.1 = entry.1.saturating_add(spent);
     }
 }
 
@@ -231,12 +269,17 @@ impl PolicyGate {
                 day: recorded.day,
                 amount,
             })),
-            Err(next) => Err(denied(format!(
+            Err(Refused::OverCap { total }) => Err(denied(format!(
                 "{} would take today's spend to {} against a daily cap of {}",
                 dollars(amount),
-                dollars(next),
+                dollars(total),
                 dollars(self.policy.daily_cap.expect("cap was checked"))
             ))),
+            Err(Refused::Held) => Err(denied(
+                "this wallet's spending history could not be read, so nothing can be spent \
+                 until it is; sign in again to retry"
+                    .to_string(),
+            )),
         }
     }
 }
@@ -343,6 +386,57 @@ mod tests {
 
     fn payment(amount: &str) -> AuthIntent {
         AuthIntent::authorize_payment_details(amount, "test", "api.test")
+    }
+
+    #[test]
+    fn a_hold_refuses_on_every_day_until_counted() {
+        let day = Arc::new(AtomicU64::new(100));
+        let ledger = ledger_at(day.clone());
+        ledger.hold("sub");
+        assert_eq!(ledger.check_and_record("sub", 1, None), Err(Refused::Held));
+        day.store(101, Ordering::SeqCst);
+        assert_eq!(ledger.check_and_record("sub", 1, None), Err(Refused::Held));
+        // Other subjects are unaffected.
+        assert!(ledger.check_and_record("other", 1, Some(1)).is_ok());
+
+        ledger.count("sub", 40_000);
+        assert_eq!(ledger.spent_today("sub"), 40_000);
+        assert_eq!(
+            ledger.check_and_record("sub", 20_000, Some(50_000)),
+            Err(Refused::OverCap { total: 60_000 })
+        );
+        assert!(ledger.check_and_record("sub", 10_000, Some(50_000)).is_ok());
+    }
+
+    #[test]
+    fn lifting_a_hold_and_counting_spend_is_one_step() {
+        use std::sync::atomic::AtomicBool;
+        for _ in 0..200 {
+            let ledger = Arc::new(MemoryLedger::new());
+            ledger.hold("sub");
+            let done = Arc::new(AtomicBool::new(false));
+            let racer = {
+                let (ledger, done) = (ledger.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut accepted = 0;
+                    while !done.load(Ordering::SeqCst) {
+                        if ledger.check_and_record("sub", 20_000, Some(50_000)).is_ok() {
+                            accepted += 1;
+                        }
+                    }
+                    accepted
+                })
+            };
+            std::thread::yield_now();
+            ledger.count("sub", 40_000);
+            done.store(true, Ordering::SeqCst);
+            assert_eq!(
+                racer.join().unwrap(),
+                0,
+                "a reservation slipped past the hold"
+            );
+            assert_eq!(ledger.spent_today("sub"), 40_000);
+        }
     }
 
     #[test]

@@ -1264,7 +1264,7 @@ pub(crate) async fn approve_with_privy(
                 && wallet.pay_can_sign
         });
         if unchanged {
-            seed_spend(state, &existing).await?;
+            seed_spend(state, &existing).await;
             return Ok(PrivyApproval {
                 subject,
                 bound: None,
@@ -1316,7 +1316,7 @@ pub(crate) async fn approve_with_privy(
             })));
         }
         let record = privy.tenant_record(&subject, &wallet);
-        seed_spend(state, &record).await?;
+        seed_spend(state, &record).await;
         // The provider may have moved the wallet while we waited on it and
         // on its history: bind only what it still confirms is this user's.
         let confirmed = privy
@@ -1350,23 +1350,16 @@ pub(crate) async fn approve_with_privy(
 }
 
 /// Count what the wallet already spent today before it can sign here.
+/// Unreadable history never refuses the sign-in; it withholds spend.
 #[cfg(feature = "privy")]
-async fn seed_spend(
-    state: &AppState,
-    record: &crate::tenants::TenantRecord,
-) -> Result<(), ApiError> {
-    state
+async fn seed_spend(state: &AppState, record: &crate::tenants::TenantRecord) {
+    if let crate::tenants::Seeded::Held { why } = state
         .tenants()
         .seed_spend(record, state.spend_history())
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, wallet = %record.pubkey, "wallet spend history unavailable");
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "spend_history_unavailable",
-                "Your wallet's spending today could not be checked. Try again shortly.",
-            )
-        })
+    {
+        tracing::warn!(error = %why, wallet = %record.pubkey, "wallet spend history unavailable; no spend until it is read");
+    }
 }
 
 /// A wallet binding the provider no longer confirms: unbind every subject
@@ -3342,13 +3335,6 @@ mod tests {
 
         #[tokio::test]
         async fn a_wallet_bound_after_a_restart_keeps_todays_spend() {
-            struct Down;
-            #[async_trait::async_trait]
-            impl crate::tenants::SpendHistory for Down {
-                async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
-                    Err("rpc down".into())
-                }
-            }
             for (history, cap_left) in [
                 (
                     Arc::new(crate::tenants::FixedHistory(100_000))
@@ -3379,31 +3365,69 @@ mod tests {
                 );
             }
 
-            // Unknown history: the sign-in fails closed.
+            // A rate-limited history read (anyone can push a wallet's
+            // history past the public RPC's limit) still signs in, with
+            // nothing to spend until a later sign-in reads it.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let limited = Arc::new(AtomicBool::new(true));
+            let rpc = {
+                let limited = limited.clone();
+                move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let limited = limited.load(Ordering::SeqCst);
+                    async move {
+                        use axum::response::IntoResponse;
+                        if limited {
+                            return StatusCode::TOO_MANY_REQUESTS.into_response();
+                        }
+                        let result = match request["method"].as_str().unwrap() {
+                            "getTokenAccountsByOwner" => json!({ "value": [] }),
+                            "getSignaturesForAddress" => json!([]),
+                            other => panic!("{other}"),
+                        };
+                        axum::Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                            .into_response()
+                    }
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().route("/", axum::routing::post(rpc)),
+                )
+                .await
+                .unwrap();
+            });
             let mock = Arc::new(MockPrivy::default());
             let fake = FakeApp::new(&mock_privy(mock.clone()).await);
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
-                .with_spend_history(Arc::new(Down));
+                .with_spend_history(Arc::new(crate::privy::OnChainSpendHistory::new(format!(
+                    "http://{addr}/"
+                ))));
             let app = crate::router(state.clone());
             let client_id = register_grok(&app).await;
-            let request_id = start_authorization(&app, &client_id, None).await;
-            let refused = post_json_with(
-                &app,
-                &approve_path(&request_id),
-                json!({}),
-                None,
-                Some(&fake.token_for(USER)),
-            )
-            .await;
-            assert_eq!(
-                refused.status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{}",
-                refused.body
+            privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            let tenant = state
+                .tenants()
+                .get(&crate::privy::subject_for_user(USER))
+                .unwrap();
+            assert!(
+                state
+                    .tenants()
+                    .reserve_cli_transaction(&tenant, 100)
+                    .is_err()
             );
-            assert!(state.tenants().is_empty());
+            limited.store(false, Ordering::SeqCst);
+            privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            assert!(
+                state
+                    .tenants()
+                    .reserve_cli_transaction(&tenant, 100)
+                    .is_ok()
+            );
         }
 
         #[tokio::test]
