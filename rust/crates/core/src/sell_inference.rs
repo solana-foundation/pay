@@ -39,6 +39,8 @@ pub const MODELS_PATH: &str = "v1/models";
 pub const USAGE_PRESET: &str = "openai-compatible";
 /// Upper bound on a buffered response body for usage extraction.
 pub const RESPONSE_BODY_LIMIT: usize = 32 * 1024 * 1024;
+/// Largest body a seller's worker may send pay-connect in one chunk push.
+pub const MAX_WORKER_PUSH_BYTES: usize = 256 * 1024;
 
 const TOKENS_PER_SCALE: u64 = 1_000_000;
 const PROMPT_TOKENS_PATH: &str = "/usage/prompt_tokens";

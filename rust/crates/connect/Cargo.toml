@@ -41,7 +41,7 @@ rand = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"], optional = true }
 reqwest = { workspace = true, features = ["json"], optional = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 solana-keychain = { workspace = true }
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true }

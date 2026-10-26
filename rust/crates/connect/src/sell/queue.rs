@@ -8,16 +8,23 @@
 //! a client that goes away closes it, and the worker's next push says so.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use pay_core::sell_inference::SellPricing;
 use serde_json::Value;
-use tokio::sync::{Notify, mpsc};
+use serde_json::value::RawValue;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 /// Most unclaimed requests one endpoint holds; beyond it, callers get 503.
 pub const MAX_WAITING: usize = 64;
+/// Most pushed bytes one request holds before its buyer reads them.
+pub const MAX_BUFFERED_PER_REQUEST: usize = 1024 * 1024;
+/// Most pushed bytes all of one endpoint's requests hold together.
+pub const MAX_BUFFERED_PER_ENDPOINT: usize = 4 * 1024 * 1024;
+/// Charged per frame on top of its bytes, for the event around it.
+const FRAME_OVERHEAD: usize = 64;
 
 /// The terms a request was admitted under. Pricing can change while a
 /// request waits; what the buyer paid for is what the endpoint earns.
@@ -61,13 +68,51 @@ pub struct Next {
     pub abandoned: Vec<ParkedRequest>,
 }
 
+/// One push of SSE `data:` lines. It holds its share of the request's and
+/// the endpoint's buffer budget until the buyer's stream takes it.
+#[derive(Debug)]
+pub struct Frame {
+    bytes: Bytes,
+    _budget: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+}
+
+impl Frame {
+    /// One `data: <chunk>\n\n` line per chunk. JSON outside strings may
+    /// carry raw line breaks, which would split an SSE line; inside strings
+    /// they are always escaped, so they become spaces.
+    fn sse(chunks: &[&RawValue]) -> Bytes {
+        let len = chunks.iter().map(|c| c.get().len() + 8).sum();
+        let mut out = Vec::with_capacity(len);
+        for chunk in chunks {
+            out.extend_from_slice(b"data: ");
+            out.extend(chunk.get().bytes().map(|b| match b {
+                b'\n' | b'\r' => b' ',
+                b => b,
+            }));
+            out.extend_from_slice(b"\n\n");
+        }
+        Bytes::from(out)
+    }
+
+    /// The bytes for the buyer; the budget they held is released.
+    pub fn into_bytes(self) -> Bytes {
+        self.bytes
+    }
+}
+
+impl PartialEq for Frame {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
 /// One step of the worker's answer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Event {
     /// A worker took the request.
     Claimed,
-    /// One `chat.completion.chunk` (streaming) or ignored (non-streaming).
-    Chunk(Value),
+    /// Pushed `chat.completion.chunk`s (streaming) or ignored (non-streaming).
+    Chunk(Frame),
     /// The end. Streaming: the final chunk (usually carrying `usage`) if
     /// any, then `[DONE]`. Non-streaming: the whole `chat.completion`.
     Complete(Option<Value>),
@@ -83,11 +128,17 @@ pub enum QueueError {
     Unknown,
     #[error("the client is no longer waiting")]
     Gone,
+    #[error("the buyer has not read what was already pushed; retry shortly")]
+    Backlogged,
+    #[error("one push may carry at most {MAX_BUFFERED_PER_REQUEST} bytes of chunks")]
+    TooLarge,
 }
 
 struct Parked {
     request: ParkedRequest,
     tx: mpsc::UnboundedSender<Event>,
+    /// Bytes this request's buyer has yet to read; see [`Frame`].
+    buffered: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -97,11 +148,22 @@ struct Inner {
 }
 
 /// The queue for one endpoint.
-#[derive(Default)]
 pub struct EndpointQueue {
     inner: Mutex<Inner>,
     /// One permit per parked request, so a waiting `next` wakes once each.
     parked: Notify,
+    /// Bytes all of this endpoint's buyers have yet to read.
+    buffered: Arc<Semaphore>,
+}
+
+impl Default for EndpointQueue {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            parked: Notify::new(),
+            buffered: Arc::new(Semaphore::new(MAX_BUFFERED_PER_ENDPOINT)),
+        }
+    }
 }
 
 impl EndpointQueue {
@@ -131,6 +193,7 @@ impl EndpointQueue {
                 admission,
             },
             tx,
+            buffered: Arc::new(Semaphore::new(MAX_BUFFERED_PER_REQUEST)),
         });
         drop(inner);
         self.parked.notify_one();
@@ -156,13 +219,16 @@ impl EndpointQueue {
             let mut abandoned = Vec::new();
             {
                 let mut inner = self.lock();
-                while let Some(parked) = inner.waiting.pop_front() {
+                while let Some(mut parked) = inner.waiting.pop_front() {
                     // A client that left before being claimed is skipped.
                     if parked.tx.send(Event::Claimed).is_err() {
                         abandoned.push(parked.request);
                         continue;
                     }
                     let request = parked.request.clone();
+                    // The worker has the body now; a claimed request that
+                    // lingers must not keep it.
+                    parked.request.body = Bytes::new();
                     inner.claimed.insert(request.id.clone(), parked);
                     return Next {
                         request: Some(request),
@@ -195,17 +261,41 @@ impl EndpointQueue {
         }
     }
 
-    /// Append chunks to a claimed request.
-    pub fn push(&self, id: &str, chunks: Vec<Value>) -> Result<(), QueueError> {
+    /// Append chunks to a claimed request. A buyer that does not read
+    /// leaves them buffered, so pushes fail with [`QueueError::Backlogged`]
+    /// once the request's or the endpoint's budget is spent.
+    pub fn push(&self, id: &str, chunks: &[&RawValue]) -> Result<(), QueueError> {
+        let bytes = Frame::sse(chunks);
+        let cost = bytes.len() + FRAME_OVERHEAD;
+        if cost > MAX_BUFFERED_PER_REQUEST {
+            return Err(QueueError::TooLarge);
+        }
+        let cost = u32::try_from(cost).map_err(|_| QueueError::TooLarge)?;
         let inner = self.lock();
         let parked = inner.claimed.get(id).ok_or(QueueError::Unknown)?;
-        for chunk in chunks {
-            parked
-                .tx
-                .send(Event::Chunk(chunk))
-                .map_err(|_| QueueError::Gone)?;
+        if parked.tx.is_closed() {
+            return Err(QueueError::Gone);
         }
-        Ok(())
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let request = parked
+            .buffered
+            .clone()
+            .try_acquire_many_owned(cost)
+            .map_err(|_| QueueError::Backlogged)?;
+        let endpoint = self
+            .buffered
+            .clone()
+            .try_acquire_many_owned(cost)
+            .map_err(|_| QueueError::Backlogged)?;
+        parked
+            .tx
+            .send(Event::Chunk(Frame {
+                bytes,
+                _budget: (request, endpoint),
+            }))
+            .map_err(|_| QueueError::Gone)
     }
 
     /// Finish a claimed request.
@@ -252,6 +342,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn raw(values: &[Value]) -> Vec<Box<RawValue>> {
+        values
+            .iter()
+            .map(|v| serde_json::value::to_raw_value(v).unwrap())
+            .collect()
+    }
+
+    fn push(queue: &EndpointQueue, id: &str, values: &[Value]) -> Result<(), QueueError> {
+        let raw = raw(values);
+        let chunks: Vec<&RawValue> = raw.iter().map(|r| &**r).collect();
+        queue.push(id, &chunks)
+    }
+
+    fn frame(rx: &mut mpsc::UnboundedReceiver<Event>) -> Bytes {
+        match rx.try_recv() {
+            Ok(Event::Chunk(frame)) => frame.into_bytes(),
+            other => panic!("expected a chunk, got {other:?}"),
+        }
+    }
+
     fn admission() -> Admission {
         Admission {
             pricing: SellPricing::PerRequest { usd: 0.02 },
@@ -275,21 +385,18 @@ mod tests {
         assert_eq!(queue.depth(), (0, 1));
         assert_eq!(rx.recv().await, Some(Event::Claimed));
 
-        queue
-            .push(&id, vec![json!({"n": 1}), json!({"n": 2})])
-            .unwrap();
+        push(&queue, &id, &[json!({"n": 1}), json!({"n": 2})]).unwrap();
         let completion = queue.complete(&id, Some(json!({"usage": {}}))).unwrap();
         assert!(completion.delivered);
         assert_eq!(completion.admission, admission());
-        assert_eq!(rx.recv().await, Some(Event::Chunk(json!({"n": 1}))));
-        assert_eq!(rx.recv().await, Some(Event::Chunk(json!({"n": 2}))));
+        assert_eq!(frame(&mut rx), "data: {\"n\":1}\n\ndata: {\"n\":2}\n\n");
         assert_eq!(
             rx.recv().await,
             Some(Event::Complete(Some(json!({"usage": {}}))))
         );
         assert_eq!(rx.recv().await, None, "the channel closes after completion");
         assert_eq!(queue.depth(), (0, 0));
-        assert_eq!(queue.push(&id, vec![]), Err(QueueError::Unknown));
+        assert_eq!(push(&queue, &id, &[]), Err(QueueError::Unknown));
     }
 
     #[tokio::test]
@@ -327,12 +434,12 @@ mod tests {
             claimed.id, live,
             "the abandoned request is never handed out"
         );
-        assert_eq!(queue.push(&gone, vec![]), Err(QueueError::Unknown));
+        assert_eq!(push(&queue, &gone, &[]), Err(QueueError::Unknown));
 
         drop(live_rx.recv().await); // Claimed
         drop(live_rx);
         assert_eq!(
-            queue.push(&live, vec![json!(1)]),
+            push(&queue, &live, &[json!(1)]),
             Err(QueueError::Gone),
             "pushing to a client that left says so"
         );
@@ -340,6 +447,78 @@ mod tests {
         let completion = queue.fail(&live, 502, "x").unwrap();
         assert!(!completion.delivered);
         assert_eq!(queue.depth(), (0, 0));
+    }
+
+    async fn claimed(queue: &EndpointQueue) -> (String, mpsc::UnboundedReceiver<Event>) {
+        let (id, mut rx) = queue.park(Bytes::new(), true, admission()).unwrap();
+        queue.next(Duration::from_secs(1)).await.request.unwrap();
+        assert_eq!(rx.recv().await, Some(Event::Claimed));
+        (id, rx)
+    }
+
+    #[tokio::test]
+    async fn an_unread_request_buffers_at_most_its_budget() {
+        let queue = EndpointQueue::default();
+        let (id, mut rx) = claimed(&queue).await;
+        let chunk = json!({ "content": "x".repeat(64 * 1024) });
+        let mut accepted = 0;
+        while push(&queue, &id, std::slice::from_ref(&chunk)).is_ok() {
+            accepted += 1;
+            assert!(accepted <= MAX_BUFFERED_PER_REQUEST / (64 * 1024));
+        }
+        assert_eq!(
+            push(&queue, &id, std::slice::from_ref(&chunk)),
+            Err(QueueError::Backlogged)
+        );
+        // Reading a frame frees its share; the next push fits again.
+        drop(frame(&mut rx));
+        push(&queue, &id, std::slice::from_ref(&chunk)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_buffers_at_most_its_budget_across_requests() {
+        let queue = EndpointQueue::default();
+        let chunk = json!({ "content": "x".repeat(MAX_BUFFERED_PER_REQUEST - 1024) });
+        let mut receivers = Vec::new();
+        for _ in 0..MAX_BUFFERED_PER_ENDPOINT / MAX_BUFFERED_PER_REQUEST {
+            let (id, rx) = claimed(&queue).await;
+            push(&queue, &id, std::slice::from_ref(&chunk)).unwrap();
+            receivers.push(rx);
+        }
+        let (id, _rx) = claimed(&queue).await;
+        assert_eq!(
+            push(&queue, &id, std::slice::from_ref(&chunk)),
+            Err(QueueError::Backlogged),
+            "a fresh request cannot buffer past the endpoint's budget"
+        );
+        drop(receivers.pop());
+        push(&queue, &id, std::slice::from_ref(&chunk)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pushes_are_bounded_single_line_frames() {
+        let queue = EndpointQueue::default();
+        let (id, mut rx) = claimed(&queue).await;
+        let huge = json!({ "content": "x".repeat(MAX_BUFFERED_PER_REQUEST) });
+        assert_eq!(push(&queue, &id, &[huge]), Err(QueueError::TooLarge));
+
+        let pretty =
+            serde_json::value::RawValue::from_string("{\n  \"a\": \"b\\nc\"\r\n}".into()).unwrap();
+        queue.push(&id, &[&pretty]).unwrap();
+        assert_eq!(frame(&mut rx), "data: {   \"a\": \"b\\nc\"  }\n\n");
+    }
+
+    #[tokio::test]
+    async fn a_claimed_request_drops_its_body() {
+        let queue = EndpointQueue::default();
+        let body = Bytes::from(vec![b' '; 1024]);
+        let (_id, _rx) = queue.park(body.clone(), true, admission()).unwrap();
+        let claimed = queue.next(Duration::from_secs(1)).await.request.unwrap();
+        drop(claimed);
+        assert!(
+            body.is_unique(),
+            "only the worker's copy held the body, and it is gone"
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,8 @@ pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest a worker's long-poll may ask to wait.
 pub const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
+/// Largest body of one worker push; workers split their output to fit.
+const MAX_PUSH_BYTES: usize = pay_core::sell_inference::MAX_WORKER_PUSH_BYTES;
 const OWNER_TOKEN_PREFIX: &str = "pso_";
 
 /// Who may create endpoints: the bearer of a connector or CLI token.
@@ -546,9 +548,11 @@ pub struct NextRequest {
     pub body: Value,
 }
 
+/// Chunks stay raw: they are relayed verbatim, never inspected.
 #[derive(Debug, Deserialize)]
-pub struct PushChunks {
-    pub chunks: Vec<Value>,
+pub struct PushChunks<'a> {
+    #[serde(borrow)]
+    pub chunks: Vec<&'a serde_json::value::RawValue>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -576,7 +580,7 @@ pub fn router(state: Arc<SellState>) -> Router {
         .route("/v1/endpoints/{id}/queue/next", get(next_request))
         .route(
             "/v1/endpoints/{id}/requests/{request}/chunks",
-            post(push_chunks),
+            post(push_chunks).layer(DefaultBodyLimit::max(MAX_PUSH_BYTES)),
         )
         .route(
             "/v1/endpoints/{id}/requests/{request}/complete",
@@ -856,6 +860,16 @@ fn queue_error(error: QueueError) -> ApiError {
             "queue_full",
             error.to_string(),
         ),
+        QueueError::Backlogged => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "buyer_backlogged",
+            error.to_string(),
+        ),
+        QueueError::TooLarge => ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "push_too_large",
+            error.to_string(),
+        ),
     }
 }
 
@@ -863,12 +877,14 @@ async fn push_chunks(
     State(state): State<Arc<SellState>>,
     Path((id, request)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(input): Json<PushChunks>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let entry = owned(&state, &id, &headers)?;
+    let input: PushChunks<'_> = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request("invalid_chunks", e.to_string()))?;
     entry
         .queue
-        .push(&request, input.chunks)
+        .push(&request, &input.chunks)
         .map_err(queue_error)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1235,7 +1251,7 @@ fn stream_response(rx: mpsc::UnboundedReceiver<Event>, guard: ClaimedRequestGuar
             let (mut rx, guard) = state?;
             let (frame, next) = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
                 Ok(Some(Event::Claimed)) => (Bytes::new(), Some((rx, guard))),
-                Ok(Some(Event::Chunk(chunk))) => (sse(&chunk), Some((rx, guard))),
+                Ok(Some(Event::Chunk(frame))) => (frame.into_bytes(), Some((rx, guard))),
                 Ok(Some(Event::Complete(Some(last)))) => {
                     signal.complete();
                     let mut frame = sse(&last).to_vec();
@@ -2299,6 +2315,62 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_buyer_that_stops_reading_backpressures_the_worker() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(&app, per_request(0.02)).await;
+        let buyer = tokio::spawn(buyer(
+            &state,
+            &id,
+            json!({ "model": "agent", "stream": true, "messages": [] }),
+        ));
+        let (_, _, next) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}/queue/next?wait=5"),
+            Some(&token),
+            None,
+        )
+        .await;
+        let rid = next["request_id"].as_str().unwrap().to_string();
+        let response = buyer.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let path = format!("/v1/endpoints/{id}/requests/{rid}/chunks");
+        let push = |chunks: Value| {
+            send(
+                &app,
+                Method::POST,
+                &path,
+                Some(&token),
+                Some(json!({ "chunks": chunks })),
+            )
+        };
+
+        let chunk = json!({ "choices": [{ "delta": { "content": "x".repeat(100 * 1024) } }] });
+        let mut accepted = 0;
+        let status = loop {
+            let (status, _, body) = push(json!([chunk])).await;
+            if status != StatusCode::ACCEPTED {
+                assert_eq!(body["error"], "buyer_backlogged", "{body}");
+                break status;
+            }
+            accepted += 1;
+            assert!(accepted <= 64, "pushes to an unread stream never stop");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(accepted * 100 * 1024 <= super::super::queue::MAX_BUFFERED_PER_REQUEST);
+
+        // Once the buyer reads, the worker may push again.
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.unwrap().unwrap().starts_with(b"data: "));
+        assert_eq!(push(json!([chunk])).await.0, StatusCode::ACCEPTED);
+
+        // One push is a few chunks, not megabytes of them.
+        let zeros = vec![0; MAX_PUSH_BYTES / 2];
+        assert_eq!(push(json!(zeros)).await.0, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test(flavor = "multi_thread")]

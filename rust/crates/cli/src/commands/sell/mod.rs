@@ -36,6 +36,10 @@ const CHARS_PER_TOKEN: usize = 4;
 const CHUNK_FLUSH: Duration = Duration::from_millis(80);
 /// Longest one turn may run before the request is failed.
 const TURN_TIMEOUT: Duration = Duration::from_secs(540);
+/// First and longest waits before re-pushing to a buyer that is not
+/// reading yet; the turn's deadline bounds the total.
+const BACKLOG_RETRY_START: Duration = Duration::from_millis(100);
+const BACKLOG_RETRY_MAX: Duration = Duration::from_secs(2);
 
 #[derive(Subcommand)]
 pub enum SellCommand {
@@ -547,11 +551,31 @@ impl Api {
         }
     }
 
-    fn push(&self, request: &str, chunks: Vec<Value>) -> pay_core::Result<()> {
-        self.post(
-            &format!("/requests/{request}/chunks"),
-            &json!({ "chunks": chunks }),
-        )
+    /// Push one serialized `{"chunks": [...]}` body. A 429 means the buyer
+    /// has not read what is buffered yet, so it is retried until `deadline`.
+    fn push(&self, request: &str, body: Vec<u8>, deadline: Instant) -> pay_core::Result<()> {
+        let mut wait = BACKLOG_RETRY_START;
+        loop {
+            let response = self
+                .http
+                .post(format!("{}/requests/{request}/chunks", self.base))
+                .bearer_auth(&self.token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .send()
+                .map_err(|e| pay_core::Error::Config(format!("pay-connect unreachable: {e}")))?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            let text = response.text().unwrap_or_default();
+            if status != reqwest::StatusCode::TOO_MANY_REQUESTS || Instant::now() + wait > deadline
+            {
+                return Err(api_error(status, &text));
+            }
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(BACKLOG_RETRY_MAX);
+        }
     }
 
     fn complete(&self, request: &str, event: Value) -> pay_core::Result<()> {
@@ -638,7 +662,8 @@ impl Worker {
             ServeHarness::Echo => None,
             _ => Some(self.agent()?),
         };
-        let mut reply = Reply::new(&self.api, request, model, prompt_chars);
+        let deadline = Instant::now() + TURN_TIMEOUT;
+        let mut reply = Reply::new(&self.api, request, model, prompt_chars, deadline);
 
         let reason = match agent {
             None => {
@@ -656,18 +681,41 @@ impl Worker {
                 let mut turn = agent
                     .prompt(&session, &prompt)
                     .map_err(|e| pay_core::Error::Config(format!("agent prompt: {e}")))?;
-                answer_turn(
-                    &agent,
-                    &session,
-                    &mut turn,
-                    &mut reply,
-                    Instant::now() + TURN_TIMEOUT,
-                )?
+                answer_turn(&agent, &session, &mut turn, &mut reply, deadline)?
             }
         };
         let chars = reply.finish(&reason)?;
         Ok(Outcome { chars, reason })
     }
+}
+
+fn push_body(chunk: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "chunks": [chunk] })).expect("a JSON value serializes")
+}
+
+/// The most bytes one `char` takes as JSON string content (`\u001f`).
+const MAX_ESCAPED_CHAR_BYTES: usize = 6;
+
+/// Bytes `c` takes inside a JSON string, as `serde_json` writes it.
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => MAX_ESCAPED_CHAR_BYTES,
+        c => c.len_utf8(),
+    }
+}
+
+/// Split `text` at a char boundary so the head's escaped length fits `room`;
+/// the head always holds at least one char.
+fn split_escaped(text: &str, room: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        used += escaped_len(c);
+        if used > room && at > 0 {
+            return text.split_at(at);
+        }
+    }
+    (text, "")
 }
 
 fn answer_turn(
@@ -727,10 +775,18 @@ struct Reply<'a> {
     last_flush: Instant,
     content: String,
     sent_role: bool,
+    /// When pushes stop waiting for a backlogged buyer.
+    deadline: Instant,
 }
 
 impl<'a> Reply<'a> {
-    fn new(api: &'a Api, request: &'a NextRequest, model: String, prompt_chars: usize) -> Self {
+    fn new(
+        api: &'a Api,
+        request: &'a NextRequest,
+        model: String,
+        prompt_chars: usize,
+        deadline: Instant,
+    ) -> Self {
         Self {
             api,
             request_id: &request.request_id,
@@ -746,6 +802,7 @@ impl<'a> Reply<'a> {
             last_flush: Instant::now(),
             content: String::new(),
             sent_role: false,
+            deadline,
         }
     }
 
@@ -779,13 +836,25 @@ impl<'a> Reply<'a> {
         if !self.stream || self.pending.is_empty() {
             return Ok(());
         }
-        let mut delta = json!({ "content": std::mem::take(&mut self.pending) });
-        if !self.sent_role {
-            delta["role"] = json!("assistant");
+        let pending = std::mem::take(&mut self.pending);
+        let mut rest = pending.as_str();
+        while !rest.is_empty() {
+            let mut delta = json!({ "content": "" });
+            if !self.sent_role {
+                delta["role"] = json!("assistant");
+            }
+            let empty = push_body(self.chunk(delta.clone(), None, None));
+            let room = pay_core::sell_inference::MAX_WORKER_PUSH_BYTES
+                .saturating_sub(empty.len())
+                .max(MAX_ESCAPED_CHAR_BYTES);
+            let (piece, tail) = split_escaped(rest, room);
+            delta["content"] = json!(piece);
+            let body = push_body(self.chunk(delta, None, None));
+            self.api.push(self.request_id, body, self.deadline)?;
             self.sent_role = true;
+            rest = tail;
         }
-        let chunk = self.chunk(delta, None, None);
-        self.api.push(self.request_id, vec![chunk])
+        Ok(())
     }
 
     fn usage(&self) -> Value {
@@ -985,7 +1054,7 @@ mod tests {
                 stream: false,
                 body: json!({}),
             };
-            let mut reply = Reply::new(&api, &request, "agent".into(), 0);
+            let mut reply = Reply::new(&api, &request, "agent".into(), 0, Instant::now());
             let result = answer_turn(
                 &agent,
                 &session,
@@ -1021,6 +1090,145 @@ mod tests {
         }
     }
 
+    type Seen = Arc<std::sync::Mutex<Vec<(u16, Vec<u8>)>>>;
+
+    /// A pay-connect stand-in for `/chunks`: refuses bodies over the push
+    /// limit like the real route, otherwise answers `status(n)` for the
+    /// n-th request, and records what it saw.
+    fn chunk_stub(status: impl Fn(usize) -> u16 + Send + 'static) -> (Api, Seen) {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let code = if length > pay_core::sell_inference::MAX_WORKER_PUSH_BYTES {
+                    413
+                } else {
+                    status(n)
+                };
+                log.lock().unwrap().push((code, body));
+                let reply = r#"{"error":"stub","message":"stub"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 {code} Stub\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        let api = Api {
+            http: http().unwrap(),
+            base,
+            token: "fixture".into(),
+        };
+        (api, seen)
+    }
+
+    fn streamed(id: &str) -> NextRequest {
+        NextRequest {
+            request_id: id.into(),
+            stream: true,
+            body: json!({}),
+        }
+    }
+
+    #[test]
+    fn large_output_is_split_into_pushes_that_fit() {
+        let (api, seen) = chunk_stub(|_| 202);
+        let request = streamed("req_large");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut reply = Reply::new(&api, &request, "agent".into(), 0, deadline);
+        // Escaping grows control characters sixfold and quotes twofold.
+        let text = "a\u{1}\"é😀 ".repeat(120 * 1024);
+        assert!(text.len() > 3 * pay_core::sell_inference::MAX_WORKER_PUSH_BYTES);
+        reply.pending.push_str(&text);
+        reply.flush().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > 3, "{} pushes", seen.len());
+        let mut content = String::new();
+        for (i, (code, body)) in seen.iter().enumerate() {
+            assert_eq!(*code, 202);
+            assert!(body.len() <= pay_core::sell_inference::MAX_WORKER_PUSH_BYTES);
+            let body: Value = serde_json::from_slice(body).unwrap();
+            let delta = &body["chunks"][0]["choices"][0]["delta"];
+            assert_eq!(delta.get("role").is_some(), i == 0, "{i}");
+            content.push_str(delta["content"].as_str().unwrap());
+        }
+        assert_eq!(content, text);
+    }
+
+    #[test]
+    fn small_output_is_one_push() {
+        let (api, seen) = chunk_stub(|_| 202);
+        let request = streamed("req_small");
+        let mut reply = Reply::new(&api, &request, "agent".into(), 0, Instant::now());
+        reply.pending.push_str("hello");
+        reply.flush().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_backlogged_buyer_is_waited_for_not_failed() {
+        let (api, seen) = chunk_stub(|n| if n < 3 { 429 } else { 202 });
+        let request = streamed("req_backlogged");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut reply = Reply::new(&api, &request, "agent".into(), 0, deadline);
+        reply.pending.push_str("hello");
+        reply.flush().unwrap();
+        let seen = seen.lock().unwrap();
+        let codes: Vec<u16> = seen.iter().map(|(code, _)| *code).collect();
+        assert_eq!(codes, [429, 429, 429, 202]);
+        // The same chunk is retried, not dropped.
+        assert!(seen.windows(2).all(|pair| pair[0].1 == pair[1].1));
+    }
+
+    #[test]
+    fn backlog_retries_stop_at_the_deadline_and_a_gone_buyer_is_not_retried() {
+        let (api, seen) = chunk_stub(|_| 429);
+        let request = streamed("req_stuck");
+        let started = Instant::now();
+        let mut reply = Reply::new(
+            &api,
+            &request,
+            "agent".into(),
+            0,
+            started + Duration::from_millis(500),
+        );
+        reply.pending.push_str("hello");
+        let error = reply.flush().unwrap_err().to_string();
+        assert!(error.contains("429"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(seen.lock().unwrap().len() >= 2);
+
+        let (api, seen) = chunk_stub(|_| 410);
+        let request = streamed("req_gone");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut reply = Reply::new(&api, &request, "agent".into(), 0, deadline);
+        reply.pending.push_str("hello");
+        assert!(reply.flush().is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn queued_turn_completes_before_its_deadline() {
         let (agent, task) = test_agent(true);
@@ -1036,7 +1244,7 @@ mod tests {
             stream: false,
             body: json!({}),
         };
-        let mut reply = Reply::new(&api, &request, "agent".into(), 0);
+        let mut reply = Reply::new(&api, &request, "agent".into(), 0, Instant::now());
         assert_eq!(
             answer_turn(
                 &agent,
