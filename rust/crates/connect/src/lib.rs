@@ -22,6 +22,8 @@ use axum::routing::{get, post};
 use serde_json::json;
 
 #[cfg(feature = "mcp")]
+mod capacity;
+#[cfg(feature = "mcp")]
 pub mod cli;
 #[cfg(feature = "mcp")]
 pub mod hosts;

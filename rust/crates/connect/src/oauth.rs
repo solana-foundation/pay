@@ -357,15 +357,31 @@ impl Store {
             secret_hash: secret.as_deref().map(sha256_hex),
             created_at: self.now(),
         };
+        // Lock order: tokens, then clients.
+        let tokens = self.tokens.lock().unwrap();
         let mut clients = self.clients.lock().unwrap();
-        // Clients never expire on their own; when the table is full the
-        // oldest unused registration goes. A live client re-registers.
-        if clients.len() >= MAX_ROWS
-            && let Some(oldest) = clients
+        // Clients never expire on their own. When the table is full the
+        // oldest registration nobody holds a live token for goes; one that
+        // users are signed in through never does.
+        if clients.len() >= MAX_ROWS {
+            let now = self.now();
+            let held: std::collections::HashSet<&str> = tokens
                 .values()
+                .filter(|token| now <= token.expires_at)
+                .map(|token| token.client_id.as_str())
+                .collect();
+            let oldest = clients
+                .values()
+                .filter(|c| !held.contains(c.client_id.as_str()))
                 .min_by_key(|c| c.created_at)
                 .map(|c| c.client_id.clone())
-        {
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "temporarily_unavailable",
+                        "Too many clients are registered. Try again later.",
+                    )
+                })?;
             clients.remove(&oldest);
         }
         clients.insert(client.client_id.clone(), client.clone());
@@ -2433,6 +2449,52 @@ mod tests {
         assert_eq!(client.redirect_uris.len(), MAX_REDIRECT_URIS);
     }
 
+    /// connect/05: open registration cannot push out a client that users
+    /// are signed in through; only registrations nobody uses make way.
+    #[test]
+    fn a_full_client_table_never_evicts_a_client_in_use() {
+        let store = Store::new("https://cloud.test/");
+        let (used, _) = store.register(grok_registration()).unwrap();
+        let pair = grant(&store, &used, "sub_1", Some("sess_1")).unwrap();
+        let (idle, _) = store.register(grok_registration()).unwrap();
+        for _ in 0..MAX_ROWS {
+            store.register(grok_registration()).unwrap();
+        }
+        assert!(store.client(&used.client_id).is_some());
+        assert!(store.refresh(&used.client_id, &pair.refresh_token).is_ok());
+        assert!(
+            store.client(&idle.client_id).is_none(),
+            "unused, so it went"
+        );
+        assert_eq!(store.clients.lock().unwrap().len(), MAX_ROWS);
+
+        // Every client in use: registration waits rather than evict one.
+        {
+            let ids: Vec<String> = store.clients.lock().unwrap().keys().cloned().collect();
+            let far = store.now() + ACCESS_TTL;
+            let mut tokens = store.tokens.lock().unwrap();
+            for id in ids {
+                tokens.insert(
+                    format!("held-{id}"),
+                    TokenRecord {
+                        kind: TokenKind::Access,
+                        client_id: id.clone(),
+                        subject: "sub_x".to_string(),
+                        scope: SCOPE.to_string(),
+                        session: None,
+                        family: id,
+                        expires_at: far,
+                    },
+                );
+            }
+        }
+        assert_eq!(
+            store.register(grok_registration()).unwrap_err().error,
+            "temporarily_unavailable"
+        );
+        assert!(store.client(&used.client_id).is_some());
+    }
+
     #[test]
     fn a_full_token_store_does_not_consume_an_authorization_code() {
         let store = Store::new("https://cloud.test");
@@ -3494,6 +3556,58 @@ mod tests {
         let most = "s".repeat(MAX_STATE_LEN);
         let reply = get(&app, &with_state(&most)).await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    }
+
+    /// connect/05, over HTTP: a registration burst leaves a connected
+    /// host's client in place, so its refresh still succeeds.
+    #[tokio::test]
+    async fn a_registration_burst_does_not_disconnect_a_host() {
+        let state = AppState::new("https://cloud.test")
+            .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]));
+        let app = crate::router(state.clone());
+        let client_id = register_grok(&app).await;
+        let request_id = start_authorization(&app, &client_id, None).await;
+        let approved = post_json(
+            &app,
+            &format!("/api/oauth/authorize/{request_id}/approve"),
+            json!({ "guest": true }),
+        )
+        .await;
+        let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+        let code = redirect
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        let tokens = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
+                ("code", &code),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(tokens.status, StatusCode::OK, "{}", tokens.body);
+        let refresh = tokens.json()["refresh_token"].as_str().unwrap().to_string();
+
+        let store = state.oauth().unwrap();
+        for _ in 0..MAX_ROWS {
+            store.register(grok_registration()).unwrap();
+        }
+        let rotated = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", &refresh),
+            ],
+        )
+        .await;
+        assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
     }
 
     // ── Privy login on the consent page ────────────────────────────────
