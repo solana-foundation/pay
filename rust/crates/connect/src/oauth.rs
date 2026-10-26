@@ -57,7 +57,7 @@ pub struct Client {
     pub client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
-    pub redirect_uris: Vec<String>,
+    pub redirect_uris: RedirectUris,
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
@@ -73,6 +73,57 @@ pub struct Client {
     secret_hash: Option<String>,
     #[serde(skip)]
     created_at: Instant,
+}
+
+/// Most redirect URIs one client registers; real hosts send one or two.
+pub const MAX_REDIRECT_URIS: usize = 8;
+/// Longest redirect URI a client registers.
+pub const MAX_REDIRECT_URI_LEN: usize = 2048;
+/// Largest `POST /oauth/register` body; real registrations are under 1 KiB.
+pub const MAX_REGISTRATION_BYTES: usize = 16 * 1024;
+/// Longest OAuth `state` a pending authorization keeps.
+pub const MAX_STATE_LEN: usize = 1024;
+
+/// A client's redirect URIs: at least one, at most [`MAX_REDIRECT_URIS`]
+/// distinct allowed URIs of at most [`MAX_REDIRECT_URI_LEN`] bytes each, so a
+/// registration holds a bounded amount of memory for as long as it lives.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct RedirectUris(Vec<String>);
+
+impl RedirectUris {
+    pub fn parse(uris: Vec<String>) -> Result<Self, String> {
+        if uris.is_empty() {
+            return Err("redirect_uris must list at least one URI.".to_string());
+        }
+        let mut distinct: Vec<String> = Vec::new();
+        for uri in uris {
+            if distinct.contains(&uri) {
+                continue;
+            }
+            if distinct.len() == MAX_REDIRECT_URIS {
+                return Err(format!(
+                    "redirect_uris may list at most {MAX_REDIRECT_URIS} URIs."
+                ));
+            }
+            if uri.len() > MAX_REDIRECT_URI_LEN {
+                return Err(format!(
+                    "a redirect_uri may be at most {MAX_REDIRECT_URI_LEN} bytes."
+                ));
+            }
+            crate::hosts::redirect_allowed(&uri)
+                .map_err(|why| format!("redirect_uri `{uri}`: {why}"))?;
+            distinct.push(uri);
+        }
+        Ok(Self(distinct))
+    }
+}
+
+impl std::ops::Deref for RedirectUris {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.0
+    }
 }
 
 /// Authentication methods a client may register with. Secrets are issued
@@ -251,14 +302,8 @@ impl Store {
     /// returned once beside the stored record.
     pub fn register(&self, req: RegistrationRequest) -> Result<(Client, Option<String>), ApiError> {
         let invalid = |msg: &str| ApiError::bad_request("invalid_client_metadata", msg);
-        if req.redirect_uris.is_empty() {
-            return Err(invalid("redirect_uris must list at least one URI."));
-        }
-        for uri in &req.redirect_uris {
-            crate::hosts::redirect_allowed(uri)
-                .map_err(|why| invalid(&format!("redirect_uri `{uri}`: {why}")))?;
-        }
-        let host = crate::hosts::identify(req.client_name.as_deref(), &req.redirect_uris);
+        let redirect_uris = RedirectUris::parse(req.redirect_uris).map_err(|why| invalid(&why))?;
+        let host = crate::hosts::identify(req.client_name.as_deref(), &redirect_uris);
         let auth_method = req
             .token_endpoint_auth_method
             .clone()
@@ -270,36 +315,43 @@ impl Store {
             )));
         }
         let secret = (auth_method != "none").then(random_token);
-        let grant_types = req
+        let mut grant_types = req
             .grant_types
-            .clone()
             .unwrap_or_else(|| vec!["authorization_code".to_string()]);
         for grant in &grant_types {
             if grant != "authorization_code" && grant != "refresh_token" {
                 return Err(invalid(&format!("grant_type `{grant}` is not supported.")));
             }
         }
-        let response_types = req
+        grant_types.sort_unstable();
+        grant_types.dedup();
+        let mut response_types = req
             .response_types
-            .clone()
             .unwrap_or_else(|| vec!["code".to_string()]);
         if response_types.iter().any(|r| r != "code") {
             return Err(invalid("only the `code` response type is supported."));
         }
+        response_types.dedup();
         let client = Client {
             client_id: format!("cli_{}", random_token()),
             client_name: req
                 .client_name
                 .map(|n| n.trim().chars().take(120).collect::<String>())
                 .filter(|n| !n.is_empty()),
-            redirect_uris: req.redirect_uris,
+            redirect_uris,
             grant_types,
             response_types,
             token_endpoint_auth_method: auth_method,
             client_id_issued_at: unix_now(),
             scope: req
                 .scope
-                .map(|s| s.split_whitespace().take(8).collect::<Vec<_>>().join(" "))
+                .map(|s| {
+                    s.split_whitespace()
+                        .filter(|scope| scope.len() <= 64)
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .filter(|s| !s.is_empty()),
             host: host.id,
             secret_hash: secret.as_deref().map(sha256_hex),
@@ -902,6 +954,12 @@ pub async fn authorize(
         return Err(ApiError::bad_request(
             "invalid_request",
             "redirect_uri does not belong to this client's host.",
+        ));
+    }
+    if q.state.as_ref().is_some_and(|s| s.len() > MAX_STATE_LEN) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            format!("state may be at most {MAX_STATE_LEN} bytes."),
         ));
     }
     let state_param = q.state.as_deref().filter(|s| !s.is_empty());
@@ -2284,8 +2342,8 @@ mod tests {
         assert_eq!(client.token_endpoint_auth_method, "none");
         assert!(secret.is_none(), "public clients get no secret");
         assert_eq!(
-            store.client(&client.client_id).unwrap().redirect_uris,
-            vec![GROK_REDIRECT]
+            store.client(&client.client_id).unwrap().redirect_uris[..],
+            [GROK_REDIRECT]
         );
         assert!(store.authenticate_client(&client.client_id, None).is_ok());
 
@@ -2332,6 +2390,47 @@ mod tests {
         let mut implicit = grok_registration();
         implicit.response_types = Some(vec!["token".to_string()]);
         assert!(store.register(implicit).is_err());
+    }
+
+    /// connect/03: what a registration stores is bounded however large the
+    /// request, so open registration cannot grow the heap without limit.
+    #[test]
+    fn registration_stores_a_bounded_client() {
+        let store = Store::new("https://cloud.test/");
+        let invalid = |req: RegistrationRequest| store.register(req).unwrap_err().error;
+
+        let mut repeated = grok_registration();
+        repeated.redirect_uris = vec![GROK_REDIRECT.to_string(); 10_000];
+        repeated.grant_types = Some(vec!["refresh_token".to_string(); 10_000]);
+        repeated.response_types = Some(vec!["code".to_string(); 10_000]);
+        repeated.scope = Some(format!("{} mcp", "s".repeat(100_000)));
+        let (client, _) = store.register(repeated).unwrap();
+        let stored = store.client(&client.client_id).unwrap();
+        assert_eq!(stored.redirect_uris[..], [GROK_REDIRECT]);
+        assert_eq!(stored.grant_types, ["refresh_token"]);
+        assert_eq!(stored.response_types, ["code"]);
+        assert_eq!(stored.scope.as_deref(), Some("mcp"));
+
+        let distinct = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("https://host.example/cb/{i}"))
+                .collect()
+        };
+        let mut many = grok_registration();
+        many.redirect_uris = distinct(MAX_REDIRECT_URIS + 1);
+        assert_eq!(invalid(many), "invalid_client_metadata");
+        let mut long = grok_registration();
+        long.redirect_uris = vec![format!(
+            "https://host.example/{}",
+            "a".repeat(MAX_REDIRECT_URI_LEN)
+        )];
+        assert_eq!(invalid(long), "invalid_client_metadata");
+
+        // Control: the most a client may register is accepted as sent.
+        let mut most = grok_registration();
+        most.redirect_uris = distinct(MAX_REDIRECT_URIS);
+        let (client, _) = store.register(most).unwrap();
+        assert_eq!(client.redirect_uris.len(), MAX_REDIRECT_URIS);
     }
 
     #[test]
@@ -3367,6 +3466,34 @@ mod tests {
         assert_eq!(created.json()["error"], "wallet_required");
         let unknown = post_json_with(&app, "/v1/endpoints", create, None, Some("nope")).await;
         assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "{}", unknown.body);
+    }
+
+    /// connect/03: an oversized registration body is refused before it is
+    /// parsed, and an oversized `state` is never parked.
+    #[tokio::test]
+    async fn oversized_registrations_and_states_are_refused() {
+        let app = app();
+        let mut body = grok_dcr_body();
+        body["redirect_uris"] = json!(vec![GROK_REDIRECT; 2_000]);
+        let reply = post_json(&app, "/oauth/register", body).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            reply.body
+        );
+
+        let client_id = register_grok(&app).await;
+        let long = "s".repeat(MAX_STATE_LEN + 1);
+        let with_state = |state: &str| {
+            authorize_path(&client_id, &[]).replace("state=st4te", &format!("state={state}"))
+        };
+        let reply = get(&app, &with_state(&long)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+        assert_eq!(reply.json()["error"], "invalid_request");
+        let most = "s".repeat(MAX_STATE_LEN);
+        let reply = get(&app, &with_state(&most)).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
     }
 
     // ── Privy login on the consent page ────────────────────────────────

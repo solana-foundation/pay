@@ -377,7 +377,12 @@ pub fn router(state: AppState) -> Router {
             "/.well-known/oauth-protected-resource/mcp",
             get(oauth::protected_resource),
         )
-        .route("/oauth/register", post(oauth::register))
+        .route(
+            "/oauth/register",
+            post(oauth::register).layer(axum::extract::DefaultBodyLimit::max(
+                oauth::MAX_REGISTRATION_BYTES,
+            )),
+        )
         .route("/oauth/authorize", get(oauth::authorize))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
