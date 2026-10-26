@@ -3,7 +3,7 @@
 //! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use pay_kit::x402::solana_keychain::{SolanaSigner, TransactionSigner};
+use pay_kit::x402::solana_keychain::SolanaSigner;
 use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
@@ -32,16 +32,56 @@ pub use pay_kit::x402::{SIGN_IN_WITH_X_HEADER, X402_V1_PAYMENT_HEADER, X402_V2_P
 pub struct Challenge {
     pub x402_version: u64,
     pub requirements: PaymentRequirements,
-    pub siwx: Option<SiwxExtension>,
     /// Raw `extensions` blob from the server's PAYMENT-REQUIRED envelope.
     /// Stored verbatim so `build_payment` can echo it back per x402 v2
     /// §5.1.2 ("client must include at least the info received").
     pub extensions: Option<serde_json::Value>,
 }
 
+/// A `sign-in-with-x` challenge bound to the resource that issued it.
 #[derive(Debug, Clone)]
 pub struct SiwxAuthChallenge {
-    pub extension: SiwxExtension,
+    extension: SiwxExtension,
+}
+
+impl SiwxAuthChallenge {
+    /// Bind `extension` to `resource_url`. The x402 SIWX spec requires the
+    /// client to refuse a challenge whose `domain` or `uri` names another
+    /// origin: the proof would sign this wallet in somewhere else.
+    pub fn for_resource(extension: SiwxExtension, resource_url: &str) -> Result<Self> {
+        if !siwx_names_origin(&extension, resource_url) {
+            return Err(Error::PaymentRejected(format!(
+                "Refusing to sign in to {} ({}) for a challenge from {resource_url}.",
+                extension.domain, extension.uri
+            )));
+        }
+        Ok(Self { extension })
+    }
+
+    pub fn extension(&self) -> &SiwxExtension {
+        &self.extension
+    }
+}
+
+/// Whether the challenge's `domain` (an RFC 3986 authority) and `uri` both
+/// name the origin of `resource_url`.
+fn siwx_names_origin(extension: &SiwxExtension, resource_url: &str) -> bool {
+    let Ok(resource) = url::Url::parse(resource_url) else {
+        return false;
+    };
+    let uri_matches =
+        url::Url::parse(&extension.uri).is_ok_and(|uri| uri.origin() == resource.origin());
+    let domain_matches = url::Url::parse(&format!("{}://{}", resource.scheme(), extension.domain))
+        .is_ok_and(|domain| {
+            domain.origin() == resource.origin()
+                && domain.username().is_empty()
+                && domain.password().is_none()
+                && domain.path() == "/"
+                && domain.query().is_none()
+                && domain.fragment().is_none()
+                && !extension.domain.ends_with('/')
+        });
+    uri_matches && domain_matches
 }
 
 /// An x402 `upto` (usage-metered) challenge: authorize a ceiling now, the
@@ -104,18 +144,17 @@ pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challen
     // sandbox offer; the network the payment signs on is resolved later
     // from the chosen offer and any `--network` override.
     let requirements = parse_x402_challenge(headers, body)?;
-    let siwx = parse_siwx_extension(headers, body).ok().flatten();
     let extensions =
         parse_payment_required_envelope(headers, body).and_then(|envelope| envelope.extensions);
     Some(Challenge {
         x402_version: detect_x402_version(headers, body),
         requirements,
-        siwx,
         extensions,
     })
 }
 
-/// Try to parse an x402 `sign-in-with-x` challenge.
+/// Try to parse an x402 `sign-in-with-x` challenge issued by `resource_url`.
+/// A challenge naming another origin is ignored.
 ///
 /// Unlike a pure auth gate, this is returned even when the same 402 also
 /// advertises payment options in `accepts` — a wallet that already holds
@@ -125,12 +164,19 @@ pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challen
 pub fn parse_siwx_auth(
     headers: &[(String, String)],
     body: Option<&str>,
+    resource_url: &str,
 ) -> Option<SiwxAuthChallenge> {
     let envelope = parse_payment_required_envelope(headers, body)?;
     let extension = siwx_extension_from_payment_required(&envelope)
         .ok()
         .flatten()?;
-    Some(SiwxAuthChallenge { extension })
+    match SiwxAuthChallenge::for_resource(extension, resource_url) {
+        Ok(challenge) => Some(challenge),
+        Err(error) => {
+            warn!(%error, "Ignoring x402 sign-in challenge for another origin");
+            None
+        }
+    }
 }
 
 /// Build signed x402 retry headers.
@@ -341,17 +387,10 @@ pub fn build_payment_for_attempt(
         }
     };
 
-    let mut headers = vec![(payment_header_name, payment_header_value)];
-    if challenge.siwx.is_some() {
-        signer.require_raw_message_signing("an x402 sign-in challenge")?;
-    }
-    if let Some((header_name, header_value)) = build_siwx_header(challenge, &signer, &network, &rt)?
-    {
-        headers.push((header_name, header_value));
-    }
-
+    // A payment approval never also signs a sign-in proof: that takes its
+    // own approval through `build_siwx_auth_header`.
     Ok(BuiltPayment {
-        headers,
+        headers: vec![(payment_header_name, payment_header_value)],
         ephemeral_notice,
     })
 }
@@ -1245,31 +1284,6 @@ pub fn build_siwx_auth_header_with_override(
     })
 }
 
-fn build_siwx_header(
-    challenge: &Challenge,
-    signer: &dyn TransactionSigner,
-    network: &str,
-    rt: &tokio::runtime::Runtime,
-) -> Result<Option<(&'static str, String)>> {
-    let Some(extension) = &challenge.siwx else {
-        return Ok(None);
-    };
-    let preferred_chain_id = siwx_chain_id_for_network(network);
-    let chain = pay_kit::x402::siwx::select_siwx_chain(
-        extension,
-        &SiwxChainSelectionOptions {
-            preferred_chain_id,
-            supported_chain_ids: vec![],
-        },
-    )
-    .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
-    let header = rt
-        .block_on(create_siwx_header(extension, &chain, signer))
-        .map_err(|e| Error::Mpp(format!("Failed to sign x402 sign-in challenge: {e}")))?;
-
-    Ok(Some((SIGN_IN_WITH_X_HEADER, header)))
-}
-
 /// Normalize CAIP-2 network identifiers to the slugs pay uses internally.
 ///
 /// x402 challenges use CAIP-2 chain IDs like `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp`
@@ -1316,17 +1330,6 @@ fn siwx_chain_id_for_network(network: &str) -> Option<String> {
         value if value.starts_with("solana:") => Some(value.to_string()),
         _ => None,
     }
-}
-
-fn parse_siwx_extension(
-    headers: &[(String, String)],
-    body: Option<&str>,
-) -> Result<Option<SiwxExtension>> {
-    let Some(envelope) = parse_payment_required_envelope(headers, body) else {
-        return Ok(None);
-    };
-    siwx_extension_from_payment_required(&envelope)
-        .map_err(|e| Error::Mpp(format!("Failed to parse x402 sign-in challenge: {e}")))
 }
 
 /// Build the `extensions` blob to include on the outbound
@@ -1867,15 +1870,9 @@ mod tests {
         );
         let headers = vec![(PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
 
-        let challenge = parse(&headers, None).unwrap();
-
-        assert_eq!(
-            challenge
-                .siwx
-                .as_ref()
-                .map(|extension| extension.nonce.as_str()),
-            Some("nonce-123")
-        );
+        assert!(parse(&headers, None).is_some());
+        let siwx = parse_siwx_auth(&headers, None, "https://api.example.com/v1/test").unwrap();
+        assert_eq!(siwx.extension().nonce, "nonce-123");
     }
 
     #[test]
@@ -2139,7 +2136,6 @@ mod tests {
                 "extra": extra,
             }))
             .unwrap(),
-            siwx: None,
             extensions: Some(serde_json::json!({
                 "payment-identifier": {
                     "info": { "required": true },
@@ -2428,9 +2424,9 @@ mod tests {
         );
         let headers = vec![(PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
 
-        let challenge = parse_siwx_auth(&headers, None).unwrap();
+        let challenge = parse_siwx_auth(&headers, None, "https://api.example.com/v1/test").unwrap();
 
-        assert_eq!(challenge.extension.nonce, "nonce-123");
+        assert_eq!(challenge.extension().nonce, "nonce-123");
         assert!(parse(&headers, None).is_none());
     }
 
@@ -2458,9 +2454,10 @@ mod tests {
         })
         .to_string();
 
-        let challenge = parse_siwx_auth(&[], Some(&body)).unwrap();
+        let challenge =
+            parse_siwx_auth(&[], Some(&body), "https://api.example.com/v1/test").unwrap();
 
-        assert_eq!(challenge.extension.nonce, "nonce-from-body");
+        assert_eq!(challenge.extension().nonce, "nonce-from-body");
     }
 
     #[test]
@@ -2501,9 +2498,10 @@ mod tests {
 
         // sign-in-with-x is surfaced even when payment options coexist, so a
         // funded wallet can prefer spending credits over paying.
-        let siwx = parse_siwx_auth(&headers, None).expect("siwx challenge present");
-        assert_eq!(siwx.extension.nonce, "nonce-123");
-        assert!(parse(&headers, None).unwrap().siwx.is_some());
+        let siwx = parse_siwx_auth(&headers, None, "https://api.example.com/v1/test")
+            .expect("siwx challenge present");
+        assert_eq!(siwx.extension().nonce, "nonce-123");
+        assert!(parse(&headers, None).is_some());
     }
 
     #[test]
@@ -2540,7 +2538,7 @@ mod tests {
         let challenge = parse(&headers, None).unwrap();
 
         assert_eq!(challenge.requirements.amount, "10000");
-        assert!(challenge.siwx.is_none());
+        assert!(parse_siwx_auth(&headers, None, "https://api.example.com/").is_none());
     }
 
     #[test]
@@ -2574,50 +2572,59 @@ mod tests {
     }
 
     #[test]
-    fn build_siwx_header_signs_selected_chain() {
-        const TEST_KEYPAIR_BYTES: [u8; 64] = [
-            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
-            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
-            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
-            246, 17, 170, 104, 17, 151, 48,
-        ];
-        let signer =
-            pay_kit::x402::solana_keychain::memory::MemorySigner::from_bytes(&TEST_KEYPAIR_BYTES)
-                .unwrap();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let extension = pay_kit::x402::siwx::SiwxExtension::new(
-            pay_kit::x402::siwx::SiwxExtensionInfo {
-                domain: "api.example.com".to_string(),
-                uri: "https://api.example.com".to_string(),
-                statement: Some("Sign in to pay.".to_string()),
-                version: "1".to_string(),
-                nonce: "nonce-123".to_string(),
-                issued_at: "2026-04-27T00:00:00Z".to_string(),
-                expiration_time: None,
-                not_before: None,
-                request_id: None,
-                resources: None,
-            },
-            pay_kit::x402::siwx::default_solana_siwx_chains(),
-        );
-        let challenge = Challenge {
-            x402_version: X402_VERSION_V2,
-            requirements: sample_requirements(),
-            siwx: Some(extension),
-            extensions: None,
+    fn siwx_challenge_binds_to_the_resource_origin() {
+        let extension = |domain: &str, uri: &str| {
+            pay_kit::x402::siwx::SiwxExtension::new(
+                pay_kit::x402::siwx::SiwxExtensionInfo {
+                    domain: domain.to_string(),
+                    uri: uri.to_string(),
+                    statement: None,
+                    version: "1".to_string(),
+                    nonce: "nonce".to_string(),
+                    issued_at: "2026-04-27T00:00:00Z".to_string(),
+                    expiration_time: None,
+                    not_before: None,
+                    request_id: None,
+                    resources: None,
+                },
+                pay_kit::x402::siwx::default_solana_siwx_chains(),
+            )
         };
-
-        let (header_name, header_value) = build_siwx_header(&challenge, &signer, "devnet", &rt)
-            .unwrap()
-            .unwrap();
-        let payload = pay_kit::x402::siwx::parse_siwx_header(&header_value).unwrap();
-
-        assert_eq!(header_name, SIGN_IN_WITH_X_HEADER);
-        assert_eq!(payload.chain_id, SOLANA_DEVNET);
-        assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
+        let resource = "https://api.example.com/v1/data?q=1";
+        for (domain, uri) in [
+            ("api.example.com", "https://api.example.com"),
+            ("api.example.com:443", "https://api.example.com/login"),
+            ("API.example.com", "https://api.example.com:443/"),
+        ] {
+            assert!(
+                SiwxAuthChallenge::for_resource(extension(domain, uri), resource).is_ok(),
+                "{domain} {uri}"
+            );
+        }
+        for (domain, uri) in [
+            ("victim.example", "https://victim.example"),
+            ("api.example.com", "https://victim.example"),
+            ("victim.example", "https://api.example.com"),
+            ("api.example.com", "http://api.example.com"),
+            ("api.example.com:8443", "https://api.example.com"),
+            ("evil@api.example.com", "https://api.example.com"),
+            ("api.example.com/path", "https://api.example.com"),
+            ("api.example.com/", "https://api.example.com"),
+            ("", "https://api.example.com"),
+            ("api.example.com", "not a url"),
+        ] {
+            assert!(
+                SiwxAuthChallenge::for_resource(extension(domain, uri), resource).is_err(),
+                "{domain} {uri}"
+            );
+        }
+        assert!(
+            SiwxAuthChallenge::for_resource(
+                extension("api.example.com", "https://api.example.com"),
+                "not a url"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2645,8 +2652,8 @@ mod tests {
         let mut file = AccountsFile::default();
         file.upsert("devnet", "default", account);
         let store = MemoryAccountsStore::with_file(file);
-        let challenge = SiwxAuthChallenge {
-            extension: pay_kit::x402::siwx::SiwxExtension::new(
+        let challenge = SiwxAuthChallenge::for_resource(
+            pay_kit::x402::siwx::SiwxExtension::new(
                 pay_kit::x402::siwx::SiwxExtensionInfo {
                     domain: "api.example.com".to_string(),
                     uri: "https://api.example.com".to_string(),
@@ -2661,7 +2668,9 @@ mod tests {
                 },
                 pay_kit::x402::siwx::default_solana_siwx_chains(),
             ),
-        };
+            "https://api.example.com/",
+        )
+        .unwrap();
 
         let built = build_siwx_auth_header(&challenge, &store, Some("devnet"), None, None).unwrap();
         let payload = pay_kit::x402::siwx::parse_siwx_header(&built.headers[0].1).unwrap();
@@ -2717,8 +2726,8 @@ mod tests {
             },
         );
         let store = MemoryAccountsStore::with_file(file);
-        let challenge = SiwxAuthChallenge {
-            extension: pay_kit::x402::siwx::SiwxExtension::new(
+        let challenge = SiwxAuthChallenge::for_resource(
+            pay_kit::x402::siwx::SiwxExtension::new(
                 pay_kit::x402::siwx::SiwxExtensionInfo {
                     domain: "merchant.example".to_string(),
                     uri: "https://merchant.example/data".to_string(),
@@ -2733,7 +2742,9 @@ mod tests {
                 },
                 pay_kit::x402::siwx::default_solana_siwx_chains(),
             ),
-        };
+            "https://merchant.example/data",
+        )
+        .unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         build_siwx_auth_header_with_override(
             &challenge,
@@ -2773,7 +2784,8 @@ mod tests {
             },
             vec![pay_kit::x402::siwx::SupportedChain::solana(SOLANA_MAINNET)],
         );
-        let challenge = SiwxAuthChallenge { extension };
+        let challenge =
+            SiwxAuthChallenge::for_resource(extension, "https://api.example.com/").unwrap();
         let store = MemoryAccountsStore::new();
 
         let err =
@@ -2802,7 +2814,6 @@ mod tests {
         let challenge = Challenge {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
-            siwx: None,
             extensions: None,
         };
 
@@ -2824,7 +2835,6 @@ mod tests {
         let challenge = Challenge {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
-            siwx: None,
             extensions: None,
         };
 
@@ -2843,7 +2853,6 @@ mod tests {
         let challenge = Challenge {
             x402_version: X402_VERSION_V2,
             requirements,
-            siwx: None,
             extensions: None,
         };
         let err = build_payment(&challenge, &store, None, Some("alice"), None).unwrap_err();
@@ -2874,7 +2883,6 @@ mod tests {
         let challenge = Challenge {
             x402_version: X402_VERSION_V2,
             requirements,
-            siwx: None,
             extensions: None,
         };
 

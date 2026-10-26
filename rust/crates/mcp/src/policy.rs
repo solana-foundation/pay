@@ -778,8 +778,8 @@ mod tests {
     fn hosted_siwx_header_is_not_signed_without_a_client_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let store = gated_file_store(&dir);
-        let challenge = pay_core::client::x402::SiwxAuthChallenge {
-            extension: pay_kit::x402::siwx::SiwxExtension::new(
+        let challenge = pay_core::client::x402::SiwxAuthChallenge::for_resource(
+            pay_kit::x402::siwx::SiwxExtension::new(
                 pay_kit::x402::siwx::SiwxExtensionInfo {
                     domain: "merchant.example".to_string(),
                     uri: "https://merchant.example/data".to_string(),
@@ -794,7 +794,9 @@ mod tests {
                 },
                 pay_kit::x402::siwx::default_solana_siwx_chains(),
             ),
-        };
+            "https://merchant.example/data",
+        )
+        .unwrap();
         let approval = PolicyApproval {
             subject: "sub".to_string(),
             policy: SpendPolicy::dollars(1.0, 10.0),
@@ -812,6 +814,81 @@ mod tests {
         // here the hosted gate refuses the raw proof.
         let err = result.expect_err("raw proof signed without approval");
         assert!(matches!(err, pay_core::Error::PaymentRejected(_)), "{err}");
+    }
+
+    #[test]
+    fn hosted_payment_never_carries_a_sign_in_proof() {
+        use base64::Engine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = gated_file_store(&dir);
+        pay_core::test_rpc::install_blockhash_rpc();
+        let resource = "https://api.example/paid";
+        let payment_required = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "exact",
+                "network": pay_kit::x402::exact::SOLANA_MAINNET,
+                "amount": "1",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "decimals": 6,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "recentBlockhash": "11111111111111111111111111111111",
+                },
+            }],
+            "extensions": {
+                "sign-in-with-x": {
+                    "info": {
+                        "domain": "api.example",
+                        "uri": "https://api.example",
+                        "version": "1",
+                        "nonce": "nonce",
+                        "issuedAt": "2026-10-19T00:00:00Z"
+                    },
+                    "supportedChains": [{
+                        "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
+                        "type": "ed25519",
+                        "signatureScheme": "siws"
+                    }]
+                }
+            }
+        });
+        let headers = vec![(
+            pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(payment_required.to_string()),
+        )];
+        let challenge = pay_core::client::x402::parse(&headers, None).expect("payment offer");
+
+        // A tiny in-policy payment signs without a prompt; a sign-in proof
+        // must never ride along under that payment approval.
+        let ledger = Arc::new(MemoryLedger::new());
+        let gate = PolicyGate::new("tenant", SpendPolicy::dollars(1.0, 10.0), ledger);
+        let built = pay_core::client::x402::build_payment_with_override(
+            &challenge,
+            &store,
+            Some("mainnet"),
+            Some("connector"),
+            Some(resource),
+            Some(Box::new(gate)),
+        )
+        .expect("in-policy payment signs");
+        assert!(
+            built
+                .headers
+                .iter()
+                .any(|(name, _)| *name == pay_kit::x402::X402_V2_PAYMENT_HEADER)
+        );
+        assert!(
+            built
+                .headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case(pay_kit::x402::SIGN_IN_WITH_X_HEADER)),
+            "{:?}",
+            built.headers
+        );
     }
 
     #[test]
@@ -836,7 +913,6 @@ mod tests {
         let challenge = pay_core::client::x402::Challenge {
             x402_version: 2,
             requirements,
-            siwx: None,
             extensions: None,
         };
 
@@ -873,7 +949,6 @@ mod tests {
             &pay_core::client::x402::Challenge {
                 x402_version: 2,
                 requirements,
-                siwx: None,
                 extensions: None,
             },
             &store,
@@ -980,7 +1055,6 @@ mod tests {
             &pay_core::client::x402::Challenge {
                 x402_version: 2,
                 requirements,
-                siwx: None,
                 extensions: None,
             },
             &store,

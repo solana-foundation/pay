@@ -1138,7 +1138,7 @@ fn classify_402_inner(
             })
     });
     let mpp_challenges = mpp::parse_headers(headers);
-    let x402_siwx_challenge = x402::parse_siwx_auth(headers, body);
+    let x402_siwx_challenge = x402::parse_siwx_auth(headers, body, resource_url);
 
     // x402::parse (from pay_kit::x402) only returns Some when a Solana-
     // compatible `accepts` entry exists — it's already a Solana filter.
@@ -5227,7 +5227,7 @@ HTTP request sent, awaiting response...
                 resource_url,
                 ..
             } => {
-                assert_eq!(challenge.extension.nonce, "nonce-123");
+                assert_eq!(challenge.extension().nonce, "nonce-123");
                 assert_eq!(resource_url, "https://example.com/resource");
             }
             other => panic!("expected X402SignInChallenge, got {other:?}"),
@@ -5280,12 +5280,80 @@ HTTP request sent, awaiting response...
                 payment_fallback,
                 ..
             } => {
-                assert_eq!(challenge.extension.nonce, "nonce-123");
+                assert_eq!(challenge.extension().nonce, "nonce-123");
                 let pay = payment_fallback.expect("payment option preserved as fallback");
                 assert_eq!(pay.requirements.amount, "10000");
             }
             other => panic!("expected X402SignInChallenge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_402_ignores_a_sign_in_challenge_for_another_origin() {
+        use base64::Engine;
+
+        let selected = serde_json::json!({
+            "scheme": pay_kit::x402::exact::EXACT_SCHEME,
+            "network": pay_kit::x402::exact::SOLANA_MAINNET,
+            "amount": "1",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
+            "maxTimeoutSeconds": 300
+        });
+        let headers_for = |domain: &str, uri: &str| {
+            let payment_required = serde_json::json!({
+                pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
+                "accepts": [selected],
+                "extensions": {
+                    "sign-in-with-x": {
+                        "info": {
+                            "domain": domain,
+                            "uri": uri,
+                            "version": "1",
+                            "nonce": "victim-nonce",
+                            "issuedAt": "2026-04-27T00:00:00Z"
+                        },
+                        "supportedChains": [{
+                            "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
+                            "type": "ed25519",
+                            "signatureScheme": "siws"
+                        }]
+                    }
+                }
+            });
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(payment_required.to_string().as_bytes());
+            vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)]
+        };
+
+        // A proof for victim.example must not be signed for attacker.example;
+        // the payment offer stands on its own.
+        for (domain, uri) in [
+            ("victim.example", "https://victim.example"),
+            ("attacker.example", "https://victim.example/login"),
+            ("victim.example", "https://attacker.example"),
+        ] {
+            let outcome = classify_402(
+                &headers_for(domain, uri),
+                None,
+                "https://attacker.example/resource",
+            );
+            assert!(
+                matches!(outcome, RunOutcome::X402Challenge { .. }),
+                "{domain} {uri}: {outcome:?}"
+            );
+        }
+
+        // Control: the issuing origin's own sign-in is still offered.
+        let outcome = classify_402(
+            &headers_for("attacker.example", "https://attacker.example/login"),
+            None,
+            "https://attacker.example/resource",
+        );
+        assert!(
+            matches!(outcome, RunOutcome::X402SignInChallenge { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]

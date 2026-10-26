@@ -589,7 +589,6 @@ assets:
                 "resource": "https://merchant.example/paid",
             }))
             .unwrap(),
-            siwx: None,
             extensions: None,
         };
         let url = "https://merchant.example/paid";

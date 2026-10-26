@@ -1820,7 +1820,6 @@ mod tests {
             challenge: Box::new(pay_core::client::x402::Challenge {
                 x402_version: 2,
                 requirements,
-                siwx: None,
                 extensions: None,
             }),
             advertised_challenges: Default::default(),
