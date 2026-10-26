@@ -37,8 +37,14 @@ pub const CONNECTOR_ACCOUNT: &str = "connector";
 
 /// How long a wallet-link ticket handed to a guest stays valid.
 pub const LINK_TTL: Duration = Duration::from_secs(30 * 60);
-/// Most link tickets held at once; expired ones are swept when full.
-const MAX_LINKS: usize = 4096;
+/// Link tickets held at once. An unclaimed ticket is a request anyone can
+/// get again, so a burst of them displaces itself; a claimed one (a link
+/// being completed) is never displaced.
+const LINK_LIMITS: crate::capacity::Limits = crate::capacity::Limits {
+    rows: 4096,
+    per_owner: 1,
+    anonymous: crate::capacity::Anonymous::EvictOldest,
+};
 
 /// Subjects minted for guests: connected, no wallet yet.
 pub const GUEST_PREFIX: &str = "guest_";
@@ -138,6 +144,15 @@ struct LinkTicket {
     subject: String,
     created_at: Instant,
     claimed: bool,
+}
+
+impl crate::capacity::Row for LinkTicket {
+    fn owner(&self) -> Option<&str> {
+        self.claimed.then_some(self.subject.as_str())
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
 }
 
 /// What a wallet has already paid out, from a record that outlives this
@@ -417,27 +432,33 @@ impl TenantRegistry {
             == Some(crate::protocol::sha256_hex(ticket).as_str())
     }
 
-    /// A fresh ticket for `subject`; `None` when the table is full of live
-    /// tickets. The plaintext goes into the tool error, only its hash stays.
+    /// A fresh ticket for `subject`; `None` while it holds a live one, or
+    /// when the table is full of links being completed. The plaintext goes
+    /// into the tool error, only its hash stays.
     pub fn mint_link(&self, subject: &str) -> Option<String> {
         let ticket = crate::protocol::random_token();
         let now = Instant::now();
         let mut links = self.links.lock().unwrap();
-        links.retain(|_, t| now.saturating_duration_since(t.created_at) <= LINK_TTL);
-        if links.values().any(|ticket| ticket.subject == subject) {
+        let expired = |t: &LinkTicket| now.saturating_duration_since(t.created_at) > LINK_TTL;
+        if links
+            .values()
+            .any(|ticket| ticket.subject == subject && !expired(ticket))
+        {
             return None;
         }
-        if links.len() >= MAX_LINKS {
-            return None;
-        }
-        links.insert(
+        let row = LinkTicket {
+            subject: subject.to_string(),
+            created_at: now,
+            claimed: false,
+        };
+        crate::capacity::admit(
+            &mut links,
             crate::protocol::sha256_hex(&ticket),
-            LinkTicket {
-                subject: subject.to_string(),
-                created_at: now,
-                claimed: false,
-            },
-        );
+            row,
+            LINK_LIMITS,
+            expired,
+        )
+        .ok()?;
         Some(ticket)
     }
 
@@ -995,6 +1016,24 @@ mod tests {
         assert!(registry.mint_link("guest_1").is_some());
         assert!(registry.mint_link("guest_1").is_none());
         assert!(registry.mint_link("guest_2").is_some());
+    }
+
+    /// connect/06: a burst of guest tickets displaces itself instead of
+    /// leaving later guests with no link, and never a link being completed.
+    #[test]
+    fn a_burst_of_link_tickets_cannot_lock_out_other_guests() {
+        let registry = TenantRegistry::new();
+        let claimed = registry.mint_link("guest_linking").unwrap();
+        let claim = registry.claim_link(&claimed).unwrap();
+        let first = registry.mint_link("guest_first").unwrap();
+        for i in 0..LINK_LIMITS.rows {
+            registry.mint_link(&format!("guest_burst_{i}")).unwrap();
+        }
+        let late = registry.mint_link("guest_late").expect("room is made");
+        assert_eq!(registry.peek_link(&late).as_deref(), Some("guest_late"));
+        assert!(registry.peek_link(&first).is_none(), "the oldest went");
+        claim.commit();
+        assert_eq!(registry.links.lock().unwrap().len(), LINK_LIMITS.rows - 1);
     }
 
     #[test]

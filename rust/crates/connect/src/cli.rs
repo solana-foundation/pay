@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
 use crate::AppState;
+use crate::capacity::{Anonymous, Limits, Row, admit};
 use crate::oauth::{FundNext, PrivyLogin, approve_with_cookie, approve_with_privy, privy_login};
 use crate::protocol::{
     ApiError, pkce_challenge, random_token, redirect_url, sha256_hex, validate_callback,
@@ -33,9 +34,20 @@ const TOKEN_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const MAX_ROWS: usize = 4096;
 /// CLI tokens held at once, and per subject: a full store refuses a new
 /// token rather than evict another user's; a subject recycles its own.
-const TOKEN_LIMITS: crate::capacity::Limits = crate::capacity::Limits {
+/// Browser requests in flight: anonymous until a sign-in parks one for
+/// funding, so a burst of them displaces itself instead of locking out
+/// every `pay setup`.
+const PENDING_LIMITS: Limits = Limits {
+    rows: MAX_ROWS,
+    per_owner: 8,
+    anonymous: Anonymous::EvictOldest,
+};
+/// Link codes, each held by the Privy session that approved it.
+const GRANT_LIMITS: Limits = PENDING_LIMITS;
+const TOKEN_LIMITS: Limits = Limits {
     rows: 16_384,
     per_owner: 8,
+    anonymous: Anonymous::Keep,
 };
 
 #[derive(Clone)]
@@ -59,6 +71,15 @@ enum PendingKind {
     },
 }
 
+impl Row for Pending {
+    fn owner(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
 struct Grant {
     subject: String,
     code_challenge: String,
@@ -67,15 +88,24 @@ struct Grant {
     created_at: Instant,
 }
 
+impl Row for Grant {
+    fn owner(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
 struct Token {
     subject: String,
     session: Option<String>,
     created_at: Instant,
 }
 
-impl crate::capacity::Row for Token {
-    fn owner(&self) -> &str {
-        &self.subject
+impl Row for Token {
+    fn owner(&self) -> Option<&str> {
+        Some(&self.subject)
     }
     fn created_at(&self) -> Instant {
         self.created_at
@@ -93,13 +123,14 @@ pub struct Store {
 impl Store {
     fn insert_pending(&self, id: String, pending: Pending) -> Result<(), ApiError> {
         let now = Instant::now();
-        let mut rows = self.pending.lock().unwrap();
-        rows.retain(|_, row| now.saturating_duration_since(row.created_at) <= REQUEST_TTL);
-        if rows.len() >= MAX_ROWS {
-            return Err(ApiError::busy());
-        }
-        rows.insert(id, pending);
-        Ok(())
+        admit(
+            &mut self.pending.lock().unwrap(),
+            id,
+            pending,
+            PENDING_LIMITS,
+            |row| now.saturating_duration_since(row.created_at) > REQUEST_TTL,
+        )
+        .map_err(|_| ApiError::busy())
     }
 
     fn pending(&self, id: &str) -> Option<Pending> {
@@ -107,9 +138,22 @@ impl Store {
         (Instant::now().saturating_duration_since(row.created_at) <= REQUEST_TTL).then_some(row)
     }
 
-    /// Consume a pending link and mint its code, bound to `session`. `live`
-    /// says whether that session is still signed in; it is asked while
-    /// grants are locked, so a sign-out either sees the code or refuses it.
+    /// Park a pending link for funding in `session`, which now holds it.
+    fn attach_session(&self, id: &str, session: &str) {
+        let mut rows = self.pending.lock().unwrap();
+        if let Some(mut row) = rows.remove(id) {
+            row.session = Some(session.to_string());
+            let now = Instant::now();
+            let _ = admit(&mut rows, id.to_string(), row, PENDING_LIMITS, |row| {
+                now.saturating_duration_since(row.created_at) > REQUEST_TTL
+            });
+        }
+    }
+
+    /// Mint a pending link's code, bound to `session`, and only then consume
+    /// the link: a refused code leaves it to approve again. `live` says
+    /// whether that session is still signed in; it is asked while grants are
+    /// locked, so a sign-out either sees the code or refuses it.
     fn approve(
         &self,
         id: &str,
@@ -122,35 +166,29 @@ impl Store {
         let PendingKind::Link { code_challenge } = &pending.kind else {
             return None;
         };
-        let code_challenge = code_challenge.clone();
-        let pending = rows.remove(id)?;
-        let session = session.or_else(|| pending.session.clone());
-        drop(rows);
-        if Instant::now().saturating_duration_since(pending.created_at) > REQUEST_TTL {
+        let now = Instant::now();
+        if now.saturating_duration_since(pending.created_at) > REQUEST_TTL {
+            rows.remove(id);
             return None;
         }
+        let code_challenge = code_challenge.clone();
+        let session = session.or_else(|| pending.session.clone());
         let code = random_token();
         let mut grants = self.grants.lock().unwrap();
         if session.is_some() && !live() {
             return None;
         }
-        if grants.len() >= MAX_ROWS {
-            let now = Instant::now();
-            grants.retain(|_, row| now.saturating_duration_since(row.created_at) <= CODE_TTL);
-            if grants.len() >= MAX_ROWS {
-                return None;
-            }
-        }
-        grants.insert(
-            sha256_hex(&code),
-            Grant {
-                subject,
-                code_challenge,
-                session,
-                created_at: Instant::now(),
-            },
-        );
-        Some((pending, code))
+        let grant = Grant {
+            subject,
+            code_challenge,
+            session,
+            created_at: now,
+        };
+        admit(&mut grants, sha256_hex(&code), grant, GRANT_LIMITS, |row| {
+            now.saturating_duration_since(row.created_at) > CODE_TTL
+        })
+        .ok()?;
+        Some((rows.remove(id)?, code))
     }
 
     fn deny(&self, id: &str) -> Option<Pending> {
@@ -274,7 +312,7 @@ impl Store {
             session,
             created_at: now,
         };
-        crate::capacity::admit(
+        admit(
             &mut self.tokens.lock().unwrap(),
             sha256_hex(&token),
             row,
@@ -489,9 +527,7 @@ pub async fn approve(
         }
     };
     if let Some(fund) = funding_next(&state, &id, &subject, fresh_login).await? {
-        if let Some(row) = state.cli().pending.lock().unwrap().get_mut(&id) {
-            row.session = Some(session.id.clone());
-        }
+        state.cli().attach_session(&id, &session.id);
         tracing::info!(subject = %subject, address = %fund.address, "empty CLI wallet: funding before approval");
         let mut response = Json(Decision {
             redirect: None,
@@ -1262,6 +1298,67 @@ mod tests {
         let tokens = store.tokens.lock().unwrap();
         assert_eq!(tokens.len(), TOKEN_LIMITS.rows);
         assert!(tokens.contains_key("live-0"));
+    }
+
+    /// connect/06: a burst of anonymous `GET /v1/cli` requests displaces
+    /// itself instead of refusing every `pay setup` for ten minutes.
+    #[tokio::test]
+    async fn a_burst_of_cli_requests_cannot_lock_out_pay_setup() {
+        let state = state();
+        let app = crate::router(state.clone());
+        for i in 0..MAX_ROWS {
+            pending_link(&state, &format!("burst-{i}"));
+        }
+        let challenge = pkce_challenge(VERIFIER);
+        let start = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/cli?callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback&state={STATE}&code_challenge={challenge}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::SEE_OTHER);
+        assert_eq!(state.cli().pending.lock().unwrap().len(), MAX_ROWS);
+    }
+
+    /// connect/06: a link approval refused for want of code slots leaves
+    /// the user's pending link in place to approve again.
+    #[test]
+    fn a_refused_link_code_does_not_consume_the_pending_link() {
+        let state = state();
+        let store = state.cli();
+        pending_link(&state, "link-1");
+        {
+            let mut grants = store.grants.lock().unwrap();
+            for i in 0..MAX_ROWS {
+                grants.insert(
+                    format!("held-{i}"),
+                    Grant {
+                        subject: format!("sub_{i}"),
+                        code_challenge: pkce_challenge(VERIFIER),
+                        session: Some(format!("sess_{i}")),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
+        }
+        let approve = || {
+            store.approve(
+                "link-1",
+                SUBJECT.to_string(),
+                Some("sess_cli".into()),
+                || true,
+            )
+        };
+        assert!(approve().is_none());
+        assert!(store.is_link_pending("link-1"));
+        store.grants.lock().unwrap().remove("held-0");
+        let (_, code) = approve().unwrap();
+        assert!(store.redeem(&code, VERIFIER, |_| true).is_ok());
     }
 
     /// One account looping links recycles its own oldest token only.

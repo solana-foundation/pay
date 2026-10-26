@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::AppState;
+use crate::capacity::{Anonymous, Limits, Row, admit};
 use crate::mcp::Tenant;
 use crate::protocol::{ApiError, is_base64url_alphabet, random_token, sha256_hex};
 
@@ -46,6 +47,16 @@ pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const REQUEST_TTL: Duration = Duration::from_secs(30 * 60);
 /// Most rows of any one kind held at once; expired rows are swept when full.
 pub const MAX_ROWS: usize = 16_384;
+/// Sign-ins in flight: anonymous until a sign-in parks one for funding, so
+/// a burst of them displaces itself instead of locking out every host.
+const PENDING_LIMITS: Limits = Limits {
+    rows: MAX_ROWS,
+    per_owner: 8,
+    anonymous: Anonymous::EvictOldest,
+};
+/// Codes waiting for exchange: a guest's are anonymous, others are held by
+/// the login session that approved them.
+const CODE_LIMITS: Limits = PENDING_LIMITS;
 /// The one scope this server knows: use the pay tools.
 pub const SCOPE: &str = "mcp";
 
@@ -160,6 +171,24 @@ struct CodeGrant {
     created_at: Instant,
 }
 
+impl Row for PendingAuthorization {
+    fn owner(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
+impl Row for CodeGrant {
+    fn owner(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenKind {
     Access,
@@ -248,23 +277,6 @@ fn unix_now() -> u64 {
 fn family_of(refresh_token: &str) -> Option<&str> {
     let (family, secret) = refresh_token.split_once('.')?;
     (!family.is_empty() && !secret.is_empty()).then_some(family)
-}
-
-/// Insert into a bounded map, sweeping expired rows when it is full.
-fn insert_bounded<V>(
-    map: &mut HashMap<String, V>,
-    key: String,
-    value: V,
-    expired: impl Fn(&V) -> bool,
-) -> bool {
-    if map.len() >= MAX_ROWS {
-        map.retain(|_, v| !expired(v));
-        if map.len() >= MAX_ROWS {
-            return false;
-        }
-    }
-    map.insert(key, value);
-    true
 }
 
 impl Store {
@@ -419,18 +431,20 @@ impl Store {
     /// Park a validated authorization request for the consent page.
     pub fn create_pending(&self, request: PendingAuthorization) -> Result<(), ApiError> {
         let now = self.now();
-        let mut pending = self.pending.lock().unwrap();
-        if insert_bounded(&mut pending, request.id.clone(), request, |p| {
-            now.saturating_duration_since(p.created_at) > REQUEST_TTL
-        }) {
-            Ok(())
-        } else {
-            Err(ApiError::new(
+        admit(
+            &mut self.pending.lock().unwrap(),
+            request.id.clone(),
+            request,
+            PENDING_LIMITS,
+            |p| now.saturating_duration_since(p.created_at) > REQUEST_TTL,
+        )
+        .map_err(|_| {
+            ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "busy",
                 "Too many sign-ins are in progress. Try again in a few minutes.",
-            ))
-        }
+            )
+        })
     }
 
     pub fn pending(&self, id: &str) -> Option<PendingAuthorization> {
@@ -457,13 +471,19 @@ impl Store {
         session: Option<&str>,
         live: impl FnOnce() -> bool,
     ) -> Option<(PendingAuthorization, String)> {
-        let request = self.pending.lock().unwrap().remove(id)?;
-        if self.now().saturating_duration_since(request.created_at) > REQUEST_TTL {
+        let mut pending = self.pending.lock().unwrap();
+        let request = pending.get(id)?;
+        let now = self.now();
+        if now.saturating_duration_since(request.created_at) > REQUEST_TTL {
+            pending.remove(id);
             return None;
         }
         let session = session.or(request.session.as_deref());
-        let client = self.client(&request.client_id)?;
-        if !host_bound(&client, &request.redirect_uri) {
+        if !self
+            .client(&request.client_id)
+            .is_some_and(|client| host_bound(&client, &request.redirect_uri))
+        {
+            pending.remove(id);
             return None;
         }
         let code = random_token();
@@ -474,28 +494,35 @@ impl Store {
             subject: subject.to_string(),
             scope: request.scope.clone(),
             session: session.map(str::to_string),
-            created_at: self.now(),
+            created_at: now,
         };
-        let now = self.now();
         let mut codes = self.codes.lock().unwrap();
-        if session.is_some() && !live() {
+        if grant.session.is_some() && !live() {
             return None;
         }
-        insert_bounded(&mut codes, sha256_hex(&code), grant, |g| {
+        // The request is consumed only once its code is stored.
+        admit(&mut codes, sha256_hex(&code), grant, CODE_LIMITS, |g| {
             now.saturating_duration_since(g.created_at) > CODE_TTL
         })
-        .then_some((request, code))
+        .ok()?;
+        Some((pending.remove(id)?, code))
     }
 
     /// Remember the login session of an approval that continues later (after
-    /// funding), so the code it ends with is still bound to it.
+    /// funding), so the code it ends with is still bound to it and the
+    /// request is held by that session.
     pub fn attach_session(&self, id: &str, session: Option<&str>) -> Option<()> {
         let mut pending = self.pending.lock().unwrap();
-        let request = pending.get_mut(id)?;
-        if let Some(session) = session {
-            request.session = Some(session.to_string());
-        }
-        Some(())
+        let Some(session) = session else {
+            return pending.contains_key(id).then_some(());
+        };
+        let mut request = pending.remove(id)?;
+        request.session = Some(session.to_string());
+        let now = self.now();
+        admit(&mut pending, id.to_string(), request, PENDING_LIMITS, |p| {
+            now.saturating_duration_since(p.created_at) > REQUEST_TTL
+        })
+        .ok()
     }
 
     /// Consume the pending request without issuing anything.
@@ -2495,6 +2522,82 @@ mod tests {
         assert!(store.client(&used.client_id).is_some());
     }
 
+    /// connect/06: a burst of anonymous authorization requests displaces
+    /// itself, oldest first, instead of refusing every sign-in; a request a
+    /// signed-in user parked for funding is never displaced.
+    #[test]
+    fn a_burst_of_authorization_requests_cannot_lock_out_sign_ins() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let parked = pending_for(&client);
+        store.create_pending(parked.clone()).unwrap();
+        store.attach_session(&parked.id, Some("sess_1")).unwrap();
+        let oldest = pending_for(&client);
+        store.create_pending(oldest.clone()).unwrap();
+        for _ in 0..MAX_ROWS {
+            store.create_pending(pending_for(&client)).unwrap();
+        }
+        let late = pending_for(&client);
+        store.create_pending(late.clone()).unwrap();
+        assert!(store.pending(&late.id).is_some());
+        assert!(store.pending(&oldest.id).is_none(), "the oldest went");
+        assert!(store.pending(&parked.id).is_some(), "parked stays");
+        assert!(
+            store
+                .approve_in_session(&parked.id, "sub_1", None, || true)
+                .is_some()
+        );
+    }
+
+    /// connect/06: guest codes cannot crowd out an approval, and an approval
+    /// refused for want of room leaves its request to approve again.
+    #[test]
+    fn a_full_code_table_neither_refuses_users_nor_consumes_their_request() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        for i in 0..MAX_ROWS {
+            let request = pending_for(&client);
+            store.create_pending(request.clone()).unwrap();
+            store.approve(&request.id, &format!("guest_{i}")).unwrap();
+        }
+        let request = pending_for(&client);
+        store.create_pending(request.clone()).unwrap();
+        let (_, code) = store
+            .approve_in_session(&request.id, "sub_1", Some("sess_1"), || true)
+            .unwrap();
+        assert!(
+            store
+                .exchange_code(&client.client_id, &code, VERIFIER, None)
+                .is_ok()
+        );
+
+        // Every slot held by some session's code: refused, not consumed.
+        {
+            let mut codes = store.codes.lock().unwrap();
+            codes.clear();
+            for i in 0..MAX_ROWS {
+                codes.insert(
+                    format!("held-{i}"),
+                    CodeGrant {
+                        client_id: client.client_id.clone(),
+                        redirect_uri: GROK_REDIRECT.to_string(),
+                        code_challenge: pkce_challenge(VERIFIER),
+                        subject: format!("sub_{i}"),
+                        scope: SCOPE.to_string(),
+                        session: Some(format!("sess_{i}")),
+                        created_at: store.now(),
+                    },
+                );
+            }
+        }
+        let request = pending_for(&client);
+        store.create_pending(request.clone()).unwrap();
+        assert!(store.approve(&request.id, "guest_x").is_none());
+        assert!(store.pending(&request.id).is_some(), "still pending");
+        store.codes.lock().unwrap().remove("held-0");
+        assert!(store.approve(&request.id, "guest_x").is_some());
+    }
+
     #[test]
     fn a_full_token_store_does_not_consume_an_authorization_code() {
         let store = Store::new("https://cloud.test");
@@ -3608,6 +3711,24 @@ mod tests {
         )
         .await;
         assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    }
+
+    /// connect/06, over HTTP: a host's authorization goes through after a
+    /// burst of parked requests filled the table.
+    #[tokio::test]
+    async fn authorize_still_parks_a_request_after_a_burst() {
+        let state = AppState::new("https://cloud.test")
+            .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]));
+        let app = crate::router(state.clone());
+        let client_id = register_grok(&app).await;
+        let store = state.oauth().unwrap();
+        let client = store.client(&client_id).unwrap();
+        for _ in 0..MAX_ROWS {
+            store.create_pending(pending_for(&client)).unwrap();
+        }
+        let request_id = start_authorization(&app, &client_id, None).await;
+        let view = get(&app, &format!("/api/oauth/authorize/{request_id}")).await;
+        assert_eq!(view.status, StatusCode::OK, "{}", view.body);
     }
 
     // ── Privy login on the consent page ────────────────────────────────
