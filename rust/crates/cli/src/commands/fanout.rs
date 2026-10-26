@@ -24,7 +24,7 @@ use pay_core::client::push::manifest::{ManifestContext, TransferManifest, parse_
 use pay_core::client::push::permit::{BatchAuthorizationSummary, BatchSigningPermit};
 use pay_core::client::push::planner::{
     AtaSnapshot, DestinationAtaStatus, FeePayerMode, compute_reserve_lamports, pack_chunks_from,
-    rent_exempt_minimum_lamports, token_account_len,
+    token_account_len,
 };
 use pay_core::{Error, Result};
 use pay_kit::mpp::protocol::solana::{default_rpc_url, programs};
@@ -206,13 +206,9 @@ impl FanoutCommand {
                 manifest.total_amount_raw
             )));
         }
-        let rent_per_ata =
-            rent_exempt_minimum_lamports(token_account_len(&mint_info.token_program));
-        let missing_ata_rent_lamports = rent_per_ata
-            .checked_mul(snapshot.missing_count() as u64)
-            .ok_or_else(|| {
-            Error::Config("missing-ATA rent estimate overflowed u64".to_string())
-        })?;
+        let missing_ata_rent_lamports = runtime.block_on(
+            rpc.missing_ata_rent_lamports(&mint_info.token_program, snapshot.missing_count()),
+        )?;
         let estimated_fee_lamports = ESTIMATED_FEE_LAMPORTS_PER_CHUNK
             .checked_mul(plan.total_transactions() as u64)
             .ok_or_else(|| Error::Config("transaction fee estimate overflowed u64".to_string()))?;
@@ -520,6 +516,29 @@ impl FanoutRpc {
             .ok_or_else(|| Error::Config(format!("token account {address} has no raw balance")))?
             .parse()
             .map_err(|error| Error::Config(format!("token balance is invalid: {error}")))
+    }
+
+    async fn missing_ata_rent_lamports(
+        &self,
+        token_program: &Pubkey,
+        missing: usize,
+    ) -> Result<u64> {
+        if missing == 0 {
+            return Ok(0);
+        }
+        let rent_per_ata = self
+            .call(
+                "getMinimumBalanceForRentExemption",
+                json!([token_account_len(token_program), {"commitment":"confirmed"}]),
+            )
+            .await?
+            .as_u64()
+            .ok_or_else(|| {
+                Error::Config("malformed getMinimumBalanceForRentExemption response".to_string())
+            })?;
+        rent_per_ata
+            .checked_mul(missing as u64)
+            .ok_or_else(|| Error::Config("missing-ATA rent estimate overflowed u64".to_string()))
     }
 
     async fn sol_balance(&self, address: &Pubkey) -> Result<u64> {
@@ -1072,6 +1091,45 @@ mod tests {
     fn global_network_override_wins_over_fanout_default() {
         assert_eq!(effective_network("mainnet", Some("devnet")), "devnet");
         assert_eq!(effective_network("devnet", None), "devnet");
+    }
+
+    #[tokio::test]
+    async fn missing_ata_rent_is_the_clusters_rent_exempt_minimum() {
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requested.clone();
+        let rpc = move |axum::Json(request): axum::Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                assert_eq!(request["method"], "getMinimumBalanceForRentExemption");
+                let data_len = request["params"][0].as_u64().unwrap();
+                seen.lock().unwrap().push(data_len);
+                axum::Json(json!({"jsonrpc":"2.0","id":1,"result":(128 + data_len) * 5_080}))
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/", axum::routing::post(rpc)),
+            )
+            .await
+            .unwrap();
+        });
+        let rpc = FanoutRpc::new(format!("http://{addr}/"));
+        let token: Pubkey = programs::TOKEN_PROGRAM.parse().unwrap();
+        let token_2022: Pubkey = programs::TOKEN_2022_PROGRAM.parse().unwrap();
+
+        assert_eq!(
+            rpc.missing_ata_rent_lamports(&token, 3).await.unwrap(),
+            3 * 1_488_440
+        );
+        assert_eq!(
+            rpc.missing_ata_rent_lamports(&token_2022, 1).await.unwrap(),
+            1_513_840
+        );
+        assert_eq!(rpc.missing_ata_rent_lamports(&token, 0).await.unwrap(), 0);
+        assert_eq!(*requested.lock().unwrap(), vec![165, 170]);
     }
     fn manifest(rows: usize) -> TransferManifest {
         let mut csv = String::from("recipient,amount\n");
