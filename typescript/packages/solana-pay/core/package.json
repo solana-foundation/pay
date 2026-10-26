@@ -116,7 +116,7 @@
         "@solana/rpc-subscriptions-api": "^8.1.0",
         "@solana/rpc-subscriptions-spec": "^8.1.0",
         "@types/node": "^20.19.43",
-        "@vitest/coverage-v8": "^4.1.11",
+        "@vitest/coverage-v8": "^4.1.12",
         "eslint": "^9.39.5",
         "eslint-plugin-simple-import-sort": "^12.1.1",
         "eslint-plugin-sort-keys-fix": "^1.1.2",
@@ -126,7 +126,7 @@
         "tsup": "^8.5.1",
         "typescript": "^5.9.3",
         "typescript-eslint": "8.49.0",
-        "vite": "8.0.16",
-        "vitest": "^4.1.11"
+        "vite": "8.1.6",
+        "vitest": "^4.1.12"
     }
 }
