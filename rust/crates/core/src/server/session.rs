@@ -407,7 +407,11 @@ impl SessionOperatorRuntime {
     /// the channel. The on-chain watermark is read first, so retries are
     /// idempotent and a successfully landed watermark is not re-broadcast on
     /// every lifecycle tick.
-    async fn operator_push_watermark(&self, channel_id: &str) -> Result<bool> {
+    async fn operator_push_watermark(
+        &self,
+        channel_id: &str,
+        min_delta: MinSettleDelta,
+    ) -> Result<bool> {
         let Some(signer) = self.payment_channel_signer() else {
             // Verification-only servers have no authority to settle. Idle
             // close retains its existing no-op behavior for these instances.
@@ -433,7 +437,9 @@ impl SessionOperatorRuntime {
         };
         // Only OPEN channels accept an intermediate settle. CLOSING/SEALED/
         // DISTRIBUTED channels are already advancing through the close path.
-        if channel.status != 0 || channel.settlement.settled >= params.settled {
+        // The operator pays every settle, so an advance below `min_delta`
+        // waits for more usage or the close.
+        if channel.status != 0 || !min_delta.covers(channel.settlement.settled, params.settled) {
             return Ok(false);
         }
 
@@ -1261,7 +1267,7 @@ enum SessionLifecycleCommand {
     Configure {
         close_delay: Option<Duration>,
         close_batch_interval: Duration,
-        settlement_interval: Option<Duration>,
+        settlement: WatermarkSettlement,
         reconciliation: SessionLifecycleReconciliation,
     },
     Touch {
@@ -1278,6 +1284,52 @@ pub enum SessionLifecycleReconciliation {
     Embedded,
     /// This process only persists touches; an external worker owns the clock.
     External,
+}
+
+/// Least unsettled amount, in base units, worth an operator-paid settle
+/// between closes. Smaller advances wait for the next push or the close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinSettleDelta(std::num::NonZeroU64);
+
+impl MinSettleDelta {
+    /// Push any advance: for operators who set the prices themselves.
+    pub const ANY: Self = Self(std::num::NonZeroU64::MIN);
+
+    pub const fn new(base_units: std::num::NonZeroU64) -> Self {
+        Self(base_units)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Whether moving the on-chain watermark to `accepted` is worth a settle.
+    fn covers(self, onchain_settled: u64, accepted: u64) -> bool {
+        accepted.saturating_sub(onchain_settled) >= self.get()
+    }
+}
+
+/// When the embedded lifecycle pushes accepted watermarks on-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatermarkSettlement(Option<(Duration, MinSettleDelta)>);
+
+impl WatermarkSettlement {
+    /// Watermarks land only when channels close.
+    pub const DISABLED: Self = Self(None);
+
+    /// Every `interval`, for channels whose unsettled amount reaches
+    /// `min_delta`. A zero interval disables pushes.
+    pub fn every(interval: Duration, min_delta: MinSettleDelta) -> Self {
+        Self((!interval.is_zero()).then_some((interval, min_delta)))
+    }
+
+    pub fn interval(self) -> Option<Duration> {
+        self.0.map(|(interval, _)| interval)
+    }
+
+    pub fn min_delta(self) -> Option<MinSettleDelta> {
+        self.0.map(|(_, min_delta)| min_delta)
+    }
 }
 
 const LIFECYCLE_OWNER_LEASE_PREFIX: &str = "embedded-v1:";
@@ -1312,7 +1364,7 @@ struct SessionLifecycleRunloop {
     owner: String,
     close_delay: Option<Duration>,
     close_batch_interval: Duration,
-    settlement_interval: Option<Duration>,
+    settlement: WatermarkSettlement,
     next_settlement: Option<Instant>,
     reconciliation: SessionLifecycleReconciliation,
     rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
@@ -1333,7 +1385,7 @@ impl SessionLifecycleRunloop {
             owner: uuid::Uuid::new_v4().to_string(),
             close_delay: None,
             close_batch_interval: Duration::from_secs(60),
-            settlement_interval: None,
+            settlement: WatermarkSettlement::DISABLED,
             next_settlement: None,
             reconciliation: SessionLifecycleReconciliation::Embedded,
             rx,
@@ -1419,14 +1471,15 @@ impl SessionLifecycleRunloop {
             Some(SessionLifecycleCommand::Configure {
                 close_delay,
                 close_batch_interval,
-                settlement_interval,
+                settlement,
                 reconciliation,
             }) => {
                 self.close_delay = close_delay;
                 self.close_batch_interval = close_batch_interval;
-                self.settlement_interval = settlement_interval;
-                self.next_settlement =
-                    settlement_interval.map(|interval| Instant::now() + interval);
+                self.settlement = settlement;
+                self.next_settlement = settlement
+                    .interval()
+                    .map(|interval| Instant::now() + interval);
                 self.reconciliation = reconciliation;
                 if reconciliation == SessionLifecycleReconciliation::Embedded {
                     self.reconcile_persisted_ownership().await;
@@ -1520,7 +1573,8 @@ impl SessionLifecycleRunloop {
             .saturating_mul(3)
             .max(MIN_LIFECYCLE_OWNER_LEASE);
         let settlement_lease = self
-            .settlement_interval
+            .settlement
+            .interval()
             .map(|interval| interval.saturating_mul(3))
             .unwrap_or_default();
         close_lease.max(settlement_lease)
@@ -1563,7 +1617,7 @@ impl SessionLifecycleRunloop {
             {
                 continue;
             }
-            let locally_active_for_settlement = self.settlement_interval.is_some()
+            let locally_active_for_settlement = self.settlement.interval().is_some()
                 && self
                     .runtime
                     .committed_watermarks
@@ -1826,7 +1880,9 @@ impl SessionLifecycleRunloop {
     }
 
     async fn push_due_watermarks(&mut self) {
-        let Some(interval) = self.settlement_interval else {
+        let (Some(interval), Some(min_delta)) =
+            (self.settlement.interval(), self.settlement.min_delta())
+        else {
             self.next_settlement = None;
             return;
         };
@@ -1875,7 +1931,9 @@ impl SessionLifecycleRunloop {
             }
             let runtime = self.runtime.clone();
             settlements.push(async move {
-                let result = runtime.operator_push_watermark(&channel_id).await;
+                let result = runtime
+                    .operator_push_watermark(&channel_id, min_delta)
+                    .await;
                 (channel_id, result)
             });
         }
@@ -2407,23 +2465,23 @@ impl SessionMpp {
         self.start_lifecycle_runloop_with_settlement_and_batching(
             close_delay,
             close_delay,
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::Embedded,
         );
     }
 
     /// Configure the lifecycle runloop to reconcile active channels' latest
     /// cumulative voucher on-chain and to settle+seal channels after an idle
-    /// period. Either duration may be zero to disable that behavior.
+    /// period. A zero `close_delay` disables idle close.
     pub fn start_lifecycle_runloop_with_settlement(
         &self,
         close_delay: Duration,
-        settlement_interval: Duration,
+        settlement: WatermarkSettlement,
     ) {
         self.start_lifecycle_runloop_with_settlement_and_batching(
             close_delay,
             close_delay,
-            settlement_interval,
+            settlement,
             SessionLifecycleReconciliation::Embedded,
         );
     }
@@ -2437,7 +2495,7 @@ impl SessionMpp {
         &self,
         close_delay: Duration,
         close_batch_interval: Duration,
-        settlement_interval: Duration,
+        settlement: WatermarkSettlement,
         reconciliation: SessionLifecycleReconciliation,
     ) {
         self.external_reconciliation.store(
@@ -2450,22 +2508,25 @@ impl SessionMpp {
         } else {
             close_batch_interval
         };
-        let settlement_interval = (reconciliation == SessionLifecycleReconciliation::Embedded
-            && !settlement_interval.is_zero())
-        .then_some(settlement_interval);
+        let settlement = if reconciliation == SessionLifecycleReconciliation::Embedded {
+            settlement
+        } else {
+            WatermarkSettlement::DISABLED
+        };
         self.lifecycle
             .touches_enabled
             .store(close_delay.is_some(), Ordering::Release);
         self.lifecycle.send(SessionLifecycleCommand::Configure {
             close_delay,
             close_batch_interval,
-            settlement_interval,
+            settlement,
             reconciliation,
         });
         tracing::info!(
             close_delay_ms = close_delay.map(|delay| delay.as_millis()),
             close_batch_interval_ms = close_batch_interval.as_millis(),
-            settlement_interval_ms = settlement_interval.map(|interval| interval.as_millis()),
+            settlement_interval_ms = settlement.interval().map(|interval| interval.as_millis()),
+            settlement_min_delta = settlement.min_delta().map(MinSettleDelta::get),
             reconciliation = ?reconciliation,
             "started session lifecycle runloop"
         );
@@ -3893,7 +3954,7 @@ mod tests {
             session.start_lifecycle_runloop_with_settlement_and_batching(
                 Duration::from_secs(300),
                 Duration::from_secs(60),
-                Duration::ZERO,
+                WatermarkSettlement::DISABLED,
                 SessionLifecycleReconciliation::External,
             );
             let result = session.for_deployment_policy(test_policy_binding(
@@ -3965,7 +4026,7 @@ mod tests {
             template.start_lifecycle_runloop_with_settlement_and_batching(
                 Duration::from_secs(300),
                 Duration::from_secs(60),
-                Duration::ZERO,
+                WatermarkSettlement::DISABLED,
                 SessionLifecycleReconciliation::External,
             );
         }
@@ -4004,7 +4065,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_secs(300),
             Duration::from_secs(60),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         session
@@ -5607,7 +5668,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::ZERO,
             Duration::from_millis(10),
-            Duration::from_millis(10),
+            WatermarkSettlement::every(Duration::from_millis(10), MinSettleDelta::ANY),
             SessionLifecycleReconciliation::Embedded,
         );
         assert!(!session.lifecycle.touches_enabled.load(Ordering::Acquire));
@@ -5674,7 +5735,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_millis(30),
             Duration::from_millis(1),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = session.challenge(None).unwrap();
@@ -5748,7 +5809,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_millis(10),
             Duration::from_millis(10),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = session.challenge(None).unwrap();
@@ -5829,7 +5890,7 @@ mod tests {
         first.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_secs(3600),
             Duration::from_secs(60),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = first.challenge(None).unwrap();
@@ -5856,7 +5917,7 @@ mod tests {
         restarted.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_secs(3600),
             Duration::from_secs(60),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::Embedded,
         );
 
@@ -5887,7 +5948,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_secs(3600),
             Duration::from_secs(60),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = session.challenge(None).unwrap();
@@ -6017,7 +6078,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             close_delay,
             Duration::from_secs(60),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = session.challenge(None).unwrap();
@@ -6079,7 +6140,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             close_delay,
             Duration::from_secs(60),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = session.challenge(None).unwrap();
@@ -6144,7 +6205,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             Duration::from_millis(30),
             Duration::from_millis(1),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::External,
         );
         let challenge = session.challenge(None).unwrap();
@@ -6574,7 +6635,7 @@ mod tests {
         session.start_lifecycle_runloop_with_settlement_and_batching(
             close_delay,
             Duration::from_millis(10),
-            Duration::ZERO,
+            WatermarkSettlement::DISABLED,
             SessionLifecycleReconciliation::Embedded,
         );
         let challenge = session.challenge(None).unwrap();
@@ -6633,6 +6694,166 @@ mod tests {
         .await
         .expect("the lifecycle distributes the deferred payout");
         assert_eq!(sent.load(Ordering::SeqCst), 1);
+    }
+
+    /// The operator pays every watermark settle. An advance below the
+    /// configured minimum waits; one that reaches it lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watermark_advances_below_the_minimum_are_not_settled() {
+        use axum::{Json, Router, routing::post};
+        use base64::Engine as _;
+        use pay_kit::mpp::program::payment_channels::generated::generated::{
+            accounts::Channel, types::SettlementWatermarks,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let operator = signer.pubkey();
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let program = pay_kit::core::payment_channels::default_program_id();
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let open = borsh::to_vec(&Channel {
+            discriminator: 1,
+            version: 1,
+            bump: 255,
+            status: ChannelStatus::Open as u8,
+            salt: 7,
+            deposit: CAP,
+            settlement: SettlementWatermarks {
+                settled: 0,
+                payout_watermark: 0,
+            },
+            closure_started_at: 0,
+            payer_withdrawn_at: 0,
+            grace_period: 900,
+            distribution_hash: pay_kit::mpp::program::payment_channels::distribution_hash(&[]),
+            payer: pay_kit::core::payment_channels::to_address(&payer),
+            payee: pay_kit::core::payment_channels::to_address(&operator),
+            authorized_signer: pay_kit::core::payment_channels::to_address(&operator),
+            mint: pay_kit::core::payment_channels::to_address(&operator),
+            rent_payer: pay_kit::core::payment_channels::to_address(&operator),
+            open_slot: 42,
+        })
+        .unwrap();
+        let blockhash = solana_hash::Hash::new_unique().to_string();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let rpc_sent = Arc::clone(&sent);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(call): Json<serde_json::Value>| {
+                let (open, blockhash, sent) = (open.clone(), blockhash.clone(), rpc_sent.clone());
+                async move {
+                    let result = match call["method"].as_str().unwrap_or_default() {
+                        "getMultipleAccounts" => serde_json::json!({
+                            "context": {"slot": 50},
+                            "value": [{
+                                "data": [
+                                    base64::engine::general_purpose::STANDARD.encode(&open),
+                                    "base64"
+                                ],
+                                "executable": false, "lamports": 1_000_000u64,
+                                "owner": program.to_string(), "rentEpoch": 0,
+                                "space": open.len()
+                            }]
+                        }),
+                        "getLatestBlockhash" => serde_json::json!({
+                            "context": {"slot": 50},
+                            "value": {"blockhash": blockhash, "lastValidBlockHeight": 1_000}
+                        }),
+                        "getSlot" | "getBlockHeight" => serde_json::json!(50),
+                        "sendTransaction" => {
+                            sent.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!(
+                                pay_kit::mpp::program::payment_channels::decode_transaction(
+                                    call["params"][0].as_str().unwrap()
+                                )
+                                .unwrap()
+                                .signatures[0]
+                                    .to_string()
+                            )
+                        }
+                        _ => {
+                            return Json(serde_json::json!({
+                                "jsonrpc": "2.0", "id": call["id"],
+                                "error": {"code": -32601, "message": "not served"}
+                            }));
+                        }
+                    };
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": call["id"], "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = test_session_config();
+        config.operator = operator.to_string();
+        config.recipient = operator.to_string();
+        config.voucher_signer = SessionVoucherSigner::Operator;
+        config.rpc_url = Some(rpc_url);
+        let session = Arc::new(
+            SessionMpp::new(config, "test-secret")
+                .with_blockhash_cache(test_blockhash_cache())
+                .with_payment_channel_signer(Arc::clone(&signer)),
+        );
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::ZERO,
+            Duration::from_millis(10),
+            WatermarkSettlement::every(
+                Duration::from_millis(10),
+                MinSettleDelta::new(std::num::NonZeroU64::new(100).unwrap()),
+            ),
+            SessionLifecycleReconciliation::Embedded,
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel_id = channel.to_string();
+        seed_channel(
+            &session,
+            &channel_id,
+            CAP,
+            &operator.to_string(),
+            "operator",
+            &challenge.id,
+            &payer.to_string(),
+            None,
+        )
+        .await;
+        let delegated = DelegatedUse::for_test(&session, &channel_id).await;
+
+        // Dust: settlement cycles and the worker's batching linger pass,
+        // nothing is broadcast.
+        let dust = session.authorize_delegated_usage(&delegated, 99).await;
+        assert_eq!(dust.unwrap().cumulative, 99);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(sent.load(Ordering::SeqCst), 0, "a dust advance was settled");
+
+        // Positive control: reaching the minimum settles.
+        let due = session.authorize_delegated_usage(&delegated, 1).await;
+        assert_eq!(due.unwrap().cumulative, 100);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sent.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a watermark at the minimum is settled");
+    }
+
+    #[test]
+    fn min_settle_delta_counts_only_the_unsettled_amount() {
+        let min = MinSettleDelta::new(std::num::NonZeroU64::new(100).unwrap());
+        assert!(!min.covers(0, 99));
+        assert!(min.covers(0, 100));
+        assert!(!min.covers(500, 599));
+        assert!(min.covers(500, 600));
+        assert!(!min.covers(600, 500));
+        assert!(MinSettleDelta::ANY.covers(0, 1));
+        assert!(!MinSettleDelta::ANY.covers(1, 1));
+        assert_eq!(
+            WatermarkSettlement::every(Duration::ZERO, MinSettleDelta::ANY),
+            WatermarkSettlement::DISABLED
+        );
     }
 
     #[test]

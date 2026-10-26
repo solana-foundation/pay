@@ -537,7 +537,7 @@ impl EndpointBackends {
                     session.start_lifecycle_runloop_with_settlement_and_batching(
                         std::time::Duration::from_millis(spec.close_delay_ms),
                         std::time::Duration::from_millis(spec.close_batch_interval_ms),
-                        std::time::Duration::from_millis(spec.settlement_interval_ms),
+                        pay_core::sell_inference::session_watermark_settlement(&spec),
                         pay_core::server::session::SessionLifecycleReconciliation::Embedded,
                     );
                     session

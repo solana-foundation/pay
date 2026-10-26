@@ -144,6 +144,28 @@ pub struct SellInference {
 /// Default [`SellInference::session_idle_close_secs`]: ten minutes.
 pub const DEFAULT_SESSION_IDLE_CLOSE_SECS: u32 = 600;
 
+/// Least unsettled amount the operator settles on-chain before a channel
+/// closes: $0.01 in a 6-decimal stablecoin. The operator pays every settle
+/// and earns nothing on the channel, so smaller advances wait for the close.
+pub const SESSION_MIN_SETTLE_BASE_UNITS: u64 = 10_000;
+
+/// How the embedded lifecycle pushes a sell session's watermarks on-chain.
+#[cfg(feature = "server")]
+pub fn session_watermark_settlement(
+    spec: &SessionSpec,
+) -> crate::server::session::WatermarkSettlement {
+    use crate::server::session::{MinSettleDelta, WatermarkSettlement};
+    const MIN: std::num::NonZeroU64 = match std::num::NonZeroU64::new(SESSION_MIN_SETTLE_BASE_UNITS)
+    {
+        Some(min) => min,
+        None => panic!("the sell settle minimum is positive"),
+    };
+    WatermarkSettlement::every(
+        std::time::Duration::from_millis(spec.settlement_interval_ms),
+        MinSettleDelta::new(MIN),
+    )
+}
+
 impl SellInference {
     /// `endpoints/<id>`.
     pub fn path_prefix(&self) -> String {
@@ -848,6 +870,29 @@ mod gate_tests {
             values(header::WWW_AUTHENTICATE.as_str()),
             values(pay_kit::x402::PAYMENT_REQUIRED_HEADER),
         )
+    }
+
+    /// A self-paying seller and buyer move dust through a session; the
+    /// operator settles only once a cent has accrued, so settles stay
+    /// bounded by the earn cap instead of by request count.
+    #[test]
+    fn session_watermarks_settle_only_past_a_cent() {
+        let spec = sale(SellPricing::PerRequest { usd: 0.000_001 })
+            .api_spec()
+            .session
+            .unwrap();
+        let settlement = session_watermark_settlement(&spec);
+        assert_eq!(
+            settlement.interval(),
+            Some(std::time::Duration::from_millis(
+                spec.settlement_interval_ms
+            ))
+        );
+        assert_eq!(
+            settlement.min_delta().map(|min| min.get()),
+            Some(SESSION_MIN_SETTLE_BASE_UNITS)
+        );
+        assert_eq!(SESSION_MIN_SETTLE_BASE_UNITS, 10_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]

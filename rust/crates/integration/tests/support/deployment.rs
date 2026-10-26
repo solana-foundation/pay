@@ -20,7 +20,9 @@ use pay_core::{
     PaymentState,
     server::{
         deployment_policy::DeploymentPolicyResolver,
-        session::{DeploymentSessionStore, SessionLifecycleReconciliation, SessionMpp},
+        session::{
+            DeploymentSessionStore, SessionLifecycleReconciliation, SessionMpp, WatermarkSettlement,
+        },
     },
 };
 use pay_kit::mpp::{
@@ -482,7 +484,7 @@ async fn connect_session(
     session.start_lifecycle_runloop_with_settlement_and_batching(
         Duration::from_secs(2),
         Duration::from_secs(1),
-        Duration::ZERO,
+        WatermarkSettlement::DISABLED,
         SessionLifecycleReconciliation::External,
     );
     session

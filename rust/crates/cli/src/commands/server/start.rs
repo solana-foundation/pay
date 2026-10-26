@@ -12,7 +12,9 @@ use futures_util::StreamExt;
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
-use pay_core::server::session::{SessionLifecycleReconciliation, SessionMpp};
+use pay_core::server::session::{
+    MinSettleDelta, SessionLifecycleReconciliation, SessionMpp, WatermarkSettlement,
+};
 use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::mpp::solana_keychain::TransactionSigner;
@@ -2146,7 +2148,12 @@ impl StartCommand {
                     smpp.start_lifecycle_runloop_with_settlement_and_batching(
                         Duration::from_millis(sess.close_delay_ms),
                         Duration::from_millis(sess.close_batch_interval_ms),
-                        Duration::from_millis(sess.settlement_interval_ms),
+                        // The gateway operator sets these prices; every
+                        // advance is worth its settle.
+                        WatermarkSettlement::every(
+                            Duration::from_millis(sess.settlement_interval_ms),
+                            MinSettleDelta::ANY,
+                        ),
                         session_channel_store.reconciliation(),
                     );
                     session_mpps.push(smpp);
