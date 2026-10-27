@@ -89,6 +89,16 @@ Important runtime fields:
   keypair file, or production signer such as GCP KMS.
 - `recipients`: named wallet aliases used by payment splits.
 - `metering.dimensions`: pricing. Omit `metering` for free endpoints.
+- `resource`: a short operation name, usually one per endpoint (for example
+  `search`). Always set it on paid endpoints: per-call schemes (`mpp-charge`,
+  the default, and `x402-exact`) derive a per-challenge payment memo from it.
+  Without it, two same-price calls from one wallet a few seconds apart build
+  the same transaction and the second fails with `This transaction has
+  already been processed` or `Transaction signature already consumed`.
+- `metering.schemes`: omitted means `[mpp-charge]` (fixed price per call).
+  Usage-metered pricing (`tokens`, `quota_units`, or a `meter`) cannot be
+  charged per call: list `[mpp-session, x402-upto]` and set `upto.max_usd`,
+  or the gateway refuses to start.
 - `session`: optional MPP session config for voucher-based repeated calls.
 
 ### Serving `/openapi.json`
@@ -146,6 +156,7 @@ recipients:
 endpoints:
   - method: POST
     path: "v1/report"
+    resource: "report"
     metering:
       dimensions:
         - direction: usage

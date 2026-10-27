@@ -1131,7 +1131,11 @@ pub struct Endpoint {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Resource group (e.g. "models", "tunedModels", "files").
+    /// Operation name, usually one per endpoint (e.g. "generate", "run-query").
+    /// Set it on every paid endpoint: per-call schemes (`mpp-charge`,
+    /// `x402-exact`) derive a per-challenge payment memo from it. Without one,
+    /// repeated same-price payments rely on blockhash uniqueness and can be
+    /// rejected as duplicates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
     /// Per-endpoint routing override. If set, takes precedence over the
@@ -1350,6 +1354,8 @@ pub struct Metering {
     pub splits: Vec<SplitRule>,
     /// Per-call schemes this endpoint accepts. `None` defaults to charge-only
     /// (`[mpp-charge]`); session and the x402 schemes must be listed explicitly.
+    /// Usage-metered dimensions (tokens, quota units, a `meter`) can't be
+    /// charged per call: list `[mpp-session, x402-upto]` and set `upto.max_usd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schemes: Option<Vec<Scheme>>,
     /// Minimum settled amount (USD) for usage-metered `x402-upto`. The tier

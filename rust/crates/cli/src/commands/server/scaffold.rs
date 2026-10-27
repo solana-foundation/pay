@@ -14,8 +14,11 @@ title: "My API"
 description: "API description"
 category: ai_ml
 version: v1
-forward_url: https://api.example.com
 accounting: pooled
+
+routing:
+  type: proxy
+  url: https://api.example.com/
 
 endpoints:
   # Free endpoint — no payment required
@@ -26,6 +29,8 @@ endpoints:
   # Metered endpoint — requires payment
   - method: POST
     path: "v1/generate"
+    # Names the operation; seeds each payment's memo so repeat calls never collide.
+    resource: "generate"
     description: "Generate content"
     metering:
       dimensions:
@@ -56,5 +61,29 @@ impl ScaffoldCommand {
         eprintln!();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TEMPLATE;
+
+    #[test]
+    fn template_boots_and_names_every_paid_endpoint() {
+        let mut api = pay_core::server::profiles::load_yaml(TEMPLATE).expect("template parses");
+        api.apply_scheme_defaults();
+        assert_eq!(
+            pay_types::metering::validate_api_spec(&api),
+            Vec::<String>::new()
+        );
+        // A paid endpoint without `resource` gets no per-challenge memo, so
+        // back-to-back same-price payments can collide as duplicates.
+        for endpoint in api.endpoints.iter().filter(|e| e.metering.is_some()) {
+            assert!(
+                endpoint.resource.is_some(),
+                "{} needs a resource",
+                endpoint.path
+            );
+        }
     }
 }
