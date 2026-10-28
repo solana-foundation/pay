@@ -1,3 +1,5 @@
+import { fileURLToPath } from 'node:url';
+
 import type { GetSignaturesForAddressApi, GetTransactionApi, Rpc, RpcSubscriptions } from '@solana/kit';
 import { createClient, generateKeyPairSigner, lamports, TransactionSigner } from '@solana/kit';
 import { litesvm } from '@solana/kit-plugin-litesvm';
@@ -11,7 +13,9 @@ import {
 } from '@solana-program/token';
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { encodeURL, parseURL, solanaPayMerchant, solanaPayWallet } from '../src/index.js';
+import { encodeURL, MEMO_PROGRAM_ADDRESS, parseURL, solanaPayMerchant, solanaPayWallet } from '../src/index.js';
+
+const MEMO_V4_PROGRAM_PATH = fileURLToPath(new URL('./fixtures/memo_v4.so', import.meta.url));
 
 /**
  *
@@ -52,6 +56,7 @@ async function createTestClient() {
         .use(solanaPayMerchant())
         .use(solanaPayWallet())
         .use(tokenProgram());
+    client.svm.addProgramFromFile(MEMO_PROGRAM_ADDRESS, MEMO_V4_PROGRAM_PATH);
     return client;
 }
 

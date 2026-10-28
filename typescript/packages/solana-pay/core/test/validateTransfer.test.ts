@@ -40,9 +40,12 @@ const TX = {
     /** SOL transfer + reference key. Accounts: [sender, recipient, system, reference] */
     SOL_TRANSFER_WITH_REF:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIE253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuPG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaGfnzwpgxJvAvNES3A/u4ApvkfeqH7Qky9uxLnjnlDIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAECAwABAwwCAAAAAMqaOwAAAAA=',
-    /** Memo("test") + SOL transfer. Accounts: [sender, recipient, system, memoProg] */
+    /** Memo v3("test") + SOL transfer. Accounts: [sender, recipient, system, memoV3Prog] */
     SOL_TRANSFER_WITH_MEMO:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIE253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuPG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDAQAEdGVzdAICAAEMAgAAAADKmjsAAAAA',
+    /** Memo v4("test") + SOL transfer. Accounts: [sender, recipient, system, memoV4Prog] */
+    SOL_TRANSFER_WITH_MEMO_V4:
+        'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIE253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuPG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABUpTUihUzdEDzC5GMaP1F5Kscnzx5Qq8l4KKxZlPPMIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDAQAEdGVzdAICAAEMAgAAAADKmjsAAAAA',
     /** Memo program as transfer ix (wrong program). Accounts: [sender, recipient, memoProg] */
     WRONG_PROGRAM:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAED253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuPG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQVKU1qZKSEGTSTocWDaOHx8NbXdvJK7geQfqEBBBUSNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAgIAAQwCAAAAAMqaOwAAAAA=',
@@ -407,7 +410,7 @@ describe('validateTransfer', () => {
     });
 
     describe('memo validation', () => {
-        it('should validate valid memo', async () => {
+        it('should validate valid memo from the legacy v3 memo program', async () => {
             const response = {
                 meta: {
                     err: null,
@@ -415,6 +418,24 @@ describe('validateTransfer', () => {
                     postBalances: [9_000_000_000n, 1_000_000_000n, 1n, 1n],
                 },
                 transaction: [TX.SOL_TRANSFER_WITH_MEMO, 'base64'],
+            };
+            const rpc = createMockRpc(response);
+            const result = await validateTransfer(rpc, SIGNATURE, {
+                recipient: ADDRESSES.recipient,
+                amount: 1,
+                memo: 'test',
+            });
+            expect(result).toBe(response);
+        });
+
+        it('should validate valid memo from the v4 memo program', async () => {
+            const response = {
+                meta: {
+                    err: null,
+                    preBalances: [10_000_000_000n, 0n, 1n, 1n],
+                    postBalances: [9_000_000_000n, 1_000_000_000n, 1n, 1n],
+                },
+                transaction: [TX.SOL_TRANSFER_WITH_MEMO_V4, 'base64'],
             };
             const rpc = createMockRpc(response);
             const result = await validateTransfer(rpc, SIGNATURE, {

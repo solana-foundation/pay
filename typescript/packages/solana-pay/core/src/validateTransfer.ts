@@ -18,7 +18,7 @@ import {
     getInstructionsFromCompiledTransactionMessage,
     MAX_SUPPORTED_TRANSACTION_VERSION,
 } from '@solana/kit';
-import { parseAddMemoInstruction } from '@solana-program/memo';
+import { parseAddMemoInstruction, SUPPORTED_MEMO_PROGRAM_ADDRESSES } from '@solana-program/memo';
 import {
     identifySystemInstruction,
     parseTransferSolInstruction,
@@ -34,7 +34,7 @@ import {
     TokenInstruction,
 } from '@solana-program/token';
 
-import { MEMO_PROGRAM_ADDRESS, SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
+import { SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
 import type { Finality, Reference, TransferFields } from './types.js';
 import { amountToBaseUnits } from './utils/amount.js';
 import { normalizeReferences } from './utils/reference.js';
@@ -170,7 +170,7 @@ export async function validateTransfer(
 
 function validateMemo(instruction: Instruction | undefined, memo: string): void {
     if (!instruction) throw new ValidateTransferError('missing memo instruction');
-    if (instruction.programAddress !== MEMO_PROGRAM_ADDRESS) {
+    if (!(SUPPORTED_MEMO_PROGRAM_ADDRESSES as readonly Address[]).includes(instruction.programAddress)) {
         throw new ValidateTransferError('invalid memo program');
     }
     if (!instruction.data) throw new ValidateTransferError('invalid memo');
