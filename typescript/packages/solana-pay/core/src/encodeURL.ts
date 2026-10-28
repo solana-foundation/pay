@@ -74,7 +74,11 @@ function encodeTransferRequestURL({
     const url = new URL(SOLANA_PROTOCOL + pathname);
 
     if (amount != null) {
-        url.searchParams.append('amount', amount.toFixed(10).replace(/0+$/, '').replace(/\.$/, ''));
+        // Cap at SOL's 9 fractional digits only for native SOL. An SPL mint may
+        // support more; toFixed(9) would round a one-base-unit amount to 0.
+        // 15 matches what a JS number can actually represent, and rounds float noise.
+        const rendered = amount.toFixed(splToken ? 15 : 9);
+        url.searchParams.append('amount', rendered.replace(/0+$/, '').replace(/\.$/, ''));
     }
 
     if (splToken) {

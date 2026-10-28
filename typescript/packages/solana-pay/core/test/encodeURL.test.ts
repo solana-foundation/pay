@@ -32,6 +32,25 @@ describe('encodeURL', () => {
             expect(String(url)).toBe(`solana:${recipient}`);
         });
 
+        it('encodes at most nine fractional digits for native SOL', () => {
+            const recipient = 'mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN';
+            const amount = 1.1234567894;
+
+            const url = encodeURL({ recipient, amount });
+
+            expect(String(url)).toBe(`solana:${recipient}?amount=1.123456789`);
+        });
+
+        it('preserves more than nine fractional digits for an SPL token', () => {
+            const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
+            const amount = 0.0000000001;
+            const splToken = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+
+            const url = encodeURL({ recipient, amount, splToken });
+
+            expect(String(url)).toBe(`solana:${recipient}?amount=0.0000000001&spl-token=${splToken}`);
+        });
+
         it('encodes a url with recipient and amount', () => {
             const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
             const amount = 1;
