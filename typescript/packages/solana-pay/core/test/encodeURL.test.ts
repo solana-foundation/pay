@@ -32,6 +32,17 @@ describe('encodeURL', () => {
             expect(String(url)).toBe(`solana:${recipient}`);
         });
 
+        it('encodes a memo of 566 UTF-8 bytes and rejects 567', () => {
+            const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
+            const ok = 'a'.repeat(564) + 'é';
+            const tooLong = 'a'.repeat(567);
+
+            expect(String(encodeURL({ recipient, memo: ok }))).toContain(`memo=${encodeURIComponent(ok)}`);
+            expect(() => encodeURL({ recipient, memo: tooLong })).toThrow('memo invalid');
+            // 566 UTF-16 code units, 567 UTF-8 bytes — must not pass a character-count check
+            expect(() => encodeURL({ recipient, memo: 'a'.repeat(565) + 'é' })).toThrow('memo invalid');
+        });
+
         it('encodes a url with recipient and amount', () => {
             const recipient = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');
             const amount = 1;

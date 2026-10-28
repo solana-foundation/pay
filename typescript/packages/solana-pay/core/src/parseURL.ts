@@ -116,6 +116,9 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     const label = searchParams.get('label') || undefined;
     const message = searchParams.get('message') || undefined;
     const memo = searchParams.get('memo') || undefined;
+    if (memo != null && new TextEncoder().encode(memo).length > 566) {
+        throw new ParseURLError('memo invalid');
+    }
 
     return {
         recipient,
