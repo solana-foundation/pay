@@ -22,7 +22,9 @@ for network fees because server-side fee payers handle fees and setup costs.
 - Paid API calls spend supported stablecoins. Do not ask users to top up SOL for
   these calls; server-side fee payers handle network fees and setup costs.
 - Do not raise spending limits, top up funds, bridge funds, or change wallet
-  settings unless the user explicitly asks for that specific operation.
+  settings unless the user explicitly asks for that specific operation. The
+  exception is proposing a top-up the user approves on their Ledger hardware
+  wallet (`references/top-up.md`): it moves nothing until they approve it.
 - Use sandbox mode for tests; it uses an ephemeral devnet wallet instead of real
   funds.
 

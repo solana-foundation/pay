@@ -79,6 +79,9 @@ provider choice.
   agents can request paid API calls, but keys stay in secure local storage,
   every single payments require autenticate local user approval with Touch ID, 
   providers are curated, and external responses are treated as untrusted data.
+- Read `references/top-up.md` when the balance is too low for a planned paid
+  call, or the user asks for a secure top-up, more agent autonomy, whether Pay
+  spending is safe, or mentions a Ledger or hardware wallet.
 - Read `references/monetize-api.md` when a developer wants to monetize an API
   with Pay, write a `pay gate api` paywall YAML file, create a pay-skills provider
   listing, deploy it as a production cloud gateway, validate/probe it, test

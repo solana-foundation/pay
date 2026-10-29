@@ -74,6 +74,9 @@ resolving ties, or estimating cost.
   never invent a replacement URL.
 - When the balance is too low, explain the shortfall and offer `topup` instead
   of retrying.
+- Read `references/top-up.md` when the balance is too low for a planned paid
+  call, or the user asks for a secure top-up, more agent autonomy, whether Pay
+  spending is safe, or mentions a Ledger or hardware wallet.
 - Do not create or fund accounts without the user's consent.
 
 ## Security
