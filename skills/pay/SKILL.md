@@ -82,6 +82,7 @@ provider choice.
 - Read `references/top-up.md` when the balance is too low for a planned paid
   call, or the user asks to fund Pay securely or from a Ledger or hardware
   wallet, how to pay with fewer confirmations, or whether Pay spending is safe.
+  A top-up the user approves on their Ledger counts as their consent.
 - Read `references/monetize-api.md` when a developer wants to monetize an API
   with Pay, write a `pay gate api` paywall YAML file, create a pay-skills provider
   listing, deploy it as a production cloud gateway, validate/probe it, test

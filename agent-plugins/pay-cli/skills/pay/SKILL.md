@@ -77,6 +77,7 @@ resolving ties, or estimating cost.
 - Read `references/top-up.md` when the balance is too low for a planned paid
   call, or the user asks to fund Pay securely or from a Ledger or hardware
   wallet, how to pay with fewer confirmations, or whether Pay spending is safe.
+  A top-up the user approves on their Ledger counts as their consent.
 - Do not create or fund accounts without the user's consent.
 
 ## Security
