@@ -17,7 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 solana-transaction = { workspace = true, features = ["serde", "wincode"] }
 # Canonical wire codec for every Solana message version (bincode cannot decode V1).
-wincode = "0.5"
+wincode = "0.6"
 tokio = { workspace = true }
 
 [dev-dependencies]
