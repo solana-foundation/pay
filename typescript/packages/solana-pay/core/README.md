@@ -18,16 +18,16 @@ npm install @solana/pay @solana/kit
 
 | Package | Version |
 |---------|---------|
-| `@solana/kit` | `^8.1.0` |
+| `@solana/kit` | `^8.6.0` |
 
 ### Optional dependencies (for `createTransfer` / `validateTransfer`)
 
 | Package | Version |
 |---------|---------|
-| `@solana-program/system` | `^0.14.0` |
-| `@solana-program/token` | `^0.16.0` |
-| `@solana-program/token-2022` | `^0.16.0` |
-| `@solana-program/memo` | `^0.13.0` |
+| `@solana-program/system` | `^0.16.0` |
+| `@solana-program/token` | `^0.18.0` |
+| `@solana-program/token-2022` | `^0.20.0` |
+| `@solana-program/memo` | `^0.16.0` |
 
 ## Quick Start
 
