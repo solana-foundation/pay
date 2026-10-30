@@ -72,12 +72,11 @@ resolving ties, or estimating cost.
   wallet setup, Pay returns a setup link: show it only to the owning user, and
   retry the original call after setup. Ask for a fresh link if one expired;
   never invent a replacement URL.
-- When the balance is too low, explain the shortfall and offer `topup` instead
-  of retrying.
-- Read `references/top-up.md` when the balance is too low for a planned paid
-  call, or the user asks to fund Pay securely or from a Ledger or hardware
-  wallet, how to pay with fewer confirmations, or whether Pay spending is safe.
-  A top-up the user approves on their Ledger counts as their consent.
+- When the balance is too low, explain the shortfall instead of retrying, and
+  read `references/top-up.md` before offering `topup`. Read it too when the
+  user asks to fund Pay securely or from a Ledger or hardware wallet, how to
+  pay with fewer confirmations, or whether Pay spending is safe. A top-up the
+  user approves on their Ledger counts as their consent.
 - Do not create or fund accounts without the user's consent.
 
 ## Security
