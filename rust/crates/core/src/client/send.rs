@@ -7,7 +7,7 @@ use pay_types::Stablecoin;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
-use crate::accounts::{AccountChoice, AccountsFile, resolve_account_for_network};
+use crate::accounts::{AccountChoice, AccountsFile, AccountsStore, resolve_account_for_network};
 use crate::client::{balance, fetch, mpp};
 use crate::{Error, Result};
 
@@ -80,6 +80,9 @@ pub struct StablecoinSendRequest<'a> {
     /// it as a Token-2022 confidential transfer bundle.
     pub confidential: bool,
     pub rpc_url: Option<&'a str>,
+    /// Accounts store the payer is resolved and signed from. Foreground
+    /// callers pass one that waits for a hardware wallet to be connected.
+    pub store: &'a dyn AccountsStore,
 }
 
 #[derive(Serialize)]
@@ -144,6 +147,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         fee_within,
         confidential,
         rpc_url,
+        store,
     } = request;
 
     let normalized_currency = currency.symbol.as_str();
@@ -219,9 +223,8 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         ));
     }
 
-    let store = crate::accounts::FileAccountsStore::default_path();
     let challenge =
-        mpp::select_challenge_by_balance(&challenges, &store, Some(network), account_override)?
+        mpp::select_challenge_by_balance(&challenges, store, Some(network), account_override)?
             .ok_or_else(|| Error::InvalidChallenge("No usable MPP send challenge".to_string()))?;
     let request_for_result: pay_kit::mpp::ChargeRequest = challenge
         .request
@@ -230,7 +233,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
 
     let (auth_header, _) = mpp::build_credential(
         challenge,
-        &store,
+        store,
         Some(network),
         account_override,
         Some(&api_url),

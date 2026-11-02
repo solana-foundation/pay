@@ -9,8 +9,8 @@ use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use futures_util::{StreamExt, TryStreamExt};
 use pay_core::accounts::{
-    Account, AccountChoice, AccountsFile, AccountsStore, BackendKind, FileAccountsStore,
-    MemoryAccountsStore, resolve_account_for_network,
+    Account, AccountChoice, AccountsFile, AccountsStore, BackendKind, MemoryAccountsStore,
+    resolve_account_for_network,
 };
 use pay_core::client::push::executor::{
     ChunkTxContext, DirectSolanaBroadcaster, PushExecutor, PushExecutorConfig,
@@ -1005,7 +1005,7 @@ fn resolve_signing_account(
         ));
     }
 
-    let store = FileAccountsStore::default_path();
+    let store = super::interactive_accounts_store();
     let file = store.load()?;
     let (account_name, account) = if let Some(name) = account_override {
         let account = file

@@ -5271,6 +5271,7 @@ dependencies = [
  "hmac 0.12.1",
  "http 1.5.0",
  "http-body",
+ "indicatif 0.17.11",
  "libc",
  "md-5",
  "mime_guess",
