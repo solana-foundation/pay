@@ -1277,7 +1277,22 @@ fn do_paid_fetch(
         initial_headers.push(("Authorization".to_string(), authorization.clone()));
     }
 
-    let outcome = fetch_request(&initial_headers)?;
+    let controlled = authority.and_then(|attempt| attempt.controller());
+    let (outcome, payment_required) = if controlled.is_some() {
+        let raw = pay_core::client::fetch::fetch_raw_with_body_for_policy(
+            pay_core::ClientApp::Mcp,
+            method,
+            url,
+            &initial_headers,
+            body,
+            redirect_policy,
+            scope.outbound_policy,
+        )?;
+        let envelope = crate::controlled::source_envelope(&raw.headers, Some(&raw.body_text()));
+        (pay_core::client::fetch::raw_to_outcome(raw), envelope)
+    } else {
+        (fetch_request(&initial_headers)?, None)
+    };
     if scope.outbound_policy == pay_core::client::fetch::OutboundPolicy::PublicInternetOnly {
         reject_cross_origin_challenge(url, &outcome)?;
     }
@@ -1420,7 +1435,17 @@ fn do_paid_fetch(
                     &challenge,
                     network_override.as_deref(),
                 );
-                authority.authorize(&challenge, &network)?;
+                let facts = authority.authorize(&challenge, &network)?;
+                if let Some(controller) = controlled {
+                    // Terminal branch: no Pay account load, signer or paid retry,
+                    // including after a controller error or a lost reply.
+                    return interpret_retry(crate::controlled::run(
+                        controller,
+                        facts,
+                        payment_required,
+                        &challenge,
+                    )?);
+                }
                 let selected = prepare_hardware_account(
                     store,
                     &network,
@@ -1435,14 +1460,21 @@ fn do_paid_fetch(
                 account_override = selected;
             }
             let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                pay_core::client::x402::build_payment_for_attempt(
+                pay_core::client::x402::build_payment_for_attempt_with_rpc(
                     &challenge,
                     store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
                     auth,
-                    Some(&attempt),
+                    pay_core::client::x402::ExactPaymentExecution {
+                        attempt: Some(&attempt),
+                        rpc: scope.rpc_url_override.as_ref().map(|url| {
+                            pay_kit::x402::solana_rpc_client::rpc_client::RpcClient::new(
+                                url.clone(),
+                            )
+                        }),
+                    },
                 )
             })?;
 

@@ -239,6 +239,38 @@ pub fn build_payment_for_attempt(
     auth_override: crate::signer::AuthOverride,
     attempt: Option<&crate::client::attempt::PaymentAttempt>,
 ) -> Result<BuiltPayment> {
+    build_payment_for_attempt_with_rpc(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        ExactPaymentExecution { attempt, rpc: None },
+    )
+}
+
+/// Execution-scoped state for an exact payment. Supplying an RPC client keeps
+/// challenge blockhash validation on the host-configured endpoint.
+pub struct ExactPaymentExecution<'a> {
+    pub attempt: Option<&'a crate::client::attempt::PaymentAttempt>,
+    pub rpc: Option<RpcClient>,
+}
+
+/// Like [`build_payment_for_attempt`], with an explicit host RPC client.
+pub fn build_payment_for_attempt_with_rpc(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    execution: ExactPaymentExecution<'_>,
+) -> Result<BuiltPayment> {
+    let ExactPaymentExecution {
+        attempt,
+        rpc: rpc_override,
+    } = execution;
     let requirements = &challenge.requirements;
     let cluster_raw = normalize_network(
         requirements
@@ -286,7 +318,7 @@ pub fn build_payment_for_attempt(
             default_rpc_url(&network).to_string()
         }
     });
-    let rpc = RpcClient::new(rpc_url.clone());
+    let rpc = rpc_override.unwrap_or_else(|| RpcClient::new(rpc_url.clone()));
 
     // Value the payment at the decimals it is signed at, before approval.
     let amount = crate::client::prompt::payment_display_amount(

@@ -175,3 +175,11 @@ results, and reconcile the same transaction after crash/lost ACK. It must also
 supply durable ownership/fencing and authoritative outcomes. It should reuse the
 SDK and may build on a separate pay-kit unsigned-prepare proposal; this PR has no
 such dependency and does not change pay-kit's pin or API.
+
+## Optional controlled execution
+
+The policy-only limitations above apply to #514. Hosts can separately opt into
+#530's `AuthorityBinding::with_controlled_execution`; see
+[`mcp-controlled-execution.md`](mcp-controlled-execution.md). This mode uses the
+unsigned pay-kit preparation dependency, delegates buyer signing and paid HTTP
+to the host, and leaves durable accounting and recovery with that host.

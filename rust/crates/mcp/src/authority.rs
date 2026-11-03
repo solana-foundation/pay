@@ -22,7 +22,7 @@ pub struct ImmutableRequest {
 }
 
 /// Facts obtained from the real SDK-decoded x402 exact offer.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SpendRequest {
     pub operation_id: String,
     /// Unique to this execution attempt, even across MCP process restarts.
@@ -73,6 +73,7 @@ pub struct AuthorityBinding {
     pub(crate) caller_id: String,
     authority: Arc<dyn SpendingAuthority>,
     timeout: Duration,
+    controlled: Option<Arc<dyn crate::controlled::ControlledExecution>>,
 }
 
 impl AuthorityBinding {
@@ -81,7 +82,18 @@ impl AuthorityBinding {
             caller_id: caller_id.into(),
             authority,
             timeout: Duration::from_secs(5),
+            controlled: None,
         }
+    }
+
+    /// Opt in to host custody after authorization. Pay prepares only unsigned
+    /// bytes; the controller owns signing, final HTTP and original-result recovery.
+    pub fn with_controlled_execution(
+        mut self,
+        controller: Arc<dyn crate::controlled::ControlledExecution>,
+    ) -> Self {
+        self.controlled = Some(controller);
+        self
     }
 
     /// Invalid (zero or >60s) deadlines fail closed when the call starts.
@@ -217,6 +229,9 @@ impl Operations {
 }
 
 impl AuthorityAttempt {
+    pub(crate) fn controller(&self) -> Option<&dyn crate::controlled::ControlledExecution> {
+        self.binding.controlled.as_deref()
+    }
     fn mark_retryable(&self) -> Result<(), pay_core::Error> {
         let mut operations = self
             .operations
@@ -238,7 +253,7 @@ impl AuthorityAttempt {
         &self,
         challenge: &pay_core::client::x402::Challenge,
         execution_network: &str,
-    ) -> Result<(), pay_core::Error> {
+    ) -> Result<SpendRequest, pay_core::Error> {
         let accepted = challenge.requirements.to_accepted_value();
         // Keep this first seam narrow. Other schemes/authentication flows must not
         // fall through to a free signer, including those advertised beside exact.
@@ -285,12 +300,12 @@ impl AuthorityAttempt {
         let decision = runtime.block_on(async {
             tokio::time::timeout(
                 self.binding.timeout,
-                self.binding.authority.authorize(facts),
+                self.binding.authority.authorize(facts.clone()),
             )
             .await
         });
         match decision {
-            Ok(Ok(AuthorityDecision::Allow)) => Ok(()),
+            Ok(Ok(AuthorityDecision::Allow)) => Ok(facts),
             Ok(Ok(AuthorityDecision::Deny)) => Err(rejected("DENIED")),
             Ok(Ok(AuthorityDecision::RejectBeforeExecution)) => {
                 self.mark_retryable()?;
@@ -394,7 +409,7 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 let result = attempt.authorize(&fixture_challenge(), "mainnet");
                 // Sent only after authorize has processed the verdict/transition.
-                done_tx.send(result).unwrap();
+                assert!(done_tx.send(result).is_ok());
             })
             .await
             .unwrap();
@@ -422,7 +437,7 @@ mod tests {
         } else {
             "UNAVAILABLE"
         };
-        assert!(result.unwrap_err().to_string().contains(code));
+        assert!(result.err().unwrap().to_string().contains(code));
         if retryable {
             let next = start().unwrap();
             assert_ne!(original_id, next.attempt_id);

@@ -645,6 +645,30 @@ pub fn fetch_request_with_body_for_policy(
     redirect_policy: RedirectPolicy,
     outbound_policy: OutboundPolicy,
 ) -> Result<RunOutcome> {
+    let raw = fetch_raw_with_body_for_policy(
+        client_app,
+        method,
+        url,
+        extra_headers,
+        body,
+        redirect_policy,
+        outbound_policy,
+    )?;
+    Ok(raw_to_outcome(raw))
+}
+
+/// Preserve response headers and body for hosts that must bind the original
+/// challenge. Applies the same outbound and no-redirect policy as the classified
+/// fetch API. This layer does not create payment credentials.
+pub fn fetch_raw_with_body_for_policy(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
+    outbound_policy: OutboundPolicy,
+) -> Result<RawResponse> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
     let raw = fetch_raw_with_method(
@@ -679,7 +703,7 @@ pub fn fetch_request_with_body_for_policy(
             raw.status
         )));
     }
-    Ok(raw_to_outcome(raw))
+    Ok(raw)
 }
 
 /// Fetch a URL, detecting 402 + MPP challenges.
@@ -750,7 +774,8 @@ pub fn fetch_raw_with_body_for(
     )
 }
 
-fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
+/// Classify a captured response without fetching it again.
+pub fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
     if raw.status == 402 {
         // 402 challenge bodies are always JSON-as-text per spec; the
         // text view is correct here.
