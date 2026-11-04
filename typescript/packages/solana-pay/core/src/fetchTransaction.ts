@@ -5,14 +5,17 @@ import type {
     CompiledTransactionMessage,
     CompiledTransactionMessageWithLifetime,
     GetLatestBlockhashApi,
+    GetMultipleAccountsApi,
     ReadonlyUint8Array,
     Rpc,
     Transaction,
 } from '@solana/kit';
 import {
     address,
+    assertIsAddress,
     compileTransaction,
     decompileTransactionMessage,
+    decompileTransactionMessageFetchingLookupTables,
     getAddressEncoder,
     getBase64Encoder,
     getCompiledTransactionMessageDecoder,
@@ -36,15 +39,16 @@ export type FetchedTransaction = Transaction;
 /**
  * Fetch a transaction from a Solana Pay transaction request link.
  *
- * @param rpc - An RPC client supporting `getLatestBlockhash`.
+ * @param rpc - An RPC client supporting `getLatestBlockhash`, and `getMultipleAccounts`
+ * for unsigned v0 transactions that use address lookup tables.
  * @param account - Address of the account that may sign the transaction.
  * @param link - `link` in the [Solana Pay spec](https://github.com/solana-foundation/pay/blob/main/typescript/packages/solana-pay/spec/SPEC.md#link).
- * @param options - Options for `getLatestBlockhash`.
+ * @param options - Commitment for the blockhash and address lookup table requests.
  *
  * @throws {FetchTransactionError}
  */
 export async function fetchTransaction(
-    rpc: Rpc<GetLatestBlockhashApi>,
+    rpc: Partial<Rpc<GetMultipleAccountsApi>> & Rpc<GetLatestBlockhashApi>,
     account: Address,
     link: URL | string,
     { commitment }: { commitment?: Commitment } = {},
@@ -151,9 +155,35 @@ export async function fetchTransaction(
     } else {
         // Ignore the fee payer and recent blockhash in the transaction and initialize them.
         const { value } = await rpc.getLatestBlockhash({ commitment }).send();
-        const msg = decompileTransactionMessage(compiledMessage);
-        const withFeePayer = setTransactionMessageFeePayer(account, msg);
-        const withLifetime = setTransactionMessageLifetimeUsingBlockhash(value, withFeePayer);
-        return compileTransaction(withLifetime);
+        try {
+            const hasLookups = compiledMessage.version === 0 && (compiledMessage.addressTableLookups?.length ?? 0) > 0;
+            if (hasLookups && typeof rpc.getMultipleAccounts !== 'function') {
+                throw new Error('RPC client must support getMultipleAccounts to resolve address lookup tables');
+            }
+            const msg = hasLookups
+                ? await decompileTransactionMessageFetchingLookupTables(
+                      compiledMessage,
+                      rpc as Rpc<GetMultipleAccountsApi>,
+                      { commitment },
+                  )
+                : decompileTransactionMessage(compiledMessage);
+            if (hasLookups) {
+                // Parsed RPC account data is not runtime-validated by the lookup helper.
+                // Reject invalid addresses before recompilation can merge account entries.
+                for (const instruction of msg.instructions) {
+                    assertIsAddress(instruction.programAddress);
+                    for (const meta of instruction.accounts ?? []) {
+                        assertIsAddress(meta.address);
+                    }
+                }
+            }
+            const withFeePayer = setTransactionMessageFeePayer(account, msg);
+            const withLifetime = setTransactionMessageLifetimeUsingBlockhash(value, withFeePayer);
+            return compileTransaction(withLifetime);
+        } catch (error) {
+            throw new FetchTransactionError(
+                `failed to prepare unsigned transaction: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
     }
 }
