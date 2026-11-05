@@ -7,7 +7,8 @@ use pay_types::Stablecoin;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
-use crate::accounts::{AccountChoice, AccountsFile, AccountsStore, resolve_account_for_network};
+use crate::accounts::AccountsStore;
+use crate::client::mpp::account_pubkey_for_network;
 use crate::client::{balance, fetch, mpp};
 use crate::{Error, Result};
 
@@ -165,11 +166,12 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
 
     let amount_for_api;
     let amount = if sends_entire_balance(amount_str) {
-        let sender = account_pubkey_for_network(network, account_override)?.ok_or_else(|| {
-            Error::Config(format!(
-                "No {network} account found. Run `pay setup` first."
-            ))
-        })?;
+        let sender =
+            account_pubkey_for_network(store, network, account_override)?.ok_or_else(|| {
+                Error::Config(format!(
+                    "No {network} account found. Run `pay setup` first."
+                ))
+            })?;
         let raw_balance = stablecoin_raw_balance_for_sender(&rpc_url, &sender, &currency)?;
         if raw_balance == 0 {
             return Err(Error::Config(format!(
@@ -206,7 +208,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
             decimals: STABLECOIN_DECIMALS,
             currency: normalized_currency.to_string(),
             mint: currency.mint.clone(),
-            from: account_pubkey_for_network(network, account_override)?
+            from: account_pubkey_for_network(store, network, account_override)?
                 .unwrap_or_else(|| String::from("(unknown)")),
             to: recipient.to_string(),
             network: network.to_string(),
@@ -246,7 +248,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
     let retry = fetch::fetch_raw("POST", &api_url, &retry_headers, Some(&body))?;
     let receipt = parse_send_receipt_or_error(retry.status, &retry.body_text())?;
 
-    let sender = account_pubkey_for_network(network, account_override)?
+    let sender = account_pubkey_for_network(store, network, account_override)?
         .unwrap_or_else(|| String::from("(unknown)"));
     let amount_raw = challenge_response
         .as_ref()
@@ -322,23 +324,6 @@ fn api_network_for_send(network: &str) -> &'static str {
     match network {
         "localnet" | "sandbox" | "devnet" => "sandbox",
         _ => "mainnet",
-    }
-}
-
-fn account_pubkey_for_network(
-    network: &str,
-    account_override: Option<&str>,
-) -> Result<Option<String>> {
-    let file = AccountsFile::load()?;
-    if let Some(name) = account_override {
-        return Ok(file
-            .named_account_for_network(network, name)
-            .and_then(|account| account.pubkey.clone()));
-    }
-
-    match resolve_account_for_network(network, &file) {
-        AccountChoice::Resolved { account, .. } => Ok(account.pubkey),
-        AccountChoice::Missing => Ok(None),
     }
 }
 
@@ -522,6 +507,55 @@ mod tests {
         assert!(effective_fee_within("*", false));
         assert!(effective_fee_within("1", true));
         assert!(!effective_fee_within("1", false));
+    }
+
+    /// The `max` balance lookup and the reported sender must come from the
+    /// store the payment is signed from, not the default `accounts.yml`.
+    #[test]
+    fn sender_is_resolved_from_the_supplied_store() {
+        use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
+        use std::collections::BTreeMap;
+
+        fn account(pubkey: &str, active: bool) -> Account {
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active,
+                auth_required: Some(false),
+                pubkey: Some(pubkey.to_string()),
+                vault: None,
+                path: None,
+                account: None,
+                secret_key_b58: Some("test-secret".to_string()),
+                created_at: None,
+                subscriptions: BTreeMap::new(),
+            }
+        }
+
+        let mut file = AccountsFile::default();
+        file.upsert("sandbox", "default", account("DefaultPk", true));
+        file.upsert("sandbox", "custom", account("CustomPk", false));
+        let store = MemoryAccountsStore::with_file(file);
+
+        assert_eq!(
+            account_pubkey_for_network(&store, "sandbox", None).unwrap(),
+            Some("DefaultPk".to_string())
+        );
+        assert_eq!(
+            account_pubkey_for_network(&store, "sandbox", Some("custom")).unwrap(),
+            Some("CustomPk".to_string())
+        );
+        assert_eq!(
+            account_pubkey_for_network(&store, "sandbox", Some("missing")).unwrap(),
+            None
+        );
+        // A store with no account for the network yields None rather than
+        // falling back to whatever the default file on disk holds.
+        let empty = MemoryAccountsStore::new();
+        assert_eq!(
+            account_pubkey_for_network(&empty, "sandbox", None).unwrap(),
+            None
+        );
     }
 
     #[test]

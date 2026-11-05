@@ -720,7 +720,14 @@ fn has_sufficient_balance(
         .any(|token| token.mint == candidate.mint && token.raw_amount >= candidate.amount)
 }
 
-fn account_pubkey_for_network(
+/// Public key of the account a payment on `network` is signed from, read
+/// from `store`: the named account when `account_override` is set, otherwise
+/// the network's active account. `None` when the store has no such account.
+///
+/// Every caller that resolves a payer must go through `store` so the balance
+/// it checks, the key it signs with and the sender it reports agree even when
+/// the store is not the default `accounts.yml`.
+pub(crate) fn account_pubkey_for_network(
     store: &dyn AccountsStore,
     network: &str,
     account_override: Option<&str>,
