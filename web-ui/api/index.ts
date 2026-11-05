@@ -1,12 +1,8 @@
 import { randomBytes } from "node:crypto";
 import express from "express";
 import cors from "cors";
-import {
-  generateKeyPairSigner,
-  createKeyPairSignerFromBytes,
-  getBase58Codec,
-} from "@solana/kit";
-import { Mppx, solana } from "@solana/mpp/server";
+import type { Address } from "@solana/kit";
+import { createPayKit, Signer, usd } from "@solana/pay-kit";
 import { paymentMiddleware } from "x402-express";
 import { FlowCorrelation, type LogEntry } from "./correlation.js";
 import type { SSEMessage } from "./types.js";
@@ -94,18 +90,33 @@ async function createApp() {
   if (cachedApp) return cachedApp;
 
   // ── Keypair setup ──
-  let feePayerSigner;
-  if (process.env.FEE_PAYER_KEY) {
-    const bytes = getBase58Codec().encode(process.env.FEE_PAYER_KEY);
-    feePayerSigner = await createKeyPairSignerFromBytes(bytes);
-  } else {
-    feePayerSigner = await generateKeyPairSigner();
-  }
+  // The fee payer co-signs MPP charges so the customer pays no network fee.
+  const feePayerSigner = process.env.FEE_PAYER_KEY
+    ? await Signer.base58(process.env.FEE_PAYER_KEY)
+    : await Signer.generate();
 
-  const recipient = process.env.RECIPIENT || feePayerSigner.address;
+  const recipient = process.env.RECIPIENT || feePayerSigner.pubkey;
 
   // Bootstrap fee payer on surfnet via cheatcodes (best-effort)
-  await bootstrap(feePayerSigner.address).catch(() => {});
+  await bootstrap(feePayerSigner.pubkey).catch(() => {});
+
+  // ── MPP setup (pay-kit) ──
+  // Challenges embed a `confirmed` blockhash and the co-signed transaction is
+  // broadcast at the same commitment, which is what surfnet 1.6 requires.
+  const pay = await createPayKit({
+    network: NETWORK as "localnet" | "devnet" | "mainnet",
+    rpcUrl: RPC_URL,
+    operator: { signer: feePayerSigner, recipient, feePayer: true },
+    mpp: {
+      challengeBindingSecret: SECRET_KEY,
+      html: true,
+      realm: new URL(productionUrl()).host,
+    },
+    pricing: {
+      quote: { amount: usd("0.01"), description: "Stock quote" },
+      weather: { amount: usd("0.005"), description: "Weather data" },
+    },
+  });
 
   // ── Express app ──
   const app = express();
@@ -123,8 +134,7 @@ async function createApp() {
 
   // ── Request logging middleware ──
   app.use((req, res, next) => {
-    if (req.path === "/" || req.path.startsWith("/__402/pdb"))
-      return next();
+    if (req.path === "/" || req.path.startsWith("/__402/pdb")) return next();
     const start = Date.now();
 
     const chunks: Buffer[] = [];
@@ -281,78 +291,29 @@ async function createApp() {
     });
   });
 
-  // ── MPP setup ──
-  const mppx = Mppx.create({
-    secretKey: SECRET_KEY,
-    methods: [
-      solana.charge({
-        recipient,
-        network: NETWORK,
-        rpcUrl: RPC_URL,
-        signer: feePayerSigner,
-        currency: USDC_MINT,
-        decimals: 6,
-        html: true,
-      }),
-    ],
-  });
-
   // ── MPP endpoints ──
+  // `pay.express` answers unpaid requests with the 402 challenge (JSON, or
+  // the hosted payment page for browsers) and, once a credential verifies,
+  // settles it after the handler runs and sets `payment-receipt`.
 
-  app.get("/mpp/quote/:symbol", async (req, res) => {
-    const result = await mppx.charge({
-      amount: "10000",
-      currency: USDC_MINT,
-      description: `Stock quote: ${req.params.symbol}`,
-    })(toWebRequest(req));
-
-    if (result.status === 402) {
-      const challenge = result.challenge as Response;
-      const body = await challenge.text();
-      res.writeHead(challenge.status, Object.fromEntries(challenge.headers));
-      res.end(body);
-      return;
-    }
-
-    const response = result.withReceipt(
-      Response.json({
-        symbol: req.params.symbol.toUpperCase(),
-        price: (Math.random() * 500).toFixed(2),
-        currency: "USD",
-        source: "mpp-demo",
-      }),
-    ) as Response;
-    res.writeHead(response.status, Object.fromEntries(response.headers));
-    res.end(await response.text());
+  app.get("/mpp/quote/:symbol", pay.express("quote"), (req, res) => {
+    res.json({
+      symbol: req.params.symbol.toUpperCase(),
+      price: (Math.random() * 500).toFixed(2),
+      currency: "USD",
+      source: "mpp-demo",
+    });
   });
 
-  app.get("/mpp/weather/:city", async (req, res) => {
-    const result = await mppx.charge({
-      amount: "5000",
-      currency: USDC_MINT,
-      description: `Weather: ${req.params.city}`,
-    })(toWebRequest(req));
-
-    if (result.status === 402) {
-      const challenge = result.challenge as Response;
-      const body = await challenge.text();
-      res.writeHead(challenge.status, Object.fromEntries(challenge.headers));
-      res.end(body);
-      return;
-    }
-
-    const response = result.withReceipt(
-      Response.json({
-        city: req.params.city,
-        temperature: Math.floor(Math.random() * 35) + 5,
-        conditions: ["Sunny", "Cloudy", "Rainy", "Windy"][
-          Math.floor(Math.random() * 4)
-        ],
-        source: "mpp-demo",
-      }),
-    ) as Response;
-    res.writeHead(response.status, Object.fromEntries(response.headers));
-    res.end(await response.text());
+  app.get("/mpp/weather/:city", pay.express("weather"), (req, res) => {
+    res.json({
+      city: req.params.city,
+      temperature: Math.floor(Math.random() * 35) + 5,
+      conditions: ["Sunny", "Cloudy", "Rainy", "Windy"][
+        Math.floor(Math.random() * 4)
+      ],
+      source: "mpp-demo",
+    });
   });
 
   // ── Embedded facilitator ──
@@ -363,7 +324,7 @@ async function createApp() {
         {
           scheme: "exact",
           network: "solana-devnet",
-          extra: { feePayer: feePayerSigner.address },
+          extra: { feePayer: feePayerSigner.pubkey },
         },
       ],
     });
@@ -427,7 +388,7 @@ async function createApp() {
 
   x402App.use(
     paymentMiddleware(
-      recipient,
+      recipient as Address,
       {
         "/x402/joke": {
           price: "$0.001",
@@ -568,19 +529,6 @@ function parseAbsoluteUrl(value: string): AbsoluteUrl {
   return url.toString() as AbsoluteUrl;
 }
 
-function toWebRequest(req: express.Request): globalThis.Request {
-  const protocol = req.headers["x-forwarded-proto"] || req.protocol || "https";
-  const host = req.headers.host || "localhost";
-  const url = `${protocol}://${host}${req.originalUrl}`;
-  return new globalThis.Request(url, {
-    method: req.method,
-    headers: new Headers(req.headers as Record<string, string>),
-    body: ["GET", "HEAD"].includes(req.method)
-      ? undefined
-      : JSON.stringify(req.body),
-  });
-}
-
 // ── Local dev server ──
 const isVercel = !!process.env.VERCEL;
 if (!isVercel) {
@@ -603,12 +551,8 @@ if (!isVercel) {
       console.log(
         `  ${d}MPP${r}   GET /mpp/weather/:city   ${d}0.005 USDC${r}`,
       );
-      console.log(
-        `  ${d}x402${r}  GET /x402/joke           ${d}$0.001${r}`,
-      );
-      console.log(
-        `  ${d}x402${r}  GET /x402/fact            ${d}$0.001${r}`,
-      );
+      console.log(`  ${d}x402${r}  GET /x402/joke           ${d}$0.001${r}`);
+      console.log(`  ${d}x402${r}  GET /x402/fact            ${d}$0.001${r}`);
       console.log();
     });
   });

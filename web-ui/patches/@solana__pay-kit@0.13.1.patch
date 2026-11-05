@@ -1,0 +1,22 @@
+diff --git a/dist/index.js b/dist/index.js
+index d42e07175979bbedc696142ce748dbe354e72759..31629e68d511b73603855807743a2b1436a8f721 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1150,7 +1150,7 @@ async function broadcastTransaction(rpcUrl, base64Tx) {
+       id: 1,
+       jsonrpc: "2.0",
+       method: "sendTransaction",
+-      params: [base64Tx, { encoding: "base64", skipPreflight: false }]
++      params: [base64Tx, { encoding: "base64", preflightCommitment: "confirmed", skipPreflight: false }]
+     }),
+     headers: { "Content-Type": "application/json" },
+     method: "POST"
+@@ -3691,7 +3691,7 @@ async function broadcastTransaction2(rpcUrl, base64Tx) {
+       id: 1,
+       jsonrpc: "2.0",
+       method: "sendTransaction",
+-      params: [base64Tx, { encoding: "base64", skipPreflight: false }]
++      params: [base64Tx, { encoding: "base64", preflightCommitment: "confirmed", skipPreflight: false }]
+     }),
+     headers: { "Content-Type": "application/json" },
+     method: "POST"
