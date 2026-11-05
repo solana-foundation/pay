@@ -434,30 +434,10 @@ pub fn load_remote_signer_from_with_hardware_timeout(
 
     let hardware_timeout =
         hardware_timeout.filter(|_| provider.custody() == crate::backend::Custody::Hardware);
-    if hardware_timeout.is_some() {
-        eprintln!(
-            "{}",
-            format!(
-                "Waiting for {}… Plug it in and unlock it. Ctrl+C to cancel.",
-                provider.display_name()
-            )
-            .dimmed()
-        );
+    let signer = match hardware_timeout {
+        Some(timeout) => wait_for_hardware(provider, &credentials, &wallet_id, timeout),
+        None => provider.connect(&credentials, &wallet_id),
     }
-    let signer = (if let Some(timeout) = hardware_timeout {
-        provider
-            .connect_interactive_for(&credentials, &wallet_id, timeout)
-            .and_then(|signer| {
-                signer.ok_or_else(|| {
-                    Error::Config(format!(
-                        "Timed out waiting for {}. Plug it in, unlock it, and retry.",
-                        provider.display_name()
-                    ))
-                })
-            })
-    } else {
-        provider.connect(&credentials, &wallet_id)
-    })
     .map_err(|e| explain_connect_failure(provider, &credentials, &wallet_id, name, e))?;
 
     let address = signer.pubkey().to_string();
@@ -474,6 +454,45 @@ pub fn load_remote_signer_from_with_hardware_timeout(
     }
 
     Ok(ResolvedSigner::remote(provider, signer))
+}
+
+/// Connect a hardware signer, waiting up to `timeout` for the device to be
+/// plugged in, unlocked and on the Solana app. Same spinner as
+/// `pay account new` on a terminal; a single plain line otherwise.
+fn wait_for_hardware(
+    provider: &dyn RemoteProvider,
+    credentials: &Credentials,
+    wallet_id: &str,
+    timeout: std::time::Duration,
+) -> Result<Box<dyn TransactionSigner>> {
+    let display = provider.display_name();
+    let message = format!("Plug in your {display} and unlock it…  Ctrl+C to cancel");
+    let spinner = indicatif::ProgressBar::new_spinner().with_style(
+        indicatif::ProgressStyle::with_template("  {spinner:.green} {msg}")
+            .expect("static template")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    if spinner.is_hidden() {
+        eprintln!("{}", message.dimmed());
+    } else {
+        spinner.set_message(message);
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    }
+
+    let result = provider.connect_interactive_for(credentials, wallet_id, timeout);
+    spinner.finish_and_clear();
+    match result {
+        Ok(Some(signer)) => {
+            if !spinner.is_hidden() {
+                eprintln!("  {} {display} connected", "✔".green());
+            }
+            Ok(signer)
+        }
+        Ok(None) => Err(Error::Config(format!(
+            "Timed out waiting for {display}. Plug it in, unlock it, and retry."
+        ))),
+        Err(err) => Err(err),
+    }
 }
 
 /// Explain a failed [`RemoteProvider::connect`] in terms of what is
@@ -543,6 +562,107 @@ mod tests {
     use super::*;
     use crate::accounts::BackendKind as KeystoreKind;
     use std::collections::BTreeMap;
+
+    /// Hardware fake: `connect` always fails like an absent device, and
+    /// `connect_interactive_for` becomes ready only if allowed to wait.
+    struct SlowDevice {
+        ready: bool,
+    }
+
+    impl SigningBackend for SlowDevice {
+        fn id(&self) -> &'static str {
+            "slow-device"
+        }
+        fn display_name(&self) -> &'static str {
+            "Slow Device"
+        }
+        fn description(&self) -> &'static str {
+            "test hardware"
+        }
+        fn custody(&self) -> crate::backend::Custody {
+            crate::backend::Custody::Hardware
+        }
+        fn is_exportable(&self) -> bool {
+            false
+        }
+        fn signs_raw_messages(&self) -> bool {
+            false
+        }
+        fn approval(&self) -> crate::backend::Approval {
+            crate::backend::Approval::DeviceConfirmation
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+            None
+        }
+    }
+
+    impl RemoteProvider for SlowDevice {
+        fn credential_fields(&self) -> &'static [CredentialField] {
+            &[]
+        }
+        fn credentials_hint(&self) -> &'static str {
+            ""
+        }
+        fn validate_wallet_id(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn discover(&self, _credentials: &Credentials) -> Result<Vec<RemoteWallet>> {
+            Ok(Vec::new())
+        }
+        fn no_wallets_hint(&self) -> &'static str {
+            ""
+        }
+        fn connect(
+            &self,
+            _credentials: &Credentials,
+            _wallet_id: &str,
+        ) -> Result<Box<dyn TransactionSigner>> {
+            Err(Error::Config("no device found".to_string()))
+        }
+        fn connect_interactive_for(
+            &self,
+            _credentials: &Credentials,
+            _wallet_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<Box<dyn TransactionSigner>>> {
+            if !self.ready {
+                return Ok(None);
+            }
+            let signer = pay_kit::solana_keychain::MemorySigner::from_bytes(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]).to_keypair_bytes(),
+            )
+            .unwrap();
+            Ok(Some(Box::new(signer)))
+        }
+    }
+
+    #[test]
+    fn hardware_wait_connects_a_device_that_is_not_ready_up_front() {
+        let device = SlowDevice { ready: true };
+        let creds = Credentials::new();
+        assert!(device.connect(&creds, "w").is_err());
+        assert!(wait_for_hardware(&device, &creds, "w", std::time::Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn hardware_wait_reports_a_timeout() {
+        let device = SlowDevice { ready: false };
+        let err = wait_for_hardware(
+            &device,
+            &Credentials::new(),
+            "w",
+            std::time::Duration::from_millis(1),
+        )
+        .err()
+        .expect("timed out");
+        assert!(
+            err.to_string()
+                .contains("Timed out waiting for Slow Device")
+        );
+    }
 
     fn remote_account(provider: Option<&str>, wallet_id: Option<&str>) -> Account {
         Account {

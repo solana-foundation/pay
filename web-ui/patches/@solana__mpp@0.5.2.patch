@@ -1,0 +1,13 @@
+diff --git a/dist/server/Charge.js b/dist/server/Charge.js
+index f935eddbe6e762bcdd2224055278e567ac676828..b1d51dc67974806c7f9f4eb453ae3bf52098f705 100644
+--- a/dist/server/Charge.js
++++ b/dist/server/Charge.js
+@@ -371,7 +371,7 @@ async function broadcastTransaction(rpcUrl, base64Tx) {
+             id: 1,
+             jsonrpc: '2.0',
+             method: 'sendTransaction',
+-            params: [base64Tx, { encoding: 'base64', skipPreflight: false }],
++            params: [base64Tx, { encoding: 'base64', preflightCommitment: 'confirmed', skipPreflight: false }],
+         }),
+         headers: { 'Content-Type': 'application/json' },
+         method: 'POST',

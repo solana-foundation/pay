@@ -110,6 +110,7 @@ impl SendCommand {
                 fee_within,
                 confidential: self.confidential,
                 rpc_url,
+                store: &super::interactive_accounts_store(),
             },
         )?;
 

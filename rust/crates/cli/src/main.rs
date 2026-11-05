@@ -87,9 +87,14 @@ struct Opts {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Use a specific named account from `~/.config/pay/accounts.yml`.
+    /// Pay from a specific named account in `~/.config/pay/accounts.yml`.
     /// In sandbox/local modes, this selects a wallet within `localnet`.
-    #[arg(long, global = true)]
+    #[arg(
+        long = "from",
+        visible_alias = "account",
+        value_name = "ACCOUNT",
+        global = true
+    )]
     account: Option<String>,
 
     /// Launch the Payment Debugger proxy on port 1402. All MCP curl
@@ -654,6 +659,18 @@ mod tests {
                 assert_eq!(cmd.recipient, "ludo");
             }
             _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn from_is_the_global_account_flag() {
+        for args in [
+            ["pay", "send", "--from", "ledger", "1", "ludo"],
+            ["pay", "--from", "ledger", "send", "1", "ludo"],
+            ["pay", "send", "1", "ludo", "--account", "ledger"],
+        ] {
+            let opts = Opts::try_parse_from(args).unwrap();
+            assert_eq!(opts.account.as_deref(), Some("ledger"), "{args:?}");
         }
     }
 

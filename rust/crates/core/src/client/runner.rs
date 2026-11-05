@@ -1360,6 +1360,16 @@ fn classify_402_inner(
 /// {"error": "session_failed", "message": "...", "retryable": true}
 /// ```
 ///
+/// Also recognises the RFC 9457 problem document the reference MPP server
+/// (`mppx`) returns when it saw a credential and refused it:
+///
+/// ```json
+/// {"type":"https://paymentauth.org/problems/verification-failed","title":"Verification Failed","status":402,"detail":"..."}
+/// ```
+///
+/// A `payment-required` problem is a fresh challenge, not a rejection, and
+/// falls through like any other body.
+///
 /// Returns `None` for any other body shape (or absent body), so the caller
 /// can fall through to the normal challenge-detection path.
 pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, bool)> {
@@ -1368,20 +1378,54 @@ pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, 
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let error = v.get("error")?.as_str()?;
-    if !matches!(error, "verification_failed" | "session_failed") {
-        return None;
+    if let Some(error) = v.get("error").and_then(|e| e.as_str()) {
+        if !matches!(error, "verification_failed" | "session_failed") {
+            return None;
+        }
+        let message = v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("payment verification failed")
+            .to_string();
+        let retryable = v
+            .get("retryable")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(false);
+        return Some((message, retryable));
     }
+    parse_problem_rejection(&v)
+}
+
+/// Problem types (the path segment after `https://paymentauth.org/problems/`)
+/// that mean the server received our credential and rejected it. Everything
+/// else, notably `payment-required`, is a challenge rather than a verdict.
+const PROBLEM_REJECTIONS: &[(&str, bool)] = &[
+    ("verification-failed", false),
+    ("malformed-credential", false),
+    ("invalid-payload", false),
+    ("invalid-challenge", false),
+    ("method-unsupported", false),
+    ("payment-insufficient", false),
+    // The challenge lapsed before the server saw the payment; a fresh
+    // pay-and-retry can succeed.
+    ("payment-expired", true),
+];
+
+fn parse_problem_rejection(v: &serde_json::Value) -> Option<(String, bool)> {
+    let problem_type = v.get("type")?.as_str()?;
+    let slug = problem_type.rsplit('/').next()?;
+    let (_, retryable) = PROBLEM_REJECTIONS
+        .iter()
+        .find(|(known, _)| *known == slug)?;
     let message = v
-        .get("message")
-        .and_then(|m| m.as_str())
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| v.get("title").and_then(|t| t.as_str()))
         .unwrap_or("payment verification failed")
+        .trim_end_matches('.')
         .to_string();
-    let retryable = v
-        .get("retryable")
-        .and_then(|r| r.as_bool())
-        .unwrap_or(false);
-    Some((message, retryable))
+    Some((message, *retryable))
 }
 
 fn check_command_exists(cmd: &str) -> Result<()> {
@@ -5443,6 +5487,34 @@ HTTP request sent, awaiting response...
         let body = r#"{"error":"verification_failed","message":"bad signature"}"#;
         let parsed = parse_verification_failure(Some(body));
         assert_eq!(parsed, Some(("bad signature".to_string(), false)));
+    }
+
+    #[test]
+    fn parse_verification_failure_reads_mppx_problem_document() {
+        // What `mppx` returns on the paid retry when the fee payer's
+        // broadcast failed: an RFC 9457 problem, no `error` field.
+        let body = r#"{"type":"https://paymentauth.org/problems/verification-failed","title":"Verification Failed","status":402,"detail":"Payment verification failed.","challengeId":"abc"}"#;
+        assert_eq!(
+            parse_verification_failure(Some(body)),
+            Some(("Payment verification failed".to_string(), false))
+        );
+
+        let expired = r#"{"type":"https://paymentauth.org/problems/payment-expired","title":"Payment Expired","status":402}"#;
+        assert_eq!(
+            parse_verification_failure(Some(expired)),
+            Some(("Payment Expired".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_ignores_mppx_fresh_challenge_problem() {
+        // The first 402 is also a problem document; it must still be
+        // treated as a challenge to pay, never as a rejection.
+        let body = r#"{"type":"https://paymentauth.org/problems/payment-required","title":"Payment Required","status":402,"detail":"Payment is required (Stock quote: AAPL).","challengeId":"abc"}"#;
+        assert_eq!(parse_verification_failure(Some(body)), None);
+        let unknown =
+            r#"{"type":"https://example.com/problems/teapot","title":"Teapot","status":402}"#;
+        assert_eq!(parse_verification_failure(Some(unknown)), None);
     }
 
     #[test]
