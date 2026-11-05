@@ -15,10 +15,9 @@
   },
   "dependencies": {
     "@solana/kit": "^6.10.0",
-    "@solana/mpp": "^0.5.2",
+    "@solana/pay-kit": "^0.13.1",
     "cors": "^2.8.6",
     "express": "^4.22.2",
-    "mppx": "^0.8.19",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "x402": "^1.2.0",
@@ -53,7 +52,7 @@
       "zod@<4.6.6": "^4.6.6"
     },
     "patchedDependencies": {
-      "@solana/mpp@0.5.2": "patches/@solana__mpp@0.5.2.patch"
+      "@solana/pay-kit@0.13.1": "patches/@solana__pay-kit@0.13.1.patch"
     }
   },
   "packageManager": "pnpm@9.15.0"
