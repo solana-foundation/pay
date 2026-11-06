@@ -93,15 +93,18 @@ pub(crate) fn payment_display_amount(
             )))
         }
         (Some(coin), _) => {
-            let decimals = u32::from(coin.decimals());
-            Ok(if decimals <= 6 {
-                format!(
-                    "${}",
-                    format_value(base as f64 / 10f64.powi(decimals as i32))
-                )
-            } else {
-                format!("${}", format_base_units(base, decimals))
-            })
+            // This text also feeds the spending policy. Render the signed
+            // integer amount exactly: rounding even a sub-cent payment can
+            // both mislead the user and understate the authorization amount.
+            let mut amount = format_base_units(base, u32::from(coin.decimals()));
+            if base != 0 {
+                match amount.split_once('.').map(|(_, fraction)| fraction.len()) {
+                    None => amount.push_str(".00"),
+                    Some(1) => amount.push('0'),
+                    _ => {}
+                }
+            }
+            Ok(format!("${amount}"))
         }
         (None, Some(decimals)) => Ok(format!(
             "{} {}",
@@ -117,35 +120,6 @@ fn asset_label(currency: &str) -> String {
         Some((end, _)) => format!("{}…", &currency[..end]),
         None => currency.to_string(),
     }
-}
-
-pub(crate) fn format_value(v: f64) -> String {
-    if v == 0.0 {
-        "0".to_string()
-    } else if v >= 0.01 && is_cent_exact(v) {
-        format!("{v:.2}")
-    } else if v >= 0.01 {
-        format_precise_value(v, 6)
-    } else if v >= 0.001 {
-        format!("{v:.3}")
-    } else if v >= 0.0001 {
-        format!("{v:.4}")
-    } else {
-        format!("{v:.6}")
-    }
-}
-
-fn is_cent_exact(v: f64) -> bool {
-    let rounded_to_cent = (v * 100.0).round() / 100.0;
-    (v - rounded_to_cent).abs() < 0.0000005
-}
-
-fn format_precise_value(v: f64, decimals: usize) -> String {
-    let mut value = format!("{v:.decimals$}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    value
 }
 
 pub(crate) fn payment_description(
@@ -354,6 +328,53 @@ mod tests {
         );
         // A stablecoin claimed at other decimals is refused outright.
         assert!(payment_display_amount("50000000", USDC, Some(Decimals::new(2).unwrap())).is_err());
+    }
+
+    #[test]
+    fn stablecoin_authorization_preserves_every_base_unit() {
+        for coin in pay_types::Stablecoin::ALL {
+            for (base, expected) in [
+                (0, "$0"),
+                (1, "$0.000001"),
+                (1_234, "$0.001234"),
+                (50, "$0.00005"),
+                (101, "$0.000101"),
+                (500, "$0.0005"),
+                (999, "$0.000999"),
+                (1_000, "$0.001"),
+                (1_001, "$0.001001"),
+                (5_000, "$0.005"),
+                (9_999, "$0.009999"),
+                (10_000, "$0.01"),
+                (10_001, "$0.010001"),
+                (100_000, "$0.10"),
+                (1_000_000, "$1.00"),
+                (1_000_001, "$1.000001"),
+                (1_001_500, "$1.0015"),
+                (1_500_000, "$1.50"),
+                (9_007_199_254_740_993, "$9007199254.740993"),
+                (u64::MAX, "$18446744073709.551615"),
+            ] {
+                for currency in [coin.symbol(), coin.mint(Some("mainnet"))] {
+                    let shown = payment_display_amount(
+                        &base.to_string(),
+                        currency,
+                        Some(Decimals::new(u64::from(coin.decimals())).unwrap()),
+                    )
+                    .unwrap();
+                    assert_eq!(shown, expected, "{currency}: {base} base units");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stablecoin_authorization_does_not_understate_the_spending_policy_amount() {
+        let shown = payment_display_amount("1234", "USDC", None).unwrap();
+        let intent = crate::keystore::AuthIntent::authorize_payment_details(&shown, "api", "op");
+        // USD policy amounts round up to 1/10,000 dollar units, so this
+        // payment must not fit a $0.001 (10-unit) cap.
+        assert_eq!(intent.amount_minor_units(), Some(13));
     }
 
     #[test]
