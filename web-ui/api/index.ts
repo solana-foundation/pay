@@ -103,6 +103,8 @@ async function createApp() {
   // ── MPP setup (pay-kit) ──
   // Challenges embed a `confirmed` blockhash and the co-signed transaction is
   // broadcast at the same commitment, which is what surfnet 1.6 requires.
+  // The pay-kit pnpm patch also prevents error challenges from re-verifying
+  // a credential and accidentally settling a request that returned 402.
   const pay = await createPayKit({
     network: NETWORK as "localnet" | "devnet" | "mainnet",
     rpcUrl: RPC_URL,
