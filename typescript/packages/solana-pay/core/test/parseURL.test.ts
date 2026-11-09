@@ -94,5 +94,36 @@ describe('parseURL', () => {
 
             expect(() => parseURL(url)).toThrow('reference invalid');
         });
+
+        it.each([
+            ['amount', '1', '2'],
+            [
+                'spl-token',
+                '82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny',
+                'mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN',
+            ],
+            ['label', 'A', 'B'],
+            ['message', 'A', 'B'],
+            ['memo', 'A', 'B'],
+        ])('throws an error on duplicate %s', (field, first, second) => {
+            const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?${field}=${first}&${field}=${second}`;
+
+            expect(() => parseURL(url)).toThrow(`${field} invalid`);
+        });
+
+        it('accepts repeated reference fields', () => {
+            const url =
+                'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?reference=82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny&reference=mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN';
+
+            const { reference } = parseURL(url) as TransferRequestURL;
+
+            expect(reference).toHaveLength(2);
+        });
+
+        it.each(['label', 'message'])('throws an error on duplicate transaction-request %s', field => {
+            const url = `solana:https://example.com/solana-pay?${field}=A&${field}=B`;
+
+            expect(() => parseURL(url)).toThrow(`${field} invalid`);
+        });
     });
 });
