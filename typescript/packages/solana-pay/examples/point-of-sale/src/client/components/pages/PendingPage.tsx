@@ -11,7 +11,7 @@ import css from './PendingPage.module.css';
 
 const PendingPage: NextPage = () => {
     const { symbol, connectWallet: connectWalletConfig } = useConfig();
-    const { amount, reset } = usePayment();
+    const { amount, reset, submissionError } = usePayment();
     const { address, connected } = useAccount();
     const { connect } = useConnectWallet();
     const connectors = useWalletConnectors();
@@ -26,7 +26,7 @@ const PendingPage: NextPage = () => {
     return (
         <div className={css.root}>
             <div className={css.header}>
-                <BackButton onClick={reset}>Cancel</BackButton>
+                <BackButton onClick={reset}>{submissionError ? 'Back' : 'Cancel'}</BackButton>
                 {connectWalletConfig && connectors.length > 0 ? (
                     <button
                         onClick={() => {
@@ -43,11 +43,22 @@ const PendingPage: NextPage = () => {
                     <Amount amount={amount} />
                 </div>
                 <div className={css.symbol}>{symbol}</div>
-                <div className={css.code}>
-                    <QRCode />
-                </div>
-                <div className={css.scan}>Scan this code with your Solana Pay wallet</div>
-                <div className={css.confirm}>You'll be asked to approve the transaction</div>
+                {!submissionError && !connectWalletConfig ? (
+                    <>
+                        <div className={css.code}>
+                            <QRCode />
+                        </div>
+                        <div className={css.scan}>Scan this code with your Solana Pay wallet</div>
+                    </>
+                ) : null}
+                {!submissionError && connectWalletConfig ? (
+                    <div className={css.confirm}>
+                        {connected
+                            ? 'Approve this payment in your connected wallet. We will check for confirmation.'
+                            : 'Connect your wallet to continue. If you already approved this payment, wait while we check for confirmation.'}
+                    </div>
+                ) : null}
+                {submissionError ? <p role="alert">{submissionError}</p> : null}
             </div>
             <div className={css.footer}>
                 <PoweredBy />

@@ -8,7 +8,7 @@ You can [check out the app](https://app.solanapay.com?recipient=GvHeR432g7MjN9uK
 
 To build and run this app locally, you'll need:
 
--   Node.js v14.17.0 or above
+-   Node.js v20.18.0 or above
 -   Yarn
 -   <details>
         <summary> Setup two wallets on <a href="https://phantom.app">Phantom</a> (Merchant and Customer) </summary>
@@ -37,6 +37,40 @@ To build and run this app locally, you'll need:
 ## Getting Started
 
 These instructions will get you a copy of the project up and running on your local machine for development and testing purposes.
+
+### Payment retry behavior and local checks
+
+The optional connected-wallet flow keeps one authorization and one submission
+attempt for each invoice reference. It does not automatically request a new
+signature after a signing or submission error. A lost RPC response does not
+prove that the transaction failed, so reference polling continues while the
+page explains the uncertainty. Check the wallet before starting another invoice.
+Preparation/signing failures are shown separately from unknown submission
+outcomes; neither displays another payment QR code on the error screen.
+
+The guard is in memory and ends when the provider is unmounted or reloaded. It
+does not coordinate payments sent from a separate wallet through a QR code.
+The default configuration uses devnet and leaves `connectWallet` disabled.
+
+The example is outside the SDK's pnpm workspace. Build its local SDK dependency
+before installing and checking the example:
+
+```shell
+cd typescript
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm --filter @solana/pay build
+cd packages/solana-pay/examples/point-of-sale
+npm install --ignore-scripts
+npm test
+npx --no-install tsc --noEmit --incremental false
+npm run build
+```
+
+The `POS example` workflow runs these checks explicitly. The regression tests
+mount the real provider and pending page, with generated signers and actual SPL
+transfers in LiteSVM. Connector/Next hooks, response loss, reference discovery
+and transfer validation are controlled fixtures; no real wallet or funds are
+used. A full application build checks the real Next and connector dependencies.
 
 ### Clone the repository
 
