@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn unhooked_v2_requires_matching_explicit_deployment_not_some_empty_hooks() {
+    fn unhooked_v2_requires_explicit_abi_and_matching_owner() {
         let (mut config, mut bytes) = v2_fixture();
         config.channel_hooks = None;
         let empty = pay_kit::core::payment_channels_v2::ChannelHooks::default();
@@ -1094,8 +1094,20 @@ mod tests {
             )
             .is_ok()
         );
+        let canary = config.channel_program.unwrap();
         config.channel_program = None;
-        assert!(session_deployment(&config).is_err());
+        assert_eq!(session_deployment(&config).unwrap().version, 2);
+        assert!(decode_session_channel(&Pubkey::new_unique(), &canary, &bytes, &config).is_err());
+        config.channel_version = None;
+        assert!(
+            decode_session_channel(
+                &Pubkey::new_unique(),
+                &default_program_id(),
+                &bytes,
+                &config
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
