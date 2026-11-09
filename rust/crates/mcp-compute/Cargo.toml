@@ -32,7 +32,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = "2"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 rcgen = "0.14"
