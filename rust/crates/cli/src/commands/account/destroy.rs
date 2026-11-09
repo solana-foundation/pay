@@ -25,14 +25,9 @@ pub struct DestroyCommand {
 }
 
 impl DestroyCommand {
-    pub fn run(self) -> pay_core::Result<()> {
+    pub fn run(self, network_override: Option<&str>) -> pay_core::Result<()> {
+        let network = super::account_network(self.sandbox, network_override)?;
         let mut accounts = AccountsFile::load()?;
-
-        let network = if self.sandbox {
-            "localnet"
-        } else {
-            MAINNET_NETWORK
-        };
 
         // Fall back to legacy keystore probe for mainnet accounts not yet in accounts.yml.
         let in_file = accounts
@@ -108,13 +103,18 @@ impl DestroyCommand {
                     .unwrap_or(false);
 
             if export {
-                let export_path = format!("backup-{}.json", self.account);
+                let export_path = if network == MAINNET_NETWORK {
+                    format!("backup-{}.json", self.account)
+                } else {
+                    format!("backup-{}-{network}.json", self.account)
+                };
                 let export_cmd = super::export::ExportCommand {
                     name: self.account.clone(),
                     path: Some(export_path.clone()),
+                    sandbox: self.sandbox,
                 };
                 // Try exporting, but don't fail the whole remove if it errors
-                match export_cmd.run() {
+                match export_cmd.run(Some(network)) {
                     Ok(()) => {}
                     Err(e) => eprintln!("  {}", format!("Export failed: {e}").dimmed()),
                 }
@@ -164,19 +164,19 @@ impl DestroyCommand {
             );
         }
 
-        // Check if this was the active mainnet account before removing.
+        // Default selection and removal belong to the target network only.
         let was_default = accounts
-            .default_account()
+            .account_for_network(network)
             .map(|(name, _)| name == self.account)
             .unwrap_or(false);
 
-        accounts.remove(MAINNET_NETWORK, &self.account);
+        accounts.remove(network, &self.account);
 
-        // If we deleted the mainnet-default and there are remaining
+        // If we deleted this network's default and there are remaining
         // accounts, prompt for a new active account.
         let remaining: Vec<String> = accounts
             .accounts
-            .get(MAINNET_NETWORK)
+            .get(network)
             .map(|net| net.keys().cloned().collect())
             .unwrap_or_default();
 
@@ -185,26 +185,21 @@ impl DestroyCommand {
             if has_tty {
                 let selection =
                     dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                        .with_prompt("Choose new default account (mainnet)")
+                        .with_prompt(format!("Choose new default account ({network})"))
                         .items(&remaining)
                         .default(0)
                         .interact()
                         .ok();
 
                 if let Some(idx) = selection {
-                    accounts.set_active(MAINNET_NETWORK, &remaining[idx]);
+                    accounts.set_active(network, &remaining[idx]);
                 }
             }
         }
 
         accounts.save()?;
 
-        let mainnet_empty = accounts
-            .accounts
-            .get(MAINNET_NETWORK)
-            .is_none_or(|net| net.is_empty());
-
-        if mainnet_empty {
+        if accounts.accounts.is_empty() {
             eprintln!();
             eprintln!(
                 "{}",
