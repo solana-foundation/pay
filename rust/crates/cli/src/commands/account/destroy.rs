@@ -164,23 +164,9 @@ impl DestroyCommand {
             );
         }
 
-        // Check if this was the active mainnet account before removing.
-        let was_default = accounts
-            .default_account()
-            .map(|(name, _)| name == self.account)
-            .unwrap_or(false);
+        let remaining = remove_account_record(&mut accounts, network, &self.account);
 
-        accounts.remove(MAINNET_NETWORK, &self.account);
-
-        // If we deleted the mainnet-default and there are remaining
-        // accounts, prompt for a new active account.
-        let remaining: Vec<String> = accounts
-            .accounts
-            .get(MAINNET_NETWORK)
-            .map(|net| net.keys().cloned().collect())
-            .unwrap_or_default();
-
-        if was_default && !remaining.is_empty() {
+        if !remaining.is_empty() {
             let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
             if has_tty {
                 let selection =
@@ -192,19 +178,19 @@ impl DestroyCommand {
                         .ok();
 
                 if let Some(idx) = selection {
-                    accounts.set_active(MAINNET_NETWORK, &remaining[idx]);
+                    accounts.set_active(network, &remaining[idx]);
                 }
             }
         }
 
         accounts.save()?;
 
-        let mainnet_empty = accounts
+        let network_empty = accounts
             .accounts
-            .get(MAINNET_NETWORK)
+            .get(network)
             .is_none_or(|net| net.is_empty());
 
-        if mainnet_empty {
+        if network_empty {
             eprintln!();
             eprintln!(
                 "{}",
@@ -289,4 +275,133 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
         });
     }
     None
+}
+
+/// Removes the account record for `name` from `network` and returns the
+/// remaining account names in that network when the removal took the active
+/// mainnet default, so the caller can prompt for a replacement.
+///
+/// Only a mainnet destroy can affect the mainnet default — a sandbox destroy
+/// leaves it, and every other network's records, untouched.
+fn remove_account_record(accounts: &mut AccountsFile, network: &str, name: &str) -> Vec<String> {
+    let was_default = network == MAINNET_NETWORK
+        && accounts
+            .default_account()
+            .is_some_and(|(default_name, _)| default_name == name);
+
+    accounts.remove(network, name);
+
+    if !was_default {
+        return Vec::new();
+    }
+    accounts
+        .accounts
+        .get(MAINNET_NETWORK)
+        .map(|net| net.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_account(active: bool) -> Account {
+        Account {
+            provider: None,
+            backend: KeystoreKind::File,
+            active,
+            auth_required: None,
+            pubkey: None,
+            vault: None,
+            account: None,
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn accounts_with_same_name_on_both_networks() -> AccountsFile {
+        let mut accounts = AccountsFile::default();
+        accounts.upsert(MAINNET_NETWORK, "shop", file_account(true));
+        accounts.upsert("localnet", "shop", file_account(false));
+        accounts
+    }
+
+    #[test]
+    fn sandbox_destroy_removes_the_localnet_record_only() {
+        // The same name exists on both networks: a sandbox destroy must remove
+        // the localnet record and leave the mainnet one (and its key) intact.
+        let mut accounts = accounts_with_same_name_on_both_networks();
+
+        let remaining = remove_account_record(&mut accounts, "localnet", "shop");
+
+        assert!(remaining.is_empty());
+        assert!(
+            accounts
+                .accounts
+                .get("localnet")
+                .is_none_or(|net| !net.contains_key("shop")),
+            "the localnet record must be removed"
+        );
+        assert!(
+            accounts
+                .accounts
+                .get(MAINNET_NETWORK)
+                .is_some_and(|net| net.contains_key("shop")),
+            "the mainnet record must survive a sandbox destroy"
+        );
+    }
+
+    #[test]
+    fn sandbox_destroy_leaves_the_mainnet_default_untouched() {
+        // The mainnet "shop" is the active default: destroying the sandbox
+        // "shop" must not remove it nor trigger the replacement prompt.
+        let mut accounts = accounts_with_same_name_on_both_networks();
+
+        let remaining = remove_account_record(&mut accounts, "localnet", "shop");
+
+        assert!(remaining.is_empty());
+        assert!(
+            accounts
+                .default_account()
+                .is_some_and(|(name, _)| name == "shop"),
+            "the mainnet default must survive a sandbox destroy"
+        );
+    }
+
+    #[test]
+    fn mainnet_destroy_of_the_default_returns_replacement_candidates() {
+        let mut accounts = AccountsFile::default();
+        accounts.upsert(MAINNET_NETWORK, "shop", file_account(true));
+        accounts.upsert(MAINNET_NETWORK, "other", file_account(false));
+
+        let remaining = remove_account_record(&mut accounts, MAINNET_NETWORK, "shop");
+
+        assert_eq!(remaining, vec!["other".to_string()]);
+        assert!(
+            accounts
+                .accounts
+                .get(MAINNET_NETWORK)
+                .is_some_and(|net| !net.contains_key("shop")),
+            "the destroyed default must be removed from mainnet"
+        );
+    }
+
+    #[test]
+    fn mainnet_destroy_of_a_non_default_returns_no_candidates() {
+        let mut accounts = AccountsFile::default();
+        accounts.upsert(MAINNET_NETWORK, "shop", file_account(true));
+        accounts.upsert(MAINNET_NETWORK, "other", file_account(false));
+
+        let remaining = remove_account_record(&mut accounts, MAINNET_NETWORK, "other");
+
+        assert!(remaining.is_empty());
+        assert!(
+            accounts
+                .default_account()
+                .is_some_and(|(name, _)| name == "shop"),
+            "the untouched default must remain the default"
+        );
+    }
 }
