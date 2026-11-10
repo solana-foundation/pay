@@ -32,3 +32,25 @@ enable it.
 The raw-hook configuration described in [MPP channel versions](mpp-channel-versions.md)
 remains an advanced integration/testing interface. Enabling V2 channel charge
 or sessions does not by itself enable a credit provider.
+
+## Musebook (proposed, unavailable)
+
+`credit_providers: [musebook]` is recognized but fails startup. Pay rejects it on
+its own, so this does not depend on the pinned pay-kit revision. The name refers
+to the reviewed program in
+[Solizardking/musebook-credit-provider](https://github.com/Solizardking/musebook-credit-provider).
+Object values, hook lists, mixed-case names and `musebook.trade` fail to deserialize,
+so customers cannot supply hook JSON.
+
+Planned operator and client behavior once it is enabled (none of this is implemented):
+
+- [ ] The operator resolves hook accounts only through the provider's fixed
+      `hook_state(program, owner, mint)`, then emits `openWithHooks` / `topUpWithHooks`
+      / `distributeWithHooks` / `withdrawPayerWithHooks` (outer tags 10–13).
+      Pay and pay-kit do not emit these yet.
+- [ ] The session store records the hook commitment and authorization nonce in
+      the same durable Redis transition as the session's open intent.
+- [ ] On restart, recovery compares the saved commitment with the on-chain channel
+      before it resumes or settles, and fails closed on any mismatch.
+- [ ] The client shows the issuer co-signed cap, payee and expiry before the owner signs.
+- [ ] Settlement is verified on chain independently of hook callbacks.

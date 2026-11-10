@@ -712,6 +712,8 @@ pub struct EnvRef {
 #[serde(rename_all = "lowercase")]
 pub enum CreditProvider {
     Coinflow,
+    /// musebook.trade API credits. Recognized, unavailable until reviewed.
+    Musebook,
 }
 
 /// Operator-level configuration for a proxy instance.
