@@ -212,21 +212,6 @@ pub fn token_account_len(token_program: &Pubkey) -> usize {
     }
 }
 
-/// Solana's rent-exemption formula (`solana_rent::Rent::default().minimum_balance`),
-/// duplicated as a plain function rather than pulling in a `solana-rent`
-/// dependency for one calculation. `ACCOUNT_STORAGE_OVERHEAD` (128),
-/// `DEFAULT_LAMPORTS_PER_BYTE_YEAR` (3480), and `DEFAULT_EXEMPTION_THRESHOLD`
-/// (2.0) are stable cluster-wide protocol defaults, not implementation
-/// detail that could silently drift underneath this crate.
-pub fn rent_exempt_minimum_lamports(data_len: usize) -> u64 {
-    const ACCOUNT_STORAGE_OVERHEAD: u64 = 128;
-    const DEFAULT_LAMPORTS_PER_BYTE_YEAR: u64 = 1_000_000_000 / 100 * 365 / (1024 * 1024);
-    const DEFAULT_EXEMPTION_THRESHOLD: f64 = 2.0;
-
-    (((ACCOUNT_STORAGE_OVERHEAD + data_len as u64) * DEFAULT_LAMPORTS_PER_BYTE_YEAR) as f64
-        * DEFAULT_EXEMPTION_THRESHOLD) as u64
-}
-
 // ── ATA snapshot ─────────────────────────────────────────────────────────
 
 /// Whether one destination's ATA already exists, as observed by preflight's
@@ -860,12 +845,6 @@ mod tests {
         assert_eq!(compute_reserve_lamports(0), MIN_FEE_RESERVE_LAMPORTS);
         assert_eq!(compute_reserve_lamports(100_000), MIN_FEE_RESERVE_LAMPORTS);
         assert_eq!(compute_reserve_lamports(1_000_000), 50_000);
-    }
-
-    #[test]
-    fn rent_exempt_minimum_matches_known_token_account_rent() {
-        // Well-known real-world SPL token account rent-exempt minimum.
-        assert_eq!(rent_exempt_minimum_lamports(TOKEN_ACCOUNT_LEN), 2_039_280);
     }
 
     // ── pack_chunks ──
