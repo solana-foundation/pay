@@ -5,7 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { createHash } = require('crypto');
-const { execSync } = require('child_process');
+const childProcess = require('child_process');
+const { execSync } = childProcess;
 const { getPlatform } = require('./platform.cjs');
 
 const pkg = require('./package.json');
@@ -62,7 +63,7 @@ function main() {
     if (meta.artifact.endsWith('.tar.gz')) {
         execSync(`tar xzf "${artifactPath}" -C "${BIN_DIR}"`, { stdio: 'inherit' });
     } else if (meta.artifact.endsWith('.zip')) {
-        execSync(`unzip -o "${artifactPath}" -d "${BIN_DIR}"`, { stdio: 'inherit' });
+        extractZip(artifactPath, BIN_DIR);
     }
 
     // Set executable permission on Unix
@@ -78,6 +79,69 @@ function main() {
     fs.writeFileSync(VERSION_FILE, version);
 
     console.log(`pay v${version} installed successfully.`);
+}
+
+/**
+ * Extract a zip without depending on Unix `unzip`, which Windows does not ship.
+ * Prefer `%SystemRoot%\System32\tar.exe` (bsdtar) so Git/MSYS GNU tar on PATH
+ * cannot steal the lookup — GNU tar cannot read zip archives.
+ *
+ * @param {string} artifactPath
+ * @param {string} destDir
+ */
+function extractZip(artifactPath, destDir) {
+    if (process.platform === 'win32') {
+        extractZipWindows(artifactPath, destDir);
+        return;
+    }
+    childProcess.execSync(`unzip -o "${artifactPath}" -d "${destDir}"`, { stdio: 'inherit' });
+}
+
+/**
+ * @param {string} artifactPath
+ * @param {string} destDir
+ */
+function extractZipWindows(artifactPath, destDir) {
+    const tar = windowsTarCandidates(process.env).find(candidate => fs.existsSync(candidate));
+
+    if (tar) {
+        childProcess.execFileSync(tar, ['-xf', artifactPath, '-C', destDir], { stdio: 'inherit' });
+        return;
+    }
+
+    const quotedArtifact = quotePowerShellLiteral(artifactPath);
+    const quotedDest = quotePowerShellLiteral(destDir);
+    childProcess.execFileSync(
+        'powershell.exe',
+        [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `Expand-Archive -LiteralPath '${quotedArtifact}' -DestinationPath '${quotedDest}' -Force`,
+        ],
+        { stdio: 'inherit' },
+    );
+}
+
+/**
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string[]}
+ */
+function windowsTarCandidates(env) {
+    const systemRoot = (env && (env.SystemRoot || env.WINDIR)) || 'C:\\Windows';
+    return [
+        path.join(systemRoot, 'System32', 'tar.exe'),
+        // 32-bit Node on 64-bit Windows: System32 is redirected to SysWOW64.
+        path.join(systemRoot, 'Sysnative', 'tar.exe'),
+    ];
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function quotePowerShellLiteral(value) {
+    return value.replace(/'/g, "''");
 }
 
 /**
@@ -122,9 +186,17 @@ function sha256File(filePath) {
     return createHash('sha256').update(data).digest('hex');
 }
 
-try {
-    main();
-} catch (err) {
-    console.error(`Failed to install pay binary: ${err.message}`);
-    process.exit(1);
+if (require.main === module) {
+    try {
+        main();
+    } catch (err) {
+        console.error(`Failed to install pay binary: ${err.message}`);
+        process.exit(1);
+    }
 }
+
+module.exports = {
+    extractZipWindows,
+    quotePowerShellLiteral,
+    windowsTarCandidates,
+};
