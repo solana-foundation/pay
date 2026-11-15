@@ -1849,7 +1849,6 @@ impl<S: PaymentState> PaymentGate<S> {
     /// Verify an MPP `charge` credential across the configured MPPs. On success,
     /// forward with a receipt; on failure, re-challenge with 402.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn charge_verify(
         &self,
         api: &pay_types::metering::ApiSpec,
