@@ -28,15 +28,32 @@ pub enum AccountCommand {
 }
 
 impl AccountCommand {
-    pub fn run(self) -> pay_core::Result<()> {
+    pub fn run(self, network_override: Option<&str>) -> pay_core::Result<()> {
         match self {
             Self::New(cmd) => cmd.run(),
             Self::Import(cmd) => cmd.run(),
             Self::List(cmd) => cmd.run(),
             Self::Default(cmd) => cmd.run(),
-            Self::Remove(cmd) => cmd.run(),
-            Self::Export(cmd) => cmd.run(),
+            Self::Remove(cmd) => cmd.run(network_override),
+            Self::Export(cmd) => cmd.run(network_override),
         }
+    }
+}
+
+/// Resolve the destructive/export command's network once, including the
+/// root CLI flags. Conflicting scopes must fail before reading any secret.
+fn account_network(sandbox: bool, network_override: Option<&str>) -> pay_core::Result<&str> {
+    if sandbox {
+        if let Some(network) = network_override
+            && network != "localnet"
+        {
+            return Err(pay_core::Error::Config(format!(
+                "--sandbox conflicts with the selected {network} network"
+            )));
+        }
+        Ok("localnet")
+    } else {
+        Ok(network_override.unwrap_or(pay_core::accounts::MAINNET_NETWORK))
     }
 }
 
