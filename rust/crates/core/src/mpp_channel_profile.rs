@@ -230,10 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn deployment_and_hook_policy_require_explicit_opt_in() {
+    fn both_deployments_accept_v1_and_explicit_v2_but_hooks_require_opt_in() {
         let v2 = "CHNLxBtXw7VPqd5GMcbtVoEbn4ehyaSoiHj56Ao5sWkJ";
-        assert!(parse_server_profile(Some(v2), None, None).is_err());
-        assert!(parse_server_profile(None, Some("2"), None).is_err());
+        assert!(parse_server_profile(Some(v2), None, None).is_ok());
+        assert!(parse_server_profile(None, Some("2"), None).is_ok());
+        assert!(parse_server_profile(Some(v2), Some("3"), None).is_err());
         assert!(parse_server_profile(Some(v2), Some("2"), None).is_ok());
         assert!(parse_server_profile(None, None, Some("{}")).is_err());
         let hooks: ChannelHooks = serde_json::from_str("{}").unwrap();

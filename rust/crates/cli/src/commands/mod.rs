@@ -1393,9 +1393,13 @@ struct PaymentRetryContext<'a, 'tool> {
     verbose: bool,
 }
 
-const HARDWARE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a foreground command waits for a hardware wallet to be plugged
+/// in, unlocked and switched to the Solana app before giving up.
+const HARDWARE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-fn interactive_accounts_store() -> pay_core::accounts::FileAccountsStore {
+/// Accounts store for foreground commands: a hardware wallet that is not
+/// ready yet is waited for (with a spinner) instead of failing the command.
+pub(crate) fn interactive_accounts_store() -> pay_core::accounts::FileAccountsStore {
     pay_core::accounts::FileAccountsStore::default_path()
         .with_hardware_connection_timeout(HARDWARE_CONNECTION_TIMEOUT)
 }

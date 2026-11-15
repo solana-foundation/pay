@@ -4490,7 +4490,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ix.program_id, base.program_id);
-        assert_eq!(ix.data, base.data);
+        assert_eq!(
+            ix.data[0],
+            pay_kit::core::payment_channels_v2::DISTRIBUTE_WITH_HOOKS_DISCRIMINATOR
+        );
+        assert_eq!(&ix.data[1..], &base.data[1..]);
         assert_eq!(&ix.accounts[..base.accounts.len()], &base.accounts);
         assert_eq!(ix.accounts.len(), base.accounts.len() + 6);
         assert!(
@@ -4705,7 +4709,11 @@ mod tests {
         let distribution = candidate.instructions.last().unwrap();
         assert_operator_funds_no_account(&candidate.instructions, &operator);
         assert_eq!(distribution.program_id, program);
-        assert_eq!(distribution.data, base.data);
+        assert_eq!(
+            distribution.data[0],
+            pay_kit::core::payment_channels_v2::DISTRIBUTE_WITH_HOOKS_DISCRIMINATOR
+        );
+        assert_eq!(&distribution.data[1..], &base.data[1..]);
         assert_eq!(
             &distribution.accounts[..base.accounts.len()],
             &base.accounts

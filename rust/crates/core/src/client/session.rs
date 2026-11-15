@@ -1064,11 +1064,11 @@ mod tests {
     }
 
     #[test]
-    fn check_signer_rejects_program_abi_mismatch_before_wallet_capabilities() {
+    fn check_signer_rejects_unknown_abi_before_wallet_capabilities() {
         use crate::backend::testing::TransactionsOnly;
         let mut request = test_request();
         request.method_details.voucher_signer = Some(SessionVoucherSigner::Operator);
-        request.method_details.channel_version = Some(2);
+        request.method_details.channel_version = Some(3);
         let challenge = PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",
@@ -1077,7 +1077,7 @@ mod tests {
             Base64UrlJson::from_typed(&request).unwrap(),
         );
         let Err(Error::Mpp(message)) = check_signer(&challenge, &TransactionsOnly) else {
-            panic!("an incompatible program must fail before querying wallet capabilities");
+            panic!("an unknown ABI must fail before querying wallet capabilities");
         };
         assert!(message.contains("channel deployment"), "{message}");
     }

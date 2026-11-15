@@ -26,8 +26,8 @@ pub fn root_overview_help_requested() -> bool {
             | "--debugger" | "--dev" => {}
             "--yolo-upto" => expect_value_for = Some("--yolo-upto"),
             _ if arg.starts_with("--yolo-upto=") => {}
-            "--account" => expect_value_for = Some("--account"),
-            _ if arg.starts_with("--account=") => {}
+            "--from" | "--account" => expect_value_for = Some("--from"),
+            _ if arg.starts_with("--from=") || arg.starts_with("--account=") => {}
             _ => return false,
         }
     }

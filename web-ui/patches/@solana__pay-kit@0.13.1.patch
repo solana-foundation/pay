@@ -1,0 +1,44 @@
+diff --git a/dist/index.js b/dist/index.js
+index d42e07175979bbedc696142ce748dbe354e72759..8713d5eb474a595985fe4c195cc2b1abc370c722 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1150,7 +1150,7 @@ async function broadcastTransaction(rpcUrl, base64Tx) {
+       id: 1,
+       jsonrpc: "2.0",
+       method: "sendTransaction",
+-      params: [base64Tx, { encoding: "base64", skipPreflight: false }]
++      params: [base64Tx, { encoding: "base64", preflightCommitment: "confirmed", skipPreflight: false }]
+     }),
+     headers: { "Content-Type": "application/json" },
+     method: "POST"
+@@ -3691,7 +3691,7 @@ async function broadcastTransaction2(rpcUrl, base64Tx) {
+       id: 1,
+       jsonrpc: "2.0",
+       method: "sendTransaction",
+-      params: [base64Tx, { encoding: "base64", skipPreflight: false }]
++      params: [base64Tx, { encoding: "base64", preflightCommitment: "confirmed", skipPreflight: false }]
+     }),
+     headers: { "Content-Type": "application/json" },
+     method: "POST"
+@@ -8185,7 +8185,9 @@ function createMppAdapter(config) {
+       });
+     },
+     async challengeHeaders(gate, request) {
+-      const result = await handlerFor(gate)(request);
++      const headers = new Headers(request.headers);
++      headers.delete("authorization");
++      const result = await handlerFor(gate)(new Request(request, { headers }));
+       if (result.status !== 402) return {};
+       const wwwAuthenticate = result.challenge.headers.get("www-authenticate");
+       return wwwAuthenticate ? { "www-authenticate": wwwAuthenticate } : {};
+@@ -8201,7 +8203,9 @@ function createMppAdapter(config) {
+     // that Response back for pay-kit to send.
+     async respond(gate, request) {
+       if (!config.mpp.html) return void 0;
+-      const result = await handlerFor(gate)(request);
++      const headers = new Headers(request.headers);
++      headers.delete("authorization");
++      const result = await handlerFor(gate)(new Request(request, { headers }));
+       if (result.status !== 402) return void 0;
+       const response = result.challenge;
+       const url = new URL(request.url);
