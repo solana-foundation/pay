@@ -1122,6 +1122,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 &amount,
                 ExactOptions {
                     memo: memo.as_deref(),
+                    resource: x402_resource_url(req).as_deref(),
                     ..Default::default()
                 },
             ) {
@@ -1305,6 +1306,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 &amount,
                 ExactOptions {
                     memo: memo.as_deref(),
+                    resource: x402_resource_url(req).as_deref(),
                     ..Default::default()
                 },
             )
@@ -2520,6 +2522,23 @@ fn x402_exact_binding(req: &GateRequest<'_>, resource: Option<&str>) -> Option<S
     Some(format!("{} {resource}", req.method))
 }
 
+/// The absolute URL of the requested resource, for the x402 v2 `resource.url`
+/// the challenge advertises and the credential must echo. Built from the
+/// request `Host`, path and query; `None` without a host, which keeps the
+/// configured resource name. The gate sees no transport scheme, so the URL is
+/// `https`, matching what the public gateway serves.
+fn x402_resource_url(req: &GateRequest<'_>) -> Option<String> {
+    let authority = canonical_authority(req.host?);
+    if authority.is_empty() {
+        return None;
+    }
+    let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!(
+        "https://{authority}/{}{query}",
+        req.path.trim_start_matches('/')
+    ))
+}
+
 fn x402_exact_payment_memo(
     x402: &X402,
     pay_header: &str,
@@ -3440,6 +3459,56 @@ mod tests {
             fee_payer_key: None,
             payment_identifier: pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
         }
+    }
+
+    fn x402_challenge_resource_url(x402: &X402, request: &GateRequest<'_>) -> String {
+        let (_, required) = x402
+            .payment_required_header(
+                "1",
+                ExactOptions {
+                    resource: x402_resource_url(request).as_deref(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, required).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        envelope["resource"]["url"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn x402_resource_url_is_the_request_url_not_the_spec_name() {
+        let x402 = x402_test_server();
+        let get = Method::GET;
+        let mut request = req(&get, "v1/rpc");
+        request.query = Some("a=1");
+        assert_eq!(
+            x402_challenge_resource_url(&x402, &request),
+            "https://api.example.com/v1/rpc?a=1"
+        );
+        // Positive control: the same header without a request URL carries the
+        // configured spec name, which is what the bug advertised.
+        let (_, required) = x402
+            .payment_required_header("1", ExactOptions::default())
+            .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, required).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(envelope["resource"]["url"], "fortune");
+    }
+
+    #[test]
+    fn x402_resource_url_needs_a_host() {
+        let get = Method::GET;
+        let mut request = req(&get, "v1/rpc");
+        request.host = None;
+        assert_eq!(x402_resource_url(&request), None);
+        request.host = Some("API.Example.com.:8443");
+        assert_eq!(
+            x402_resource_url(&request).as_deref(),
+            Some("https://api.example.com:8443/v1/rpc")
+        );
     }
 
     fn x402_accepted_with_memo(x402: &X402, memo: Option<&str>) -> serde_json::Value {
