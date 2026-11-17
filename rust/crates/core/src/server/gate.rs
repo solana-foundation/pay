@@ -3309,10 +3309,11 @@ mod tests {
         );
     }
 
-    /// Pay's own client against pay's resource-bound exact route: the
-    /// credential it builds names the route's resource and carries the
-    /// endpoint memo, so the kit's fail-closed binding accepts it, and the
-    /// same credential stripped of its resource is refused.
+    /// Pay's own client against pay's resource-bound exact route, through the
+    /// real gate: the challenge advertises the request URL, the credential
+    /// the client builds echoes it and carries the endpoint memo, and the
+    /// gate's verification accepts it. A credential bound to another URL, or
+    /// stripped of its resource, is refused.
     #[test]
     fn pay_clients_satisfy_the_exact_resource_binding() {
         let rpc = crate::test_rpc::install_blockhash_rpc();
@@ -3321,67 +3322,71 @@ mod tests {
             ..x402_test_config()
         })
         .unwrap();
-        let binding = x402_exact_binding(&req(&Method::GET, "fortune"), Some("fortune"));
-        let memo = crate::server::payment::resource_memo_with_nonce(
-            binding.as_deref(),
-            pay_kit::x402::exact::MAX_MEMO_BYTES,
-        );
-        let (name, required) = x402
-            .payment_required_header(
-                "0.01",
-                ExactOptions {
-                    memo: memo.as_deref(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let challenge =
-            crate::client::x402::parse(&[(name.to_string(), required)], None).expect("x402 offer");
-        let store = crate::accounts::MemoryAccountsStore::new();
-        let built = crate::client::x402::build_payment_with_override(
-            &challenge,
-            &store,
-            Some("devnet"),
-            None,
-            Some("https://api.example.com/fortune"),
-            None,
-        )
-        .unwrap();
-        let credential = built.headers[0].1.clone();
-
+        let gate = x402_gate(x402);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let verify = |header: &str| {
-            let memo = x402_exact_payment_memo(&x402, header, binding.as_deref()).unwrap();
-            runtime.block_on(x402.process_payment(
-                header,
-                "0.01",
-                ExactOptions {
-                    memo: memo.as_deref(),
-                    ..Default::default()
-                },
-            ))
+        let respond = |request: &GateRequest<'_>| match runtime.block_on(gate.evaluate(request)) {
+            GateDecision::Respond(response) => response,
+            _ => panic!("expected the gate to respond"),
         };
-        verify(&credential).expect("pay's credential satisfies the binding");
+        let get = Method::GET;
+        let url_a = "https://api.example.com/fortune?a=1";
+        let mut request_a = req(&get, "fortune");
+        request_a.query = Some("a=1");
+
+        // Challenge with the request URL, then build pay's credential for it.
+        let challenge_header = x402_challenge_header(&respond(&request_a));
+        assert_eq!(x402_header_resource_url(&challenge_header.1), url_a);
+        let challenge = crate::client::x402::parse(&[challenge_header], None).expect("x402 offer");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let credential = crate::client::x402::build_payment_with_override(
+            &challenge,
+            &store,
+            Some("devnet"),
+            None,
+            Some(url_a),
+            None,
+        )
+        .unwrap()
+        .headers[0]
+            .1
+            .clone();
+
+        // Verification passes the resource check: the only remaining failure
+        // is the missing fee-payer signer, which comes after verification.
+        let verify = |header: &str, query: &'static str| {
+            let mut request = req(&get, "fortune");
+            request.query = Some(query);
+            request.x402_payment = Some(header);
+            let response = respond(&request);
+            assert_eq!(response.status, StatusCode::PAYMENT_REQUIRED);
+            String::from_utf8_lossy(&response.body).into_owned()
+        };
+        let accepted = verify(&credential, "a=1");
+        assert!(
+            accepted.contains("fee-payer signer"),
+            "credential bound to the request URL must verify: {accepted}"
+        );
+
+        // The same credential presented for a different URL is refused.
+        let wrong_url = verify(&credential, "a=2");
+        assert!(!wrong_url.contains("fee-payer signer"), "{wrong_url}");
 
         let mut envelope: serde_json::Value = serde_json::from_slice(
             &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &credential)
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(envelope["resource"]["url"], "fortune");
+        assert_eq!(envelope["resource"]["url"], url_a);
         envelope.as_object_mut().unwrap().remove("resource");
         let unbound = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             serde_json::to_vec(&envelope).unwrap(),
         );
-        let error = verify(&unbound).unwrap_err();
-        assert!(
-            error.to_string().contains("Resource binding missing"),
-            "{error}"
-        );
+        let missing = verify(&unbound, "a=1");
+        assert!(missing.contains("Resource binding missing"), "{missing}");
     }
 
     #[test]
@@ -3461,41 +3466,84 @@ mod tests {
         }
     }
 
-    fn x402_challenge_resource_url(x402: &X402, request: &GateRequest<'_>) -> String {
-        let (_, required) = x402
-            .payment_required_header(
-                "1",
-                ExactOptions {
-                    resource: x402_resource_url(request).as_deref(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+    /// One x402-exact `GET fortune` endpoint ($0.01, resource `fortune`) on
+    /// `api.example.com`, so tests drive the real gate's challenge and verify
+    /// paths.
+    #[derive(Clone)]
+    struct X402GateState {
+        apis: Vec<pay_types::metering::ApiSpec>,
+        x402: Arc<X402>,
+    }
+
+    impl PaymentState for X402GateState {
+        fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+        fn x402(&self) -> Option<&X402> {
+            Some(self.x402.as_ref())
+        }
+    }
+
+    fn x402_gate(x402: X402) -> PaymentGate<X402GateState> {
+        let api: pay_types::metering::ApiSpec = serde_json::from_value(json!({
+            "name": "fortune", "subdomain": "api", "title": "Fortune",
+            "description": "", "category": "ai_ml", "version": "v1",
+            "routing": {"type": "respond"},
+            "endpoints": [{
+                "method": "GET", "path": "fortune", "resource": "fortune",
+                "metering": {
+                    "schemes": ["x402-exact"],
+                    "dimensions": [{
+                        "direction": "usage", "unit": "requests", "scale": 1,
+                        "tiers": [{"price_usd": 0.01}]
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+        PaymentGate::new(X402GateState {
+            apis: vec![api],
+            x402: Arc::new(x402),
+        })
+    }
+
+    /// The `PAYMENT-REQUIRED` header (name, value) of a gate response.
+    fn x402_challenge_header(response: &GateResponse) -> (String, String) {
+        let (name, value) = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.as_str().eq_ignore_ascii_case("payment-required"))
+            .expect("402 carries a PAYMENT-REQUIRED header");
+        (name.to_string(), value.to_str().unwrap().to_string())
+    }
+
+    fn x402_header_resource_url(required: &str) -> String {
         let decoded =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, required).unwrap();
         let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         envelope["resource"]["url"].as_str().unwrap().to_string()
     }
 
-    #[test]
-    fn x402_resource_url_is_the_request_url_not_the_spec_name() {
-        let x402 = x402_test_server();
+    /// The gate's x402 challenge advertises the request URL as
+    /// `resource.url`, not the endpoint's configured resource name.
+    #[tokio::test]
+    async fn x402_challenge_advertises_the_request_url() {
+        let gate = x402_gate(x402_test_server());
         let get = Method::GET;
-        let mut request = req(&get, "v1/rpc");
+        let mut request = req(&get, "fortune");
         request.query = Some("a=1");
+        let GateDecision::Respond(response) = gate.evaluate(&request).await else {
+            panic!("expected a 402 challenge");
+        };
+        assert_eq!(response.status, StatusCode::PAYMENT_REQUIRED);
+        let (_, required) = x402_challenge_header(&response);
         assert_eq!(
-            x402_challenge_resource_url(&x402, &request),
-            "https://api.example.com/v1/rpc?a=1"
+            x402_header_resource_url(&required),
+            "https://api.example.com/fortune?a=1"
         );
-        // Positive control: the same header without a request URL carries the
-        // configured spec name, which is what the bug advertised.
-        let (_, required) = x402
-            .payment_required_header("1", ExactOptions::default())
-            .unwrap();
-        let decoded =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, required).unwrap();
-        let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(envelope["resource"]["url"], "fortune");
     }
 
     #[test]
