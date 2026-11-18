@@ -53,6 +53,9 @@ export async function createTransfer(
 
     // If a memo is provided, add it before the transfer instruction
     if (memo != null) {
+        if (new TextEncoder().encode(memo).length > 566) {
+            throw new CreateTransferError('memo invalid');
+        }
         instructions.push(getAddMemoInstruction({ memo, signers: [sender] }));
     }
 
