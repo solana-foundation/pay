@@ -22,12 +22,13 @@ import {
     getBase64EncodedWireTransaction,
 } from '@solana/kit';
 import { useRouter } from 'next/router';
-import React, { FC, ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import React, { FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useConfig } from '../../hooks/useConfig';
 import { useNavigateWithQuery } from '../../hooks/useNavigateWithQuery';
 import { PaymentContext, PaymentStatus } from '../../hooks/usePayment';
 import { Confirmations } from '../../types';
 import { DEVNET_ENDPOINT } from '../../utils/constants';
+import { createPaymentSubmission, PaymentSubmissionError } from '../../utils/paymentSubmission';
 
 export interface PaymentProviderProps {
     children: ReactNode;
@@ -59,6 +60,11 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
     const [memo, setMemo] = useState<string>();
     const [reference, setReference] = useState<Address>();
     const [signature, setSignature] = useState<Signature>();
+    const [submissionError, setSubmissionError] = useState<string>();
+    const submissionRef = useRef<{
+        reference: Address;
+        submit: ReturnType<typeof createPaymentSubmission>;
+    }>();
     const [status, setStatus] = useState(PaymentStatus.New);
     const [confirmations, setConfirmations] = useState<Confirmations>(0);
     const navigate = useNavigateWithQuery();
@@ -113,6 +119,8 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
         setMemo(undefined);
         setReference(undefined);
         setSignature(undefined);
+        setSubmissionError(undefined);
+        submissionRef.current = undefined;
         setStatus(PaymentStatus.New);
         setConfirmations(0);
         navigate('/new', true);
@@ -127,68 +135,89 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
         }
     }, [status, reference, navigate]);
 
+    // A wallet connection can end before its RPC outcome arrives. Keep that
+    // outcome attached to this pending invoice, but retire it when the invoice
+    // changes, leaves Pending, or the provider unmounts.
+    useEffect(() => {
+        return () => {
+            submissionRef.current = undefined;
+        };
+    }, [status, reference]);
+
     // If there's a connected wallet, use it to sign and send the transaction
     useEffect(() => {
-        if (status === PaymentStatus.Pending && connectWallet && walletAddress && txSigner) {
+        if (status === PaymentStatus.Pending && reference && connectWallet && walletAddress && txSigner) {
             let changed = false;
+            if (submissionRef.current?.reference !== reference) {
+                submissionRef.current = { reference, submit: createPaymentSubmission() };
+            }
+            const attempt = submissionRef.current;
 
             const run = async () => {
                 try {
-                    const request = parseURL(url);
+                    await attempt.submit(
+                        async () => {
+                            const request = parseURL(url);
+                            let compiledTx: ReturnType<typeof compileTransaction>;
 
-                    if ('link' in request) {
-                        const { link } = request;
-                        const compiledTx = await fetchTransaction(rpc, address(walletAddress), link);
-                        if (!changed) {
+                            if ('link' in request) {
+                                const { link } = request;
+                                compiledTx = await fetchTransaction(rpc, address(walletAddress), link);
+                            } else {
+                                const { recipient, amount, splToken, reference, memo } = request;
+                                if (!amount) throw new Error('An amount is required before payment submission');
+
+                                const instructions = await createTransfer(rpc, txSigner, {
+                                    recipient,
+                                    amount,
+                                    splToken,
+                                    reference,
+                                    memo,
+                                });
+
+                                // Build transaction message
+                                const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
+                                const txMessage = appendTransactionMessageInstructions(
+                                    instructions,
+                                    setTransactionMessageLifetimeUsingBlockhash(
+                                        latestBlockhash,
+                                        setTransactionMessageFeePayer(
+                                            address(walletAddress),
+                                            createTransactionMessage({ version: 0 }),
+                                        ),
+                                    ),
+                                );
+
+                                compiledTx = compileTransaction(txMessage);
+                            }
+                            // Preparation may finish after cleanup. Never open
+                            // a wallet prompt for the cancelled effect.
+                            if (changed) return undefined;
                             const [signedTx] = await txSigner.modifyAndSignTransactions([compiledTx]);
-                            const wireBase64 = getBase64EncodedWireTransaction(signedTx);
-                            await rpc.sendTransaction(wireBase64, { encoding: 'base64' }).send();
-                        }
-                    } else {
-                        const { recipient, amount, splToken, reference, memo } = request;
-                        if (!amount) return;
-
-                        const instructions = await createTransfer(rpc, txSigner, {
-                            recipient,
-                            amount,
-                            splToken,
-                            reference,
-                            memo,
-                        });
-
-                        // Build transaction message
-                        const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-                        const txMessage = appendTransactionMessageInstructions(
-                            instructions,
-                            setTransactionMessageLifetimeUsingBlockhash(
-                                latestBlockhash,
-                                setTransactionMessageFeePayer(
-                                    address(walletAddress),
-                                    createTransactionMessage({ version: 0 })
-                                )
-                            )
-                        );
-
-                        const compiled = compileTransaction(txMessage);
-                        if (!changed) {
-                            const [signedTx] = await txSigner.modifyAndSignTransactions([compiled]);
-                            const wireBase64 = getBase64EncodedWireTransaction(signedTx);
-                            await rpc.sendTransaction(wireBase64, { encoding: 'base64' }).send();
-                        }
-                    }
+                            return getBase64EncodedWireTransaction(signedTx);
+                        },
+                        wire => rpc.sendTransaction(wire, { encoding: 'base64' }).send(),
+                        () => changed,
+                    );
                 } catch (error) {
                     console.error(error);
-                    timeout = setTimeout(run, 5000);
+                    if (submissionRef.current === attempt) {
+                        setSubmissionError(
+                            error instanceof PaymentSubmissionError && error.broadcastAttempted
+                                ? 'The payment submission result is unknown. We are still checking for the payment. Check your wallet before starting another payment.'
+                                : 'This attempt did not reach transaction submission. Start over to try again.',
+                        );
+                    }
                 }
             };
-            let timeout = setTimeout(run, 0);
+            const timeout = setTimeout(run, 0);
 
             return () => {
                 changed = true;
                 clearTimeout(timeout);
             };
         }
-    }, [status, connectWallet, walletAddress, txSigner, url, rpc]);
+    }, [status, reference, connectWallet, walletAddress, txSigner, url, rpc]);
 
     // When the status is pending, poll for the transaction using the reference key
     useEffect(() => {
@@ -293,6 +322,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
                 setMemo,
                 reference,
                 signature,
+                submissionError,
                 status,
                 confirmations,
                 progress,
