@@ -49,6 +49,10 @@ export async function createTransfer(
     sender: TransactionSigner,
     { recipient, amount, splToken, reference, memo }: TransferFields,
 ): Promise<Instruction[]> {
+    if (!Number.isFinite(amount) || amount < 0) {
+        throw new CreateTransferError('amount invalid');
+    }
+
     const instructions: Instruction[] = [];
 
     // If a memo is provided, add it before the transfer instruction

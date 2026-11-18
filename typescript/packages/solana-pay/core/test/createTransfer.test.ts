@@ -135,6 +135,45 @@ describe('createTransfer', () => {
         vi.clearAllMocks();
     });
 
+    it('rejects non-finite amounts before any RPC call', async () => {
+        const rpc = createMockRpc(new Map());
+        const send = vi.fn();
+        rpc.getMultipleAccounts = () => ({ send });
+
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity })).rejects.toThrow(
+            CreateTransferError,
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity })).rejects.toThrow(
+            'amount invalid',
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: NaN })).rejects.toThrow(
+            'amount invalid',
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: -1 })).rejects.toThrow(
+            CreateTransferError,
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: -1 })).rejects.toThrow(
+            'amount invalid',
+        );
+        expect(send).not.toHaveBeenCalled();
+    });
+
+    it('accepts a zero amount with valid accounts', async () => {
+        const accounts = new Map<string, any>([
+            [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+            [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+        ]);
+        const rpc = createMockRpc(accounts);
+
+        const instructions = await createTransfer(rpc, sender, {
+            recipient: ADDRESSES.recipient,
+            amount: 0,
+        });
+
+        expect(instructions.length).toBe(1);
+        expect(instructions[0].programAddress).toBe(SYSTEM_PROGRAM_ADDRESS);
+    });
+
     describe('SOL transfers', () => {
         it('should create valid SOL transfer with correct instruction shape', async () => {
             const accounts = new Map<string, any>([
