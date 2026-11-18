@@ -194,6 +194,8 @@ The library supports legacy, v0, and v1 transactions:
 - `fetchTransaction` decodes merchant-supplied transactions in any of the three formats, and preserves a v1 transaction's message-level config (compute unit limit, priority fee, loaded accounts data size limit, heap size) through the fee payer swap.
 - The merchant plugin's `buildTransaction` builds v0 by default; pass `{ version: 1, config: { ... } }` to build a v1 transaction.
 
+For unsigned v0 transaction requests that use address lookup tables, `fetchTransaction` also needs `getMultipleAccounts` on its RPC client to resolve the table contents. The wallet and combined clients already provide it. Transactions without lookup tables continue to work with a blockhash-only RPC client, and transactions with existing signatures retain their original message bytes without fetching lookup tables.
+
 The v1 format ([SIMD-0385](https://solana.com/upgrades/larger-transaction-sizes)) raises the transaction size cap from 1232 to 4096 bytes and moves compute unit and data size limits from ComputeBudget instructions into a message-level config. Note that a v1 transaction with no `computeUnitLimit` in its config is budgeted **zero** compute units, so always set one when building v1 transactions. v1 requires the `txv1aq4pp281K9um3tnPgkfX8UqtFT6wcVW3hNezGLL` feature gate to be active on the target cluster (Agave v4.2+); legacy and v0 remain fully supported.
 
 ## Migration Guide
