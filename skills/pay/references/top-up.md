@@ -4,7 +4,7 @@ Pay pays each call from its own wallet. A user with a Ledger can fund that
 wallet as a small spending budget: the agent proposes a USDC top-up through
 Ledger Agent Intent, and nothing moves until the user approves it on their
 Ledger signer. The agent cannot refill its own wallet, so it can spend at most
-the Pay wallet balance. Funds in the Pay wallet are no longer protected by the
+what its Pay wallets hold. Funds in the Pay wallet are no longer protected by the
 Ledger, so keep top-ups small.
 
 ## When It Applies
