@@ -191,6 +191,23 @@ describe('validateTransfer', () => {
             ).rejects.toThrow(ValidateTransferError);
         });
 
+        it('should include the transaction error in the message', async () => {
+            const response = makeSOLResponse({ err: { InstructionError: [0, { Custom: 6004 }] } });
+            const rpc = createMockRpc(response);
+            await expect(
+                validateTransfer(rpc, SIGNATURE, { recipient: ADDRESSES.recipient, amount: 1 }),
+            ).rejects.toThrow('{"InstructionError":[0,{"Custom":6004}]}');
+        });
+
+        // @solana/kit decodes the numbers inside `meta.err` as bigints, which JSON.stringify can't serialize.
+        it('should throw ValidateTransferError when the transaction error contains a bigint', async () => {
+            const response = makeSOLResponse({ err: { InstructionError: [3, { Custom: 6004n }] } });
+            const rpc = createMockRpc(response);
+            const promise = validateTransfer(rpc, SIGNATURE, { recipient: ADDRESSES.recipient, amount: 1 });
+            await expect(promise).rejects.toThrow(ValidateTransferError);
+            await expect(promise).rejects.toThrow('{"InstructionError":[3,{"Custom":"6004"}]}');
+        });
+
         it('should throw "amount not transferred" when insufficient amount', async () => {
             const response = makeSOLResponse({ postBalance: 100n });
             const rpc = createMockRpc(response);

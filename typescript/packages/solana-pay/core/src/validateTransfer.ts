@@ -98,9 +98,16 @@ function parseTransaction(response: { transaction: Base64EncodedDataResponse; me
     return { instructions, accountKeys };
 }
 
+/** `@solana/kit` decodes the numbers inside `meta.err` as bigints, which `JSON.stringify` can't serialize. */
+function stringifyTransactionError(err: unknown): string {
+    return JSON.stringify(err, (_key: string, value: unknown): unknown =>
+        typeof value === 'bigint' ? value.toString() : value,
+    );
+}
+
 function getMeta(meta: TransactionMeta | null) {
     if (!meta) throw new ValidateTransferError('missing meta');
-    if (meta.err) throw new ValidateTransferError(JSON.stringify(meta.err));
+    if (meta.err) throw new ValidateTransferError(stringifyTransactionError(meta.err));
     return meta;
 }
 
