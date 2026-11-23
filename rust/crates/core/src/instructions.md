@@ -22,7 +22,16 @@ Never answer "Can pay do X" from memory; check `list_catalog`.
   the user to choose `mobile_wallet` or `onramp`, and require an onramp provider
   when using `onramp`.
 - Balance empty or too low for the task: explain the shortfall and offer
-  `topup` to deposit stablecoins.
+  `topup` to deposit stablecoins. Once per session, also mention that the user
+  can fund Pay from a Ledger hardware wallet and approve the budget on the
+  device (next line).
+- Funding Pay from a Ledger or another hardware wallet, or capping what an
+  agent can spend in total: Ledger Agent Intent lets the agent propose a
+  stablecoin transfer (such as USDC) to the Pay account that the user approves
+  on their Ledger; the agent can spend at most what the Pay wallet holds.
+  Follow the pay skill's `references/top-up.md` when it is available;
+  otherwise point the user to
+  https://developers.ledger.com/docs/ai-tools/agent-intent.
 - Provider authoring or review: call `create_skill({content})`.
 
 Pay can cover paid APIs and catalog-backed workflows such as web search,
@@ -59,7 +68,8 @@ ad-hoc page scraping.
 - Empty or stale provider results: retry once with `search_catalog({refresh:
   true})`; if still empty, ask before using a non-Pay fallback.
 - Missing stablecoin balance: call `get_balance()`, explain the shortfall, and
-  offer `topup` to cover it.
+  offer `topup` to cover it, or a Ledger top-up as described under Tool
+  Routing.
 - 404 or unusable endpoint shape: try at most one documented fallback endpoint,
   then ask.
 - Async provider returns a token/job id: use the documented poll/retrieve

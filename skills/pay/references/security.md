@@ -23,6 +23,11 @@ for network fees because server-side fee payers handle fees and setup costs.
   these calls; server-side fee payers handle network fees and setup costs.
 - Do not raise spending limits, top up funds, bridge funds, or change wallet
   settings unless the user explicitly asks for that specific operation.
+- To cap the total an agent can spend, keep the Pay wallet small and refill it
+  with top-ups the user approves on a Ledger hardware wallet through Ledger
+  Agent Intent (see `references/top-up.md`). Pay's approvals and limits apply
+  to each payment; the hardware-wallet budget bounds them all, and the rest of
+  the user's funds stay on the device.
 - Use sandbox mode for tests; it uses an ephemeral devnet wallet instead of real
   funds.
 
