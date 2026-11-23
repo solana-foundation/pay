@@ -127,6 +127,19 @@ Prefer to keep no key on the machine at all? `pay` can also sign through an [Ope
 pay account new agent --backend openfort   # connect an existing Openfort backend wallet (acc_…)
 ```
 
+### 🔑 Agent Budgets from a Hardware Wallet
+
+Per-payment approval protects each call. To also cap what an agent can spend in total, fund its Pay wallet from a hardware wallet as a budget. With [Ledger Agent Intent](https://developers.ledger.com/docs/ai-tools/agent-intent), the agent proposes a stablecoin top-up (USDC below) to its Pay account, and nothing moves until you approve it on your Ledger. The device doesn't need to be attached to the agent's machine, so this also works for remote agents and hosted Pay, and the rest of your funds stay on the Ledger.
+
+```sh
+# The agent proposes the top-up; you open the review link and approve on your Ledger
+wallet-cli agent-intent send --profile my-agent --account solana-1 \
+  --to <Pay address> --amount '5 USDC' \
+  --token EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+```
+
+The Pay skill offers this next to `topup` when the balance runs low; see [`skills/pay/references/top-up.md`](skills/pay/references/top-up.md). To sign every payment on a Ledger instead, use `pay account new --backend ledger`.
+
 ### 📚 Open Source Catalog
 
 The paid API catalog is open source in the [`pay-skills`](https://github.com/solana-foundation/pay-skills) repo.
