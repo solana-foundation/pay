@@ -4,8 +4,8 @@ Pay pays each call from its own wallet. A user with a Ledger can fund that
 wallet as a small spending budget: the agent proposes a USDC top-up through
 Ledger Agent Intent, and nothing moves until the user approves it on their
 Ledger signer. The agent cannot refill its own wallet, so it can spend at most
-what its Pay wallets hold. Funds in the Pay wallet are no longer protected by the
-Ledger, so keep top-ups small.
+what its Pay wallets hold. Funds in the Pay wallet are no longer protected by
+the Ledger, so keep top-ups small.
 
 ## When It Applies
 
@@ -52,11 +52,11 @@ below.
 
 1. Run `pay --mainnet whoami 2>&1`. The recipient is the address in its
    `[mainnet <address>]` header, and the lines below it list the mainnet
-   balances. When `pay account list` shows more than one mainnet account, ask
-   the user which one Pay pays from and run
-   `pay --mainnet --account <name> whoami 2>&1` instead. For a low balance,
-   when the mainnet USDC already covers the call's price, the shortfall is on
-   another network: tell the user and stop.
+   balances. No USDC line, or the note to run `pay topup`, means 0 USDC. When
+   `pay account list` shows more than one mainnet account, ask the user which
+   one Pay pays from and run `pay --mainnet --account <name> whoami 2>&1`
+   instead. For a low balance, when the mainnet USDC already covers the
+   call's price, the shortfall is on another network: tell the user and stop.
 2. Read the sender label (such as `solana-1`) from `wallet-cli session view`.
    When no Solana account is listed, run
    `wallet-cli agent-intent sync --profile <id>` first. With more than one,
@@ -80,22 +80,27 @@ below.
    holds the review link in `deeplink` and the intent id in `intentId`. When
    `intentId` is `null`, run the step 3 listing and use the `id` of the entry
    whose `recipient` is the step 1 address.
-5. Send the user the `deeplink` with the recipient address and amount, ask them
-   to check both on the Ledger screen before approving, and to tell you when
-   they have approved or rejected it. When `deeplink` is `null`, the intent
+5. Send the user the `deeplink` with the amount, the recipient address and the
+   sender address (the Ledger app may name the account differently from
+   `wallet-cli`). Ask them to check the amount and recipient on the Ledger
+   screen before approving, and to tell you when they have approved or
+   rejected it. Then end your turn. When `deeplink` is `null`, the intent
    still exists: point the user to https://app.agents.ledger.com/ instead of
    running `send` again. The user can also confirm the address by running
    `pay whoami` in their own terminal.
-6. On the user's next message, run
+6. On the user's next message, whatever it says (a bare "ok" or "done"
+   counts), run this before anything else:
    `wallet-cli agent-intent status --profile <id> --intent <intent-id> --output json`.
    The intent is final only when `terminal` is `true`. While `terminal` is
-   `false` or `null` (`signed` is not final either), tell the user it is still
-   pending and check again on their next message.
-7. On `success`, run the step 1 `whoami` command again to confirm the USDC
-   landed, then retry the original paid call once. When the conversation has
-   moved on since the shortfall, ask the user before retrying. Any other final
-   state (`rejected`, `cancelled`, `expired`, `failed`) or an error ends the
-   paid call: report it to the user.
+   `false` or `null`, run the step 1 `whoami` command: the status can stay
+   `broadcast` after the transfer lands. When the mainnet USDC has grown by
+   the top-up amount, continue with step 7. Otherwise tell the user it is
+   still pending and check again on their next message.
+7. On `success`, run the step 1 `whoami` command to confirm the USDC landed.
+   Once it has landed, retry the original paid call once. When the
+   conversation has moved on since the shortfall, ask the user before
+   retrying. Any other final state (`rejected`, `cancelled`, `expired`,
+   `failed`) or an error ends the paid call: report it to the user.
 
 ## Rules
 

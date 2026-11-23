@@ -83,6 +83,11 @@ provider choice.
   call (before offering `topup`), or the user asks to fund Pay securely or from a Ledger or hardware
   wallet, how to pay with fewer confirmations, or whether Pay spending is safe.
   A top-up the user approves on their Ledger counts as their consent.
+  Check the balance in its own step before a paid call, and make the call
+  only after reading the result. `pay whoami` prints no USDC line for an
+  empty account: that is 0 USDC, and a
+  paid call that fails while the balance is 0 is this shortfall, not a
+  provider outage.
 - Read `references/monetize-api.md` when a developer wants to monetize an API
   with Pay, write a `pay gate api` paywall YAML file, create a pay-skills provider
   listing, deploy it as a production cloud gateway, validate/probe it, test

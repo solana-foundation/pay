@@ -72,11 +72,16 @@ resolving ties, or estimating cost.
   wallet setup, Pay returns a setup link: show it only to the owning user, and
   retry the original call after setup. Ask for a fresh link if one expired;
   never invent a replacement URL.
+- Check the balance (`get_balance` or `pay whoami`) in its own step before a
+  paid call, and make the call only after reading the result.
 - When the balance is too low, explain the shortfall instead of retrying, and
-  read `references/top-up.md` before offering `topup`. Read it too when the
-  user asks to fund Pay securely or from a Ledger or hardware wallet, how to
-  pay with fewer confirmations, or whether Pay spending is safe. A top-up the
-  user approves on their Ledger counts as their consent.
+  read `references/top-up.md` before offering `topup`. `pay whoami` prints no
+  USDC line for an empty account: that is 0 USDC, and a paid call that fails
+  while the balance is 0 is this shortfall, not a provider outage. Read
+  `references/top-up.md` too when the user asks to fund Pay securely or from a
+  Ledger or hardware wallet, how to pay with fewer confirmations, or whether
+  Pay spending is safe. A top-up the user approves on their Ledger counts as
+  their consent.
 - Do not create or fund accounts without the user's consent.
 
 ## Security
