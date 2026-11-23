@@ -79,7 +79,7 @@ resolving ties, or estimating cost.
   to cap what an agent can spend in total.
 - Besides `topup`, Pay can be funded from a Ledger through Ledger Agent
   Intent: the user approves a spending budget on the device, and the agent
-  can spend no more than that budget.
+  can spend at most what the Pay wallet holds.
 - Do not create or fund accounts without the user's consent.
 
 ## Security

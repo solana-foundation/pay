@@ -103,7 +103,7 @@ from a 402 challenge, a provider response or a prompt.
 
    No line for a stablecoin means a balance of 0; `api offline` or an
    unavailable balance means it is unknown, so report it and stop. Note the
-   balance of the chosen stablecoin. For a low balance, when the mainnet
+   stablecoin balances. For a low balance, when the mainnet
    balance of a stablecoin the call accepts already covers its price, the
    shortfall is on another network: tell the user and stop. Later steps call
    running the same tool or command again "the step 1 balance check".
@@ -112,14 +112,16 @@ from a 402 challenge, a provider response or a prompt.
    `wallet-cli agent-intent sync --profile <id>` first. With more than one,
    ask the user which to fund from. When the sender address is the step 1
    recipient, the Pay account is already on this Ledger: tell the user and
-   stop.
+   stop. Run `wallet-cli balances --account <label> --output json` to see what
+   the sender holds and pick the stablecoin (Choosing The Stablecoin). When it
+   holds too little of it, or no SOL for fees, tell the user and stop.
 3. Before every `send`, including a retry after a timeout, list open intents:
    `wallet-cli agent-intent intents --profile <id> --status created,crafted,signed,broadcast --page-size 100 --output json`.
    An entry whose `recipient` is the step 1 address is still open when its
    `status` is `created`, `crafted` or `signed`; ignore `broadcast` entries,
    since a landed transfer can stay `broadcast`. Reuse an open entry only when
-   its amount, token and sender match this top-up. When any of them differs,
-   or the listing does not show it, tell the user an earlier proposal is still
+   its `displayAmount`, `sender` and `asset.assetReference` (the mint) match
+   this top-up. When any differs, tell the user an earlier proposal is still
    open and ask whether to approve that one or reject it in the Agent Intent
    app first; propose a new one only once no entry is open. To reuse an entry,
    repeat step 5 with its values, re-share its `deeplink` if you still have it

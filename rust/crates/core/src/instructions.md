@@ -28,8 +28,9 @@ Never answer "Can pay do X" from memory; check `list_catalog`.
 - Funding Pay from a Ledger or another hardware wallet, or capping what an
   agent can spend in total: Ledger Agent Intent lets the agent propose a
   stablecoin transfer (such as USDC) to the Pay account that the user approves
-  on their Ledger, so the agent can spend no more than that budget. Follow the pay skill's
-  `references/top-up.md` when it is available; otherwise point the user to
+  on their Ledger; the agent can spend at most what the Pay wallet holds.
+  Follow the pay skill's `references/top-up.md` when it is available;
+  otherwise point the user to
   https://developers.ledger.com/docs/ai-tools/agent-intent.
 - Provider authoring or review: call `create_skill({content})`.
 

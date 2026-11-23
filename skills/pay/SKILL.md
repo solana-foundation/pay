@@ -83,8 +83,9 @@ provider choice.
   any reason, and when the user asks to fund Pay from a Ledger or another
   hardware wallet or to cap what an agent can spend in total. Besides
   `topup`, Pay can be funded from a Ledger through Ledger Agent Intent: the
-  user approves a spending budget on the device, and the agent can spend no
-  more than that budget. Check the balance in its own step before a paid call:
+  user approves a spending budget on the device, and the agent can spend at
+  most what the Pay wallet holds. Check the balance in its own step before a
+  paid call:
   `pay whoami` prints no line for a stablecoin the account does not hold (no
   USDC line means 0 USDC) and `api offline` when the balance is unknown.
 - Read `references/monetize-api.md` when a developer wants to monetize an API
