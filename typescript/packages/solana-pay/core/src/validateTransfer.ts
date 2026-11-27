@@ -13,6 +13,7 @@ import type {
     TokenBalance,
 } from '@solana/kit';
 import {
+    address,
     decodeTransactionFromRpcResponse,
     getAccountMetasFromCompiledTransactionMessage,
     getInstructionsFromCompiledTransactionMessage,
@@ -45,6 +46,15 @@ import { normalizeReferences } from './utils/reference.js';
 export class ValidateTransferError extends Error {
     name = 'ValidateTransferError';
 }
+
+/**
+ * Compute Budget instructions are transaction-level metadata: they take no
+ * accounts and cannot move tokens. Wallets may append them after the transfer
+ * (for example Solflare adds `SetComputeUnitLimit` + `SetComputeUnitPrice`) or
+ * insert them around it when signing a transaction request, so they must not be
+ * mistaken for the transfer or memo instruction.
+ */
+const COMPUTE_BUDGET_PROGRAM_ADDRESS = address('ComputeBudget111111111111111111111111111111');
 
 /** A decompiled instruction with accounts and data present. */
 type DecompiledInstruction = Instruction &
@@ -150,8 +160,16 @@ export async function validateTransfer(
     const meta = getMeta(response.meta);
     const { instructions, accountKeys } = parseTransaction({ transaction: response.transaction, meta });
 
-    // Transfer instruction must be the last instruction
-    const instruction = instructions.pop();
+    // Compute Budget instructions are transaction-level metadata: they take no
+    // accounts and cannot move tokens. Wallets may append them after the
+    // transfer (Solflare) or insert them around it when signing a transaction
+    // request, so drop them before locating the transfer and memo.
+    const coreInstructions = instructions.filter(
+        instruction => instruction.programAddress !== COMPUTE_BUDGET_PROGRAM_ADDRESS,
+    );
+
+    // Transfer instruction must be the last remaining instruction
+    const instruction = coreInstructions.pop();
     validateInstruction(instruction);
 
     const { pre, post, decimals } = splToken
@@ -162,7 +180,7 @@ export async function validateTransfer(
     if (post - pre < expected) throw new ValidateTransferError('amount not transferred');
 
     if (memo !== undefined) {
-        validateMemo(instructions.pop(), memo);
+        validateMemo(coreInstructions.pop(), memo);
     }
 
     return response;

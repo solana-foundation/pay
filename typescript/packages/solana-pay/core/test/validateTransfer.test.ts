@@ -52,6 +52,22 @@ const TX = {
     /** SPL TransferChecked (disc=12), 1 USDC. Accounts: [sender, senderATA, recipientATA, splToken, tokenProg] */
     SPL_TRANSFER_CHECKED:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIF253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQEAQMCAAoMQEIPAAAAAAAG',
+    /**
+     * SPL TransferChecked + two trailing Compute Budget instructions
+     * (SetComputeUnitLimit + SetComputeUnitPrice), the layout Solflare emits
+     * when it signs a transaction request.
+     */
+    SPL_TRANSFER_CHECKED_WITH_COMPUTE_BUDGET:
+        'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIG253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqQMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADBAQBAwIACgxAQg8AAAAAAAYFAAUCQA0DAAUACgPoAwAAAAAAAAA=',
+    /** Two leading Compute Budget instructions + SPL TransferChecked. */
+    SPL_TRANSFER_CHECKED_WITH_COMPUTE_BUDGET_BEFORE:
+        'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIG253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqQMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADBQAFAkANAwAFAAoD6AMAAAAAAAAABAQBAwIACgxAQg8AAAAAAAY=',
+    /** Memo v3("test") + SOL transfer + two trailing Compute Budget instructions. */
+    SOL_TRANSFER_WITH_MEMO_AND_COMPUTE_BUDGET:
+        'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIF253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuPG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0DBkZv5SEXMv/srbpyw5vnvIzlu8X3EmssQ5s6QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAMBAAR0ZXN0AgIAAQwCAAAAAMqaOwAAAAAEAAUCQA0DAAQACgPoAwAAAAAAAAA=',
+    /** Memo v3("test") + two Compute Budget instructions + SOL transfer. */
+    SOL_TRANSFER_WITH_MEMO_AND_COMPUTE_BUDGET_BEFORE:
+        'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIF253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuPG+nrzvtutOj1l82qryXQxsbvkwtL24OR8pgIDRS9dYQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABUpTWpkpIQZNJOhxYNo4fHw1td28kruB5B+oQEEFRI0DBkZv5SEXMv/srbpyw5vnvIzlu8X3EmssQ5s6QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAMBAAR0ZXN0BAAFAkANAwAEAAoD6AMAAAAAAAAAAgIAAQwCAAAAAMqaOwAAAAA=',
     /** SPL Transfer (disc=3), 1 token. Accounts: [sender, senderATA, recipientATA, tokenProg] */
     SPL_TRANSFER:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAEE253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTBt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEDAwECAAkDQEIPAAAAAAA=',
@@ -286,6 +302,30 @@ describe('validateTransfer', () => {
             expect(result).toBe(response);
         });
 
+        it('should ignore trailing Compute Budget instructions after the transfer', async () => {
+            // Solflare appends SetComputeUnitLimit + SetComputeUnitPrice after
+            // the transfer when signing a transaction request (#552).
+            const response = makeSPLResponse({ base64Tx: TX.SPL_TRANSFER_CHECKED_WITH_COMPUTE_BUDGET });
+            const rpc = createMockRpc(response);
+            const result = await validateTransfer(rpc, SIGNATURE, {
+                recipient: ADDRESSES.recipient,
+                amount: 1,
+                splToken: ADDRESSES.splToken,
+            });
+            expect(result).toBe(response);
+        });
+
+        it('should ignore leading Compute Budget instructions before the transfer', async () => {
+            const response = makeSPLResponse({ base64Tx: TX.SPL_TRANSFER_CHECKED_WITH_COMPUTE_BUDGET_BEFORE });
+            const rpc = createMockRpc(response);
+            const result = await validateTransfer(rpc, SIGNATURE, {
+                recipient: ADDRESSES.recipient,
+                amount: 1,
+                splToken: ADDRESSES.splToken,
+            });
+            expect(result).toBe(response);
+        });
+
         it('should throw "invalid transfer" when the program is not a token program', async () => {
             const response = makeSPLResponse({ base64Tx: TX.SPL_WRONG_PROGRAM });
             const rpc = createMockRpc(response);
@@ -419,6 +459,34 @@ describe('validateTransfer', () => {
                 },
                 transaction: [TX.SOL_TRANSFER_WITH_MEMO, 'base64'],
             };
+            const rpc = createMockRpc(response);
+            const result = await validateTransfer(rpc, SIGNATURE, {
+                recipient: ADDRESSES.recipient,
+                amount: 1,
+                memo: 'test',
+            });
+            expect(result).toBe(response);
+        });
+
+        it('should validate memo when Compute Budget instructions trail the transfer', async () => {
+            const response = makeSOLResponse({
+                base64Tx: TX.SOL_TRANSFER_WITH_MEMO_AND_COMPUTE_BUDGET,
+                postBalance: 1_000_000_000n,
+            });
+            const rpc = createMockRpc(response);
+            const result = await validateTransfer(rpc, SIGNATURE, {
+                recipient: ADDRESSES.recipient,
+                amount: 1,
+                memo: 'test',
+            });
+            expect(result).toBe(response);
+        });
+
+        it('should validate memo when Compute Budget instructions sit between memo and transfer', async () => {
+            const response = makeSOLResponse({
+                base64Tx: TX.SOL_TRANSFER_WITH_MEMO_AND_COMPUTE_BUDGET_BEFORE,
+                postBalance: 1_000_000_000n,
+            });
             const rpc = createMockRpc(response);
             const result = await validateTransfer(rpc, SIGNATURE, {
                 recipient: ADDRESSES.recipient,
